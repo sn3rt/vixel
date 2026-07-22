@@ -60,26 +60,7 @@ providers:
       gain_db: 0.0
       frame_rate_hz: 10.0
 
-  # Optional fallback; the provider is built only when Arena SDK is installed.
-  lucid:
-    model_allowlist: []
-    discovery_period_ms: 2000
-    image_timeout_ms: 5000
-    schedule_lead_ms: 250
-    action_device_key: 1
-    action_group_key: 1
-    action_group_mask: 1
-    imaging:
-      pixel_format: BGR8
-      use_max_width: true
-      use_max_height: true
-      exposure_auto: Continuous
-      exposure_time_us: 1000.0
-      gain_auto: Continuous
-      gain_db: 0.0
-
 defaults:
-  camera_backend: genicam
   startup_mode: idle
   preview_rate_hz: 2.0
   preview_width: 960

@@ -1,7 +1,7 @@
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, Shutdown
 from launch.conditions import IfCondition
-from launch.substitutions import EqualsSubstitution, LaunchConfiguration
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
@@ -12,13 +12,8 @@ def generate_launch_description():
     legacy_file = LaunchConfiguration("legacy_file")
     web_preview = LaunchConfiguration("web_preview")
     web_port = LaunchConfiguration("web_port")
-    camera_backend = LaunchConfiguration("camera_backend")
 
     return LaunchDescription([
-        DeclareLaunchArgument(
-            "camera_backend", default_value="genicam",
-            description="Camera backend: genicam (Aravis) or lucid (Arena fallback)",
-        ),
         DeclareLaunchArgument(
             "machine_file", default_value="/etc/vixel/machine.yaml",
             description="Host/provider configuration YAML (copy from machine.example.yaml)",
@@ -50,7 +45,7 @@ def generate_launch_description():
                 "machine_file": machine_file,
                 "inventory_file": inventory_file,
                 "legacy_file": legacy_file,
-                "camera_backend": camera_backend,
+                "camera_backend": "genicam",
                 "start_preview": ParameterValue(web_preview, value_type=bool),
             }],
             on_exit=Shutdown(reason="Vixel inventory manager exited"),
@@ -62,20 +57,8 @@ def generate_launch_description():
             namespace="vixel/providers/genicam",
             output="screen",
             emulate_tty=True,
-            condition=IfCondition(EqualsSubstitution(camera_backend, "genicam")),
             parameters=[{"machine_file": machine_file}],
             on_exit=Shutdown(reason="Vixel GenICam provider exited"),
-        ),
-        Node(
-            package="vixel_lucid",
-            executable="lucid_provider",
-            name="lucid_provider",
-            namespace="vixel/providers/lucid",
-            output="screen",
-            emulate_tty=True,
-            condition=IfCondition(EqualsSubstitution(camera_backend, "lucid")),
-            parameters=[{"machine_file": machine_file}],
-            on_exit=Shutdown(reason="Vixel LUCID provider exited"),
         ),
         Node(
             package="vixel_web",

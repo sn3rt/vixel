@@ -38,8 +38,8 @@ Enrollment-time network provisioning should be reversible by default. The
 generic GigE Vision provider uses volatile GVCP ForceIP assignments and must not
 overwrite a camera's persistent static, DHCP, or link-local configuration.
 
-Camera providers publish beneath `/vixel/sensors/<sensor_id>`; the LUCID
-provider publishes `image_raw`, `image_raw/compressed`, and `camera_info`.
+Camera providers publish beneath `/vixel/sensors/<sensor_id>`; the generic
+GenICam provider publishes `image_raw`, `image_raw/compressed`, and `camera_info`.
 Other sensor kinds can use the same base with conventional ROS data topics.
-Provider packages should keep vendor SDK objects and exceptions behind their
-package boundary.
+Provider packages should keep transport-library objects and exceptions behind
+their package boundary.

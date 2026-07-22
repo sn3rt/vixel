@@ -13,7 +13,6 @@
   <exec_depend>ros2launch</exec_depend>
   <exec_depend>vixel_interfaces</exec_depend>
   <exec_depend>vixel_genicam</exec_depend>
-  <exec_depend>vixel_lucid</exec_depend>
   <exec_depend>vixel_manager</exec_depend>
   <exec_depend>vixel_network</exec_depend>
   <exec_depend>vixel_web</exec_depend>

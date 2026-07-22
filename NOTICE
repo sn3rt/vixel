@@ -11,12 +11,5 @@ Public License v2.1. Its source and license are available at:
 
 https://github.com/AravisProject/aravis
 
-LUCID Arena SDK
----------------
-
-The optional vixel_lucid provider can link to a separately installed LUCID
-Arena SDK. The SDK is not included in this repository. Users are responsible
-for obtaining it from LUCID Vision Labs and complying with its license.
-
 ROS, GenICam, GigE Vision, USB3 Vision, LUCID, IDS, and other names may be
 trademarks of their respective owners. Their mention does not imply endorsement.

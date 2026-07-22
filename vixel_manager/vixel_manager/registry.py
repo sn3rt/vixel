@@ -920,7 +920,7 @@ class Registry:
                 "calibration_url": str((camera or {}).get("calibration_url", "")),
                 "network_id": network_id,
                 "assigned_address": assigned_address,
-                "capabilities": ["image", "jpeg_preview", "ptp_action_capture"],
+                "capabilities": ["image", "jpeg_preview"],
             }
             migrated["known_sensors"][sensor_id] = _known_from_sensor(
                 sensor_id,

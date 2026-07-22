@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Vixel is a modular ROS 2 platform for discovering, configuring, organizing, and
-previewing GenICam cameras. It uses Aravis for vendor-neutral GigE Vision and
+previewing GenICam cameras. It uses Aravis for GigE Vision and
 USB3 Vision access, keeps camera identity separate from physical placement, and
 provides a dynamic browser dashboard through an SSH tunnel.
 
@@ -22,9 +22,8 @@ provides a dynamic browser dashboard through an SSH tunnel.
 - Standard and arbitrary typed GenICam feature configuration.
 - ROS image, compressed preview, camera-info, inventory, and control interfaces.
 - Editable location, pose, calibration, notes, and per-camera settings.
-- Preview and synchronized capture groups with explicit degraded/strict policies.
+- Preview and grouped capture with explicit degraded/strict membership policies.
 - Loopback-only web dashboard, API, snapshots, and cached image streams.
-- Optional LUCID Arena backend for scheduled Action Commands.
 
 ## Compatibility
 
@@ -34,7 +33,6 @@ provides a dynamic browser dashboard through an SSH tunnel.
 | USB3 Vision + GenICam | Experimental | Aravis transport is enabled; Vixel USB enrollment is not yet complete. |
 | Vendor GenTL only | Not automatic | Requires a dedicated provider or compatible transport integration. |
 | Legacy/proprietary USB | Unsupported by generic backend | For example, IDS `UI-` cameras require IDS software. |
-| LUCID Arena | Optional fallback | Requires a separately installed Arena SDK. |
 
 Compatibility depends on standards compliance, supported pixel formats, and the
 GenICam nodes exposed by the camera. A manufacturer or model does not need a

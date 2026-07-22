@@ -6,13 +6,7 @@
 ros2 launch vixel cameras_launch.py web_preview:=true
 ```
 
-The default backend is the generic Aravis provider. Select the optional Arena
-backend only when it was built against an installed SDK:
-
-```bash
-ros2 launch vixel cameras_launch.py \
-  web_preview:=true camera_backend:=lucid
-```
+The camera backend is the Aravis-based GenICam provider.
 
 The launch shuts down the stack if a core node exits, avoiding stale processes
 holding cameras or the dashboard port.
@@ -50,8 +44,7 @@ ROS image topics. Capture belongs to a named sync group.
 
 A `strict` group requires every member. A `degraded` group captures ready
 members when another member is unavailable. The generic backend uses host
-software triggers and reports captures as not PTP synchronized. The optional
-LUCID backend can use PTP and scheduled Action Commands.
+software triggers and reports captures as not PTP synchronized.
 
 ## ROS interfaces
 

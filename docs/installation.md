@@ -22,9 +22,6 @@ Aravis 0.8.34 or newer can be supplied by the system. If it is absent, the
 that fallback requires Git, Meson, GLib, GObject, GIO, and libxml2 development
 packages.
 
-Arena SDK is optional. When it is absent, the LUCID-specific provider is simply
-not built and the generic Aravis provider remains available.
-
 ## Project environment with direnv
 
 Direnv is optional but convenient for development:
@@ -67,4 +64,4 @@ colcon test
 colcon test-result --verbose
 ```
 
-The hardware-independent test suite does not require cameras or Arena SDK.
+The hardware-independent test suite does not require connected cameras.
