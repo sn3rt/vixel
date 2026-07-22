@@ -51,12 +51,39 @@ GenicamConfig load_genicam_config(const std::string & path)
     config.networks[network.id] = network;
   }
 
-  const auto provider = root["providers"]["genicam"];
+  const auto providers = root["providers"];
+  if (!providers || !providers.IsMap()) {
+    throw std::runtime_error(
+            "machine configuration is missing providers.genicam; "
+            "migrate configuration from the removed providers.lucid backend");
+  }
+  YAML::Node genicam_provider;
+  YAML::Node legacy_provider;
+  for (const auto & item : providers) {
+    const auto name = item.first.as<std::string>();
+    if (name == "genicam") {
+      genicam_provider = item.second;
+    } else if (name == "lucid") {
+      legacy_provider = item.second;
+    }
+  }
+  // Backward-compatible, in-memory migration. The generic defaults cover
+  // settings that did not exist in the Arena-backed configuration.
+  const bool migrating_legacy = !genicam_provider.IsMap() && legacy_provider.IsMap();
+  const auto provider = migrating_legacy ? legacy_provider : genicam_provider;
+  if (!provider.IsMap()) {
+    throw std::runtime_error(
+            "machine configuration is missing providers.genicam; "
+            "migrate configuration from the removed providers.lucid backend");
+  }
   config.vendor_allowlist = read_or(
     provider, "vendor_allowlist", std::vector<std::string>{});
   config.discovery_period_ms = read_or(
     provider, "discovery_period_ms", config.discovery_period_ms);
   config.image_timeout_ms = read_or(provider, "image_timeout_ms", config.image_timeout_ms);
+  if (migrating_legacy) {
+    config.image_timeout_ms = std::min(config.image_timeout_ms, 1000);
+  }
   config.buffer_count = std::max(4, read_or(provider, "buffer_count", config.buffer_count));
   config.socket_buffer_bytes = read_or(
     provider, "socket_buffer_bytes", config.socket_buffer_bytes);

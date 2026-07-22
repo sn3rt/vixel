@@ -168,6 +168,12 @@ def test_overlapping_managed_networks_are_rejected():
         validate_machine(broken)
 
 
+def test_legacy_lucid_provider_is_migrated_in_memory():
+    machine = validate_machine(MACHINE)
+    assert "lucid" not in machine["providers"]
+    assert machine["providers"]["genicam"]["imaging"]["frame_rate_hz"] == 10.0
+
+
 def test_v1_inventory_is_migrated_with_backup(tmp_path):
     machine_path = tmp_path / "machine.yaml"
     inventory_path = tmp_path / "inventory.yaml"

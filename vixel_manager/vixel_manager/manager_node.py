@@ -90,6 +90,11 @@ def _dict_to_pose(value: dict[str, Any] | None) -> Pose:
 class InventoryManager(Node):
     def __init__(self) -> None:
         super().__init__("inventory_manager", namespace="/vixel")
+        # rclpy may destroy a partially constructed node when startup fails.
+        # Establish cleanup state before loading any fallible configuration.
+        self.lock = threading.RLock()
+        self.catalog_dirty = False
+        self.port_status_monitor = None
         self.callback_group = ReentrantCallbackGroup()
         machine_file = self.declare_parameter("machine_file", "/etc/vixel/machine.yaml").value
         inventory_file = self.declare_parameter(
@@ -126,11 +131,9 @@ class InventoryManager(Node):
         self.get_logger().info(f"Machine configuration: {machine_file}")
         self.get_logger().info(f"Inventory state: {inventory_file}")
 
-        self.lock = threading.RLock()
         self.generation = 1
         self.observations: dict[str, tuple[dict[str, Any], float]] = {}
         self.known_checkpoint_at: dict[str, float] = {}
-        self.catalog_dirty = False
         self.runtime: dict[str, Sensor] = {}
         self.provider_groups: dict[str, SyncGroup] = {}
         self.sensor_modes: dict[str, str] = {}
@@ -752,8 +755,10 @@ class InventoryManager(Node):
         return message
 
     def destroy_node(self):
-        self._flush_catalog()
-        self.port_status_monitor.stop()
+        if hasattr(self, "registry"):
+            self._flush_catalog()
+        if self.port_status_monitor is not None:
+            self.port_status_monitor.stop()
         return super().destroy_node()
 
     def _publish_static_transforms(self, sensor_array: SensorArray) -> None:

@@ -174,6 +174,23 @@ def validate_machine(data: dict[str, Any]) -> dict[str, Any]:
     defaults = result.setdefault("defaults", {})
     if not isinstance(networks, dict) or not isinstance(providers, dict):
         raise RegistryError("managed_networks and providers must be mappings")
+    # Releases before the generic backend stored the same camera settings under
+    # providers.lucid. Keep existing machines bootable while presenting only
+    # the generic provider to the rest of the runtime.
+    if "genicam" not in providers and isinstance(providers.get("lucid"), dict):
+        legacy = providers.pop("lucid")
+        legacy_imaging = legacy.get("imaging", {})
+        if not isinstance(legacy_imaging, dict):
+            legacy_imaging = {}
+        providers["genicam"] = {
+            "vendor_allowlist": [],
+            "discovery_period_ms": legacy.get("discovery_period_ms", 2000),
+            "image_timeout_ms": min(int(legacy.get("image_timeout_ms", 1000)), 1000),
+            "buffer_count": 16,
+            "socket_buffer_bytes": 33554432,
+            "imaging": copy.deepcopy(legacy_imaging),
+        }
+        providers["genicam"]["imaging"].setdefault("frame_rate_hz", 10.0)
     defaults.setdefault("preview_rate_hz", 2.0)
     defaults.setdefault("preview_width", 960)
     defaults.setdefault("jpeg_quality", 70)
