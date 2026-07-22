@@ -1,0 +1,12 @@
+string candidate_id
+string sensor_id
+string serial
+string mac_address
+string network_id
+string target_address
+string subnet_mask
+string gateway
+---
+bool success
+string message
+string current_address

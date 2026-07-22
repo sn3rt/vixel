@@ -1,0 +1,15 @@
+builtin_interfaces/Time stamp
+string network_id
+string interface_name
+string interface_mac
+string mode
+bool approved
+bool auto_enroll
+bool configured
+bool link_up
+string host_cidr
+uint32 capacity
+string[] enrolled_sensor_ids
+string[] discovered_candidate_ids
+string lifecycle_state
+string last_error

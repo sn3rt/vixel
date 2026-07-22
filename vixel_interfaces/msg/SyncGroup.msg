@@ -1,0 +1,12 @@
+builtin_interfaces/Time stamp
+string group_id
+string provider
+string[] member_ids
+string missing_policy
+string operating_mode
+float64 preview_rate_hz
+string preferred_master_id
+bool ready
+string[] online_member_ids
+string[] missing_member_ids
+string last_error

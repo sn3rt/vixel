@@ -1,0 +1,11 @@
+string name
+string value_type
+bool readable
+bool writable
+string current_value_json
+string minimum_value_json
+string maximum_value_json
+string increment_value_json
+string[] enum_values
+string unit
+string description

@@ -1,0 +1,12 @@
+string operation
+string candidate_id
+string source_sensor_id
+string target_network_id
+---
+bool success
+string message
+vixel_interfaces/Sensor sensor
+---
+string stage
+string detail
+uint8 progress_percent

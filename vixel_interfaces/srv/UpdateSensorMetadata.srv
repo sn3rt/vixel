@@ -1,0 +1,12 @@
+string sensor_id
+string display_name
+string location_label
+bool has_pose
+string parent_frame
+geometry_msgs/Pose pose
+string calibration_url
+bool enabled
+---
+bool success
+string message
+vixel_interfaces/Sensor sensor

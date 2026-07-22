@@ -1,0 +1,9 @@
+string group_id
+string request_id
+---
+bool success
+string message
+builtin_interfaces/Time scheduled_time
+string capture_id
+string[] participating_sensor_ids
+string[] missing_sensor_ids

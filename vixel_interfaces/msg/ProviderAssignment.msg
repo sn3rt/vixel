@@ -1,0 +1,17 @@
+builtin_interfaces/Time stamp
+string sensor_id
+string provider
+string kind
+string serial
+string mac_address
+bool enabled
+string frame_id
+string calibration_url
+string network_id
+string assigned_address
+string sync_group
+string group_missing_policy
+string preferred_master_id
+string operating_mode
+float64 preview_rate_hz
+string provider_settings_json

@@ -1,0 +1,22 @@
+Vixel third-party notices
+=========================
+
+Aravis
+------
+
+The default GenICam provider links to Aravis. When a compatible system copy is
+not available, the build downloads the pinned Aravis source release configured
+in vixel_aravis_vendor. Aravis is distributed under the GNU Lesser General
+Public License v2.1. Its source and license are available at:
+
+https://github.com/AravisProject/aravis
+
+LUCID Arena SDK
+---------------
+
+The optional vixel_lucid provider can link to a separately installed LUCID
+Arena SDK. The SDK is not included in this repository. Users are responsible
+for obtaining it from LUCID Vision Labs and complying with its license.
+
+ROS, GenICam, GigE Vision, USB3 Vision, LUCID, IDS, and other names may be
+trademarks of their respective owners. Their mention does not imply endorsement.

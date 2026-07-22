@@ -1,0 +1,6 @@
+string sensor_id
+string[] names
+---
+bool success
+string message
+vixel_interfaces/CameraFeature[] features

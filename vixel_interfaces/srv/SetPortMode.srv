@@ -1,0 +1,6 @@
+string network_id
+string mode
+---
+bool success
+string message
+vixel_interfaces/ManagedPort port

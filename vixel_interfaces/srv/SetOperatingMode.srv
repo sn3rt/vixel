@@ -1,0 +1,6 @@
+string target_kind
+string target_id
+string mode
+---
+bool success
+string message

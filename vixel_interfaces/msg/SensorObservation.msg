@@ -1,0 +1,12 @@
+builtin_interfaces/Time stamp
+string provider
+string candidate_id
+string kind
+string vendor
+string model
+string serial
+string mac_address
+string transport
+string interface_name
+string current_address
+string[] capabilities

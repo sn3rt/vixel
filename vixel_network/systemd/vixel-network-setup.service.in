@@ -1,0 +1,12 @@
+[Unit]
+Description=Configure Vixel managed sensor networks
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=@VIXEL_NETWORK_SETUP@ --machine-file /etc/vixel/machine.yaml apply
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

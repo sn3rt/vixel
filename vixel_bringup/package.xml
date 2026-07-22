@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>vixel</name>
+  <version>0.2.0</version>
+  <description>Bringup and machine configuration for the modular Vixel sensor platform.</description>
+  <maintainer email="sn3rt@users.noreply.github.com">sn3rt</maintainer>
+  <license>MIT</license>
+  <url type="repository">https://github.com/sn3rt/vixel</url>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>ros2launch</exec_depend>
+  <exec_depend>vixel_interfaces</exec_depend>
+  <exec_depend>vixel_genicam</exec_depend>
+  <exec_depend>vixel_lucid</exec_depend>
+  <exec_depend>vixel_manager</exec_depend>
+  <exec_depend>vixel_network</exec_depend>
+  <exec_depend>vixel_web</exec_depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>

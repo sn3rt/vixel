@@ -1,0 +1,7 @@
+string sensor_id
+string notes
+string provider_settings_json
+---
+bool success
+string message
+vixel_interfaces/KnownSensor sensor

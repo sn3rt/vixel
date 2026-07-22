@@ -1,0 +1,88 @@
+schema_version: 1
+
+# Copy this file to /etc/vixel/machine.yaml and replace every example interface,
+# MAC address, and subnet with values for the target computer. The locally
+# administered MAC addresses below are intentionally not real hardware.
+host_tuning:
+  udp_receive_buffer_bytes: 33554432
+  netdev_max_backlog: 4096
+
+managed_networks:
+  camera_link_0:
+    interface: enp2s0
+    interface_mac: "02:00:00:00:00:02"
+    approved: true
+    auto_enroll: true
+    mode: direct
+    host_cidr: 192.168.10.1/24
+    address_pool: {start: 192.168.10.11, end: 192.168.10.42}
+    max_devices: 1
+    switched_max_devices: 32
+    mtu: 9000
+    rp_filter: 0
+    gateway: 0.0.0.0
+    packet_size: 9000
+    packet_delay: 1000
+    transfer_slot_ms: 100
+
+  # A switch may host multiple cameras. Give each switched port its own subnet.
+  camera_link_1:
+    interface: enp3s0
+    interface_mac: "02:00:00:00:00:03"
+    approved: true
+    auto_enroll: true
+    mode: switched
+    host_cidr: 192.168.11.1/24
+    address_pool: {start: 192.168.11.11, end: 192.168.11.42}
+    max_devices: 1
+    switched_max_devices: 32
+    mtu: 9000
+    rp_filter: 0
+    gateway: 0.0.0.0
+    packet_size: 9000
+    packet_delay: 1000
+    transfer_slot_ms: 100
+
+providers:
+  genicam:
+    vendor_allowlist: []
+    discovery_period_ms: 2000
+    image_timeout_ms: 1000
+    buffer_count: 16
+    socket_buffer_bytes: 33554432
+    imaging:
+      pixel_format: BGR8
+      use_max_width: true
+      use_max_height: true
+      exposure_auto: Continuous
+      exposure_time_us: 1000.0
+      gain_auto: Continuous
+      gain_db: 0.0
+      frame_rate_hz: 10.0
+
+  # Optional fallback; the provider is built only when Arena SDK is installed.
+  lucid:
+    model_allowlist: []
+    discovery_period_ms: 2000
+    image_timeout_ms: 5000
+    schedule_lead_ms: 250
+    action_device_key: 1
+    action_group_key: 1
+    action_group_mask: 1
+    imaging:
+      pixel_format: BGR8
+      use_max_width: true
+      use_max_height: true
+      exposure_auto: Continuous
+      exposure_time_us: 1000.0
+      gain_auto: Continuous
+      gain_db: 0.0
+
+defaults:
+  camera_backend: genicam
+  startup_mode: idle
+  preview_rate_hz: 2.0
+  preview_width: 960
+  preview_format: jpeg
+  png_compression: 3
+  jpeg_quality: 70

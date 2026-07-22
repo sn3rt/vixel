@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>vixel_aravis_vendor</name>
+  <version>0.2.0</version>
+  <description>Build interface for the Aravis GenICam transport used by Vixel.</description>
+  <maintainer email="sn3rt@users.noreply.github.com">sn3rt</maintainer>
+  <license>MIT</license>
+  <url type="repository">https://github.com/sn3rt/vixel</url>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <build_depend>git</build_depend>
+  <build_depend>libxml2</build_depend>
+  <build_depend>meson</build_depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>

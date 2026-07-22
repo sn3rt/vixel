@@ -1,0 +1,13 @@
+string candidate_id
+string network_id
+string requested_address
+string display_name
+string location_label
+---
+bool success
+string message
+vixel_interfaces/Sensor sensor
+---
+string stage
+string detail
+uint8 progress_percent

@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    container: ubuntu:26.04
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      LANG: en_US.UTF-8
+      LC_ALL: en_US.UTF-8
+      ROS_DISTRO: lyrical
+    steps:
+      - name: Install bootstrap tools
+        run: |
+          apt-get update
+          apt-get install -y curl git locales software-properties-common
+          locale-gen en_US en_US.UTF-8
+          add-apt-repository universe
+
+      - name: Configure ROS repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(curl -fsSL https://api.github.com/repos/ros-infrastructure/ros-apt-source/releases/latest \
+            | sed -n 's/.*"tag_name": "\([^"]*\)".*/\1/p')"
+          test -n "$version"
+          curl -fsSL -o /tmp/ros2-apt-source.deb \
+            "https://github.com/ros-infrastructure/ros-apt-source/releases/download/${version}/ros2-apt-source_${version}.resolute_all.deb"
+          dpkg -i /tmp/ros2-apt-source.deb
+          apt-get update
+
+      - name: Install ROS and development tools
+        run: |
+          apt-get install -y gjs ros-lyrical-ros-base ros-dev-tools
+
+      - uses: actions/checkout@v4
+
+      - name: Install workspace dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          source /opt/ros/lyrical/setup.bash
+          rosdep update
+          rosdep install --from-paths . --ignore-src -r -y --rosdistro lyrical \
+            --skip-keys "ament_pytest gjs"
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          source /opt/ros/lyrical/setup.bash
+          colcon build --event-handlers console_direct+
+
+      - name: Test
+        shell: bash
+        run: |
+          set -euo pipefail
+          source /opt/ros/lyrical/setup.bash
+          source install/setup.bash
+          colcon test --event-handlers console_direct+
+          colcon test-result --verbose

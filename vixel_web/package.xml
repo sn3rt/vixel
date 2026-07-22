@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>vixel_web</name>
+  <version>0.2.0</version>
+  <description>Dynamic browser UI and precompressed image gateway for Vixel.</description>
+  <maintainer email="sn3rt@users.noreply.github.com">sn3rt</maintainer>
+  <license>MIT</license>
+  <url type="repository">https://github.com/sn3rt/vixel</url>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>vixel_interfaces</exec_depend>
+  <test_depend>ament_pytest</test_depend>
+  <test_depend>gjs</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export><build_type>ament_python</build_type></export>
+</package>
