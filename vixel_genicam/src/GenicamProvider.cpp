@@ -25,6 +25,7 @@
 #include <yaml-cpp/yaml.h>
 
 #include <arpa/inet.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -73,9 +74,164 @@ struct DeviceRecord
   std::string interface_name;
 };
 
+class ScopedSocket
+{
+public:
+  explicit ScopedSocket(int value = -1) : value_(value) {}
+  ~ScopedSocket() {if (value_ >= 0) {close(value_);}}
+  ScopedSocket(const ScopedSocket &) = delete;
+  ScopedSocket & operator=(const ScopedSocket &) = delete;
+  int get() const {return value_;}
+
+private:
+  int value_;
+};
+
 std::string value_or_empty(const char * value)
 {
   return value == nullptr ? std::string{} : std::string(value);
+}
+
+std::string fixed_text(const std::uint8_t * value, std::size_t size)
+{
+  std::size_t length = 0;
+  while (length < size && value[length] != 0) {++length;}
+  std::string result(reinterpret_cast<const char *>(value), length);
+  while (!result.empty() && std::isspace(static_cast<unsigned char>(result.back()))) {
+    result.pop_back();
+  }
+  return result;
+}
+
+std::vector<DeviceRecord> gvcp_discover(
+  const std::string & interface_name, const std::string & source_address,
+  std::chrono::milliseconds timeout)
+{
+  constexpr std::uint16_t gvcp_port = 3956;
+  constexpr std::uint16_t discovery_command = 0x0002;
+  constexpr std::uint16_t discovery_acknowledge = 0x0003;
+  constexpr std::size_t discovery_reply_size = 256;
+  static std::atomic<std::uint16_t> request_sequence{1};
+
+  ScopedSocket source_socket(socket(AF_INET, SOCK_DGRAM, 0));
+  if (source_socket.get() < 0) {throw std::runtime_error("cannot create GVCP discovery socket");}
+  int enabled = 1;
+  if (setsockopt(
+      source_socket.get(), SOL_SOCKET, SO_BROADCAST, &enabled, sizeof(enabled)) != 0 ||
+    setsockopt(
+      source_socket.get(), SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled)) != 0)
+  {
+    throw std::runtime_error("cannot configure GVCP discovery socket");
+  }
+  sockaddr_in source{};
+  source.sin_family = AF_INET;
+  source.sin_port = 0;
+  if (inet_pton(AF_INET, source_address.c_str(), &source.sin_addr) != 1 ||
+    bind(
+      source_socket.get(), reinterpret_cast<const sockaddr *>(&source), sizeof(source)) != 0)
+  {
+    throw std::runtime_error(
+            "cannot bind GVCP discovery source " + source_address + " on " + interface_name);
+  }
+  socklen_t source_size = sizeof(source);
+  if (getsockname(
+      source_socket.get(), reinterpret_cast<sockaddr *>(&source), &source_size) != 0)
+  {
+    throw std::runtime_error("cannot determine GVCP discovery source port");
+  }
+
+  // Off-subnet cameras broadcast their acknowledgement because they cannot
+  // route a unicast response to the host address. A wildcard socket on the
+  // same port is therefore required in addition to the source-bound socket.
+  ScopedSocket wildcard_socket(socket(AF_INET, SOCK_DGRAM, 0));
+  if (wildcard_socket.get() < 0 || setsockopt(
+      wildcard_socket.get(), SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled)) != 0)
+  {
+    throw std::runtime_error("cannot create GVCP wildcard receive socket");
+  }
+  sockaddr_in wildcard{};
+  wildcard.sin_family = AF_INET;
+  wildcard.sin_port = source.sin_port;
+  wildcard.sin_addr.s_addr = htonl(INADDR_ANY);
+  if (bind(
+      wildcard_socket.get(), reinterpret_cast<const sockaddr *>(&wildcard),
+      sizeof(wildcard)) != 0)
+  {
+    throw std::runtime_error("cannot bind GVCP wildcard receive socket");
+  }
+
+  std::array<std::uint8_t, 8> request{
+    0x42, 0x11,
+    static_cast<std::uint8_t>((discovery_command >> 8) & 0xff),
+    static_cast<std::uint8_t>(discovery_command & 0xff),
+    0x00, 0x00, 0x00, 0x00};
+  const auto next_request = request_sequence.fetch_add(1);
+  const auto request_id = next_request == 0 ? 1 : next_request;
+  request[6] = static_cast<std::uint8_t>((request_id >> 8) & 0xff);
+  request[7] = static_cast<std::uint8_t>(request_id & 0xff);
+  sockaddr_in destination{};
+  destination.sin_family = AF_INET;
+  destination.sin_port = htons(gvcp_port);
+  destination.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+  if (sendto(
+      source_socket.get(), request.data(), request.size(), 0,
+      reinterpret_cast<const sockaddr *>(&destination), sizeof(destination)) !=
+    static_cast<ssize_t>(request.size()))
+  {
+    throw std::runtime_error(
+            "GVCP discovery send failed on " + interface_name + ": " + std::strerror(errno));
+  }
+
+  std::map<std::string, DeviceRecord> discovered;
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  std::array<pollfd, 2> sockets{{
+    {source_socket.get(), POLLIN, 0}, {wildcard_socket.get(), POLLIN, 0}}};
+  while (std::chrono::steady_clock::now() < deadline) {
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+      deadline - std::chrono::steady_clock::now());
+    if (poll(sockets.data(), sockets.size(), std::max(1, static_cast<int>(remaining.count()))) <= 0) {
+      break;
+    }
+    for (auto & candidate : sockets) {
+      if ((candidate.revents & POLLIN) == 0) {continue;}
+      std::array<std::uint8_t, 1024> reply{};
+      const auto length = recv(candidate.fd, reply.data(), reply.size(), 0);
+      if (length < static_cast<ssize_t>(discovery_reply_size) ||
+        reply[2] != static_cast<std::uint8_t>((discovery_acknowledge >> 8) & 0xff) ||
+        reply[3] != static_cast<std::uint8_t>(discovery_acknowledge & 0xff) ||
+        reply[6] != request[6] || reply[7] != request[7])
+      {
+        continue;
+      }
+      DeviceRecord record;
+      std::ostringstream mac;
+      mac << std::hex;
+      for (std::size_t index = 18; index < 24; ++index) {
+        if (index != 18) {mac << ':';}
+        mac.width(2);
+        mac.fill('0');
+        mac << static_cast<unsigned int>(reply[index]);
+      }
+      record.physical_id = mac.str();
+      in_addr address{};
+      std::memcpy(&address.s_addr, reply.data() + 44, sizeof(address.s_addr));
+      std::array<char, INET_ADDRSTRLEN> address_text{};
+      if (inet_ntop(AF_INET, &address, address_text.data(), address_text.size()) == nullptr) {
+        continue;
+      }
+      record.address = address_text.data();
+      record.vendor = fixed_text(reply.data() + 80, 32);
+      record.model = fixed_text(reply.data() + 112, 32);
+      record.serial = fixed_text(reply.data() + 224, 16);
+      record.device_id = record.vendor + "-" + record.serial;
+      record.protocol = "GigEVision";
+      record.interface_name = interface_name;
+      if (!record.serial.empty()) {discovered[record.vendor + "\n" + record.serial] = record;}
+    }
+  }
+  std::vector<DeviceRecord> result;
+  for (auto & item : discovered) {result.push_back(std::move(item.second));}
+  return result;
 }
 
 bool feature_writable(ArvCamera * camera, const char * feature)
@@ -1141,8 +1297,19 @@ private:
         {
           continue;
         }
-        arv_gv_interface_set_discovery_interface_name(item.second.interface.c_str());
-        collect_current_devices(item.second.interface, discovered);
+        const auto raw_devices = gvcp_discover(
+          item.second.interface, host_address_for_cidr(item.second.host_cidr), 300ms);
+        for (const auto & record : raw_devices) {
+          if (vendor_allowed(record.vendor)) {
+            discovered[record.vendor + "\n" + record.serial] = record;
+          }
+        }
+        // Keep Aravis' interface-local scan as a fallback for devices whose
+        // discovery acknowledgement does not use the standard GVCP layout.
+        if (raw_devices.empty()) {
+          arv_gv_interface_set_discovery_interface_name(item.second.interface.c_str());
+          collect_current_devices(item.second.interface, discovered);
+        }
       }
     } catch (const std::exception & error) {
       last_system_error_ = error.what();
