@@ -725,6 +725,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
 
@@ -743,6 +744,10 @@ class Handler(BaseHTTPRequestHandler):
         return value
 
     def do_GET(self):
+        # Finite dashboard requests must not occupy a server worker until the
+        # idle socket timeout. Streaming handlers still remain active until
+        # their method returns, after which their connection is closed too.
+        self.close_connection = True
         parsed = urllib.parse.urlparse(self.path)
         parts = [part for part in parsed.path.split("/") if part]
         if parsed.path == "/" or parsed.path == "/index.html":
@@ -751,6 +756,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
         elif parsed.path == "/api/v1/sensors":
@@ -824,6 +830,7 @@ class Handler(BaseHTTPRequestHandler):
         self._mutate("DELETE")
 
     def _mutate(self, method: str):
+        self.close_connection = True
         parsed = urllib.parse.urlparse(self.path)
         parts = [part for part in parsed.path.split("/") if part]
         node = self.server.node
@@ -911,6 +918,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("X-Vixel-Frame-Age-Ms", frame_age_ms)
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
             self.end_headers()
             return
         self.send_response(HTTPStatus.OK)
@@ -919,6 +927,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("ETag", etag)
         self.send_header("X-Vixel-Frame-Age-Ms", frame_age_ms)
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(data)
 

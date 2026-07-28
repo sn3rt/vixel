@@ -1,9 +1,11 @@
+import io
 import threading
 from http.server import ThreadingHTTPServer
 from types import SimpleNamespace
 
 from vixel_web.gateway import (
     capture_record_to_dict,
+    Handler,
     VixelHTTPServer,
     health_response,
     is_routine_snapshot_request,
@@ -72,6 +74,50 @@ class _FakeRequest:
 
     def sendall(self, value):
         self.response += value
+
+
+class _HTTPConnection:
+    def __init__(self, request: bytes):
+        self.input = io.BytesIO(request)
+        self.response = bytearray()
+        self.timeout = None
+
+    def makefile(self, mode, _buffering=None):
+        assert mode == "rb"
+        return self.input
+
+    def sendall(self, value):
+        self.response.extend(value)
+
+    def settimeout(self, value):
+        self.timeout = value
+
+
+class _Logger:
+    def debug(self, *_args):
+        pass
+
+    def info(self, *_args):
+        pass
+
+
+def test_finite_http_response_closes_connection_immediately():
+    node = SimpleNamespace(
+        health=lambda: (200, {"status": "ok"}),
+        get_logger=lambda: _Logger(),
+    )
+    server = SimpleNamespace(node=node)
+    connection = _HTTPConnection(
+        b"GET /api/v1/health HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    )
+
+    handler = Handler(connection, ("127.0.0.1", 12345), server)
+
+    response = bytes(connection.response)
+    assert response.startswith(b"HTTP/1.1 200 OK\r\n")
+    assert b"\r\nConnection: close\r\n" in response
+    assert handler.close_connection
+    assert connection.timeout == 40.0
 
 
 def test_http_connection_limit_returns_503_without_starting_handler_thread():

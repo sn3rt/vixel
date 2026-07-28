@@ -457,11 +457,36 @@ private:
       std::size_t reported_count = 0;
       const auto deadline = std::chrono::steady_clock::now() + config_.capture_timeout;
       rclcpp::WaitSet wait_set;
+      struct WaitSetSubscriptions
+      {
+        rclcpp::WaitSet & wait_set;
+        std::vector<std::shared_ptr<rclcpp::SubscriptionBase>> subscriptions;
+
+        void add(const std::shared_ptr<rclcpp::SubscriptionBase> & subscription)
+        {
+          wait_set.add_subscription(subscription);
+          subscriptions.push_back(subscription);
+        }
+
+        ~WaitSetSubscriptions()
+        {
+          for (
+            auto iterator = subscriptions.rbegin();
+            iterator != subscriptions.rend(); ++iterator)
+          {
+            try {
+              wait_set.remove_subscription(*iterator);
+            } catch (...) {
+              // Cleanup must not mask the capture result during stack unwinding.
+            }
+          }
+        }
+      } wait_set_subscriptions{wait_set, {}};
       for (const auto & subscription : subscriptions.image_subscriptions) {
-        wait_set.add_subscription(subscription.second);
+        wait_set_subscriptions.add(subscription.second);
       }
       for (const auto & subscription : subscriptions.info_subscriptions) {
-        wait_set.add_subscription(subscription.second);
+        wait_set_subscriptions.add(subscription.second);
       }
       std::size_t chunks_taken = 0;
       while (std::chrono::steady_clock::now() < deadline) {
