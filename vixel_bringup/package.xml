@@ -15,6 +15,7 @@
   <exec_depend>vixel_genicam</exec_depend>
   <exec_depend>vixel_manager</exec_depend>
   <exec_depend>vixel_network</exec_depend>
+  <exec_depend>vixel_recorder</exec_depend>
   <exec_depend>vixel_web</exec_depend>
   <export><build_type>ament_cmake</build_type></export>
 </package>

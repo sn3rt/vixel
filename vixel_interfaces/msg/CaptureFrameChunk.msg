@@ -1,0 +1,9 @@
+std_msgs/Header header
+string capture_id
+string sensor_id
+string format
+uint32 width
+uint32 height
+uint32 chunk_index
+uint32 chunk_count
+uint8[] data

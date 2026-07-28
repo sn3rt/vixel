@@ -171,9 +171,14 @@ def validate_machine(data: dict[str, Any]) -> dict[str, Any]:
     result["schema_version"] = MACHINE_SCHEMA_VERSION
     networks = result.setdefault("managed_networks", {})
     providers = result.setdefault("providers", {})
+    recording = result.setdefault("recording", {})
     defaults = result.setdefault("defaults", {})
-    if not isinstance(networks, dict) or not isinstance(providers, dict):
-        raise RegistryError("managed_networks and providers must be mappings")
+    if (
+        not isinstance(networks, dict)
+        or not isinstance(providers, dict)
+        or not isinstance(recording, dict)
+    ):
+        raise RegistryError("managed_networks, providers, and recording must be mappings")
     # Releases before the generic backend stored the same camera settings under
     # providers.lucid. Keep existing machines bootable while presenting only
     # the generic provider to the rest of the runtime.
@@ -191,6 +196,21 @@ def validate_machine(data: dict[str, Any]) -> dict[str, Any]:
             "imaging": copy.deepcopy(legacy_imaging),
         }
         providers["genicam"]["imaging"].setdefault("frame_rate_hz", 10.0)
+    recording.setdefault("root_directory", "/var/lib/vixel/captures")
+    recording.setdefault("minimum_free_bytes", 5 * 1024 * 1024 * 1024)
+    recording.setdefault("capture_timeout_ms", 10000)
+    recording.setdefault("png_compression", 3)
+    recording.setdefault("recent_limit", 100)
+    if not str(recording["root_directory"]).strip():
+        raise RegistryError("recording.root_directory must not be empty")
+    if int(recording["minimum_free_bytes"]) < 0:
+        raise RegistryError("recording.minimum_free_bytes must not be negative")
+    if not 1000 <= int(recording["capture_timeout_ms"]) <= 60000:
+        raise RegistryError("recording.capture_timeout_ms must be between 1000 and 60000")
+    if not 0 <= int(recording["png_compression"]) <= 9:
+        raise RegistryError("recording.png_compression must be between 0 and 9")
+    if not 1 <= int(recording["recent_limit"]) <= 1000:
+        raise RegistryError("recording.recent_limit must be between 1 and 1000")
     defaults.setdefault("preview_rate_hz", 2.0)
     defaults.setdefault("preview_width", 960)
     defaults.setdefault("jpeg_quality", 70)

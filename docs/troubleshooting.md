@@ -56,3 +56,15 @@ The dashboard polls cached compressed snapshots and does not control the raw
 camera rate. Check provider acquisition warnings, preview rate, JPEG encoding
 load, network loss, and browser tunnel latency. A successful HTTP response can
 still contain an old cached frame when acquisition has stalled.
+
+## Capture is rejected or times out
+
+The group must be in `capture` mode and ready. Check `/vixel/sync_groups`, the
+action feedback, and the recent failed manifest. A disk-space rejection means
+the filesystem is below `recording.minimum_free_bytes`; Vixel will not remove
+older data for you.
+
+Full-resolution captures use a reliable chunked ROS transport so large BGR8
+frames do not depend on middleware-specific maximum sample tuning. Repeated
+timeouts still indicate a missing camera frame, a provider that has not
+implemented the capture-chunk contract, or severe local resource pressure.

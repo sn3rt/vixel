@@ -11,11 +11,14 @@ def test_dashboard_is_dynamic_and_uses_gateway_endpoints():
     assert "/api/v1/sensors/" in page
     assert "/api/v1/known-sensors" in page
     assert "/api/v1/groups/" in page
+    assert "/api/v1/captures" in page
     assert "state.sensors" in page
     assert "state.knownSensors" in page
+    assert "state.captures" in page
     assert "Unenroll and archive" in page
     assert "front_left" not in page
     assert "web_video_server" not in page
+    assert "Capture and save" in page
 
 
 def test_dashboard_javascript_parses():

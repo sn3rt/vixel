@@ -3,11 +3,37 @@ from http.server import ThreadingHTTPServer
 from types import SimpleNamespace
 
 from vixel_web.gateway import (
+    capture_record_to_dict,
     VixelHTTPServer,
     health_response,
     is_routine_snapshot_request,
     known_sensor_to_dict,
 )
+
+
+def test_capture_record_is_exposed_as_json():
+    class Stamp:
+        sec = 12
+        nanosec = 34
+
+    class Record:
+        capture_id = "capture_test"
+        group_id = "pair"
+        status = "complete"
+        directory = "/tmp/capture_test"
+        message = "saved"
+        started_at = "2026-07-28T10:00:00.000Z"
+        completed_at = "2026-07-28T10:00:01.000Z"
+        scheduled_time = Stamp()
+        requested_sensor_ids = ["a", "b"]
+        participating_sensor_ids = ["a", "b"]
+        saved_sensor_ids = ["a", "b"]
+        missing_sensor_ids = []
+
+    value = capture_record_to_dict(Record())
+    assert value["capture_id"] == "capture_test"
+    assert value["scheduled_time"] == {"sec": 12, "nanosec": 34}
+    assert value["saved_sensor_ids"] == ["a", "b"]
 
 
 def test_health_response_tracks_manager_age_and_counts():

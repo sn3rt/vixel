@@ -22,7 +22,8 @@ provides a dynamic browser dashboard through an SSH tunnel.
 - Standard and arbitrary typed GenICam feature configuration.
 - ROS image, compressed preview, camera-info, inventory, and control interfaces.
 - Editable location, pose, calibration, notes, and per-camera settings.
-- Preview and grouped capture with explicit degraded/strict membership policies.
+- Preview and persistent grouped capture with full-resolution PNGs and manifests.
+- Explicit degraded/strict membership policies and capture disk safeguards.
 - Loopback-only web dashboard, API, snapshots, and cached image streams.
 
 ## Compatibility
@@ -47,14 +48,18 @@ flowchart LR
     Provider -->|observations and health| Manager[Inventory manager]
     Manager -->|assignments and groups| Provider
     Provider -->|ROS images and previews| Gateway[Web gateway]
+    Provider -->|lossless capture chunks| Recorder[Capture recorder]
+    Recorder -->|PNG sets and manifests| Storage[(Capture storage)]
+    Recorder -->|capture history| Gateway
     Manager -->|inventory and operations| Gateway
     Network[Network setup helper] -->|approved host interfaces| Cameras
     Gateway -->|127.0.0.1:8080| Browser[Browser through SSH]
 ```
 
-The image providers are C++. Inventory and web components are Python control
-plane nodes. Public ROS interfaces live in `vixel_interfaces`; new hardware
-families integrate through the [provider contract](docs/provider_contract.md).
+The image providers and capture recorder are C++. Inventory and web components
+are Python control-plane nodes. Public ROS interfaces live in
+`vixel_interfaces`; new hardware families integrate through the
+[provider contract](docs/provider_contract.md).
 
 ## Quick start
 

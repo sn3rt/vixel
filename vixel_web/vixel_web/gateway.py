@@ -22,10 +22,15 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CompressedImage
 
-from vixel_interfaces.action import EnrollSensor, ResolveSensorPlacement
-from vixel_interfaces.msg import KnownSensorArray, ManagedPortArray, SensorArray, SyncGroupArray
+from vixel_interfaces.action import EnrollSensor, RecordCapture, ResolveSensorPlacement
+from vixel_interfaces.msg import (
+    CaptureRecordArray,
+    KnownSensorArray,
+    ManagedPortArray,
+    SensorArray,
+    SyncGroupArray,
+)
 from vixel_interfaces.srv import (
-    CaptureGroup,
     DeleteSyncGroup,
     ForgetSensor,
     PurgeKnownSensor,
@@ -201,6 +206,26 @@ def port_to_dict(port) -> dict[str, Any]:
     }
 
 
+def capture_record_to_dict(record) -> dict[str, Any]:
+    return {
+        "capture_id": record.capture_id,
+        "group_id": record.group_id,
+        "status": record.status,
+        "directory": record.directory,
+        "message": record.message,
+        "started_at": record.started_at,
+        "completed_at": record.completed_at,
+        "scheduled_time": {
+            "sec": record.scheduled_time.sec,
+            "nanosec": record.scheduled_time.nanosec,
+        },
+        "requested_sensor_ids": list(record.requested_sensor_ids),
+        "participating_sensor_ids": list(record.participating_sensor_ids),
+        "saved_sensor_ids": list(record.saved_sensor_ids),
+        "missing_sensor_ids": list(record.missing_sensor_ids),
+    }
+
+
 class GatewayNode(Node):
     def __init__(self):
         super().__init__("web_gateway", namespace="/vixel")
@@ -230,6 +255,7 @@ class GatewayNode(Node):
         self.groups: dict[str, dict[str, Any]] = {}
         self.ports: dict[str, dict[str, Any]] = {}
         self.operations: dict[str, dict[str, Any]] = {}
+        self.capture_records: list[dict[str, Any]] = []
         self.frames: dict[
             str, tuple[bytes, float, int] | tuple[bytes, float, int, str]
         ] = {}
@@ -248,6 +274,10 @@ class GatewayNode(Node):
         )
         self.port_subscription = self.create_subscription(
             ManagedPortArray, "/vixel/ports", self._ports, STATE_QOS,
+            callback_group=self.callback_group
+        )
+        self.capture_records_subscription = self.create_subscription(
+            CaptureRecordArray, "/vixel/capture_records", self._capture_records, STATE_QOS,
             callback_group=self.callback_group
         )
         self.enroll_client = ActionClient(
@@ -282,8 +312,8 @@ class GatewayNode(Node):
         self.delete_group_client = self.create_client(
             DeleteSyncGroup, "/vixel/delete_sync_group", callback_group=self.callback_group
         )
-        self.capture_client = self.create_client(
-            CaptureGroup, "/vixel/capture_group", callback_group=self.callback_group
+        self.record_capture_client = ActionClient(
+            self, RecordCapture, "/vixel/record_capture", callback_group=self.callback_group
         )
 
     @staticmethod
@@ -348,6 +378,14 @@ class GatewayNode(Node):
             self.ports = {port.network_id: port_to_dict(port) for port in message.ports}
             self.changed.notify_all()
 
+    def _capture_records(self, message: CaptureRecordArray):
+        with self.changed:
+            self.generation = max(self.generation + 1, int(message.generation))
+            self.capture_records = [
+                capture_record_to_dict(record) for record in message.records
+            ]
+            self.changed.notify_all()
+
     def _frame(self, sensor_id: str, message: CompressedImage):
         image_format = message.format.lower()
         if "png" in image_format:
@@ -376,6 +414,7 @@ class GatewayNode(Node):
                 "groups": list(self.groups.values()),
                 "ports": list(self.ports.values()),
                 "operations": list(self.operations.values()),
+                "capture_records": list(self.capture_records),
             }
 
     def health(self) -> tuple[int, dict[str, Any]]:
@@ -467,6 +506,29 @@ class GatewayNode(Node):
             "success": wrapped.result.success,
             "message": wrapped.result.message,
             "sensor": sensor_to_dict(wrapped.result.sensor),
+        }
+
+    def record_capture(self, group_id: str, body: dict[str, Any]):
+        if not self.record_capture_client.wait_for_server(timeout_sec=2.0):
+            raise RuntimeError("Vixel capture recorder action is unavailable")
+        goal = RecordCapture.Goal()
+        goal.group_id = group_id
+        goal.request_id = str(body.get("request_id", ""))
+        handle = self.wait_future(
+            self.record_capture_client.send_goal_async(goal), 5.0
+        )
+        if not handle.accepted:
+            raise RuntimeError(
+                "Capture was rejected; check group mode and whether another capture is active"
+            )
+        wrapped = self.wait_future(handle.get_result_async(), 30.0)
+        return {
+            "success": wrapped.result.success,
+            "message": wrapped.result.message,
+            "capture_id": wrapped.result.capture_id,
+            "directory": wrapped.result.directory,
+            "saved_sensor_ids": list(wrapped.result.saved_sensor_ids),
+            "missing_sensor_ids": list(wrapped.result.missing_sensor_ids),
         }
 
     def start_operation(self, kind: str, target: str, worker) -> dict[str, Any]:
@@ -644,7 +706,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def setup(self):
         super().setup()
-        self.connection.settimeout(20.0)
+        self.connection.settimeout(40.0)
 
     def log_message(self, format_string, *args):
         self.server.node.get_logger().info("HTTP " + (format_string % args))
@@ -722,6 +784,12 @@ class Handler(BaseHTTPRequestHandler):
             snapshot = self.server.node.snapshot()
             self._json(HTTPStatus.OK, {
                 "generation": snapshot["generation"], "operations": snapshot["operations"]
+            })
+        elif parsed.path == "/api/v1/captures":
+            snapshot = self.server.node.snapshot()
+            self._json(HTTPStatus.OK, {
+                "generation": snapshot["generation"],
+                "capture_records": snapshot["capture_records"],
             })
         elif parsed.path == "/api/v1/system/config":
             self._json(HTTPStatus.OK, self.server.node.system_info())
@@ -808,7 +876,7 @@ class Handler(BaseHTTPRequestHandler):
             elif method == "PUT" and len(parts) == 4 and parts[:3] == ["api", "v1", "groups"]:
                 request = UpsertSyncGroup.Request()
                 request.group_id = parts[3]
-                request.provider = str(body.get("provider", "lucid"))
+                request.provider = str(body.get("provider", "genicam"))
                 request.member_ids = list(body.get("member_ids", []))
                 request.missing_policy = str(body.get("missing_policy", "strict"))
                 request.preview_rate_hz = float(body.get("preview_rate_hz", 2.0))
@@ -821,17 +889,7 @@ class Handler(BaseHTTPRequestHandler):
                 response = node.call_service(node.delete_group_client, request)
                 self._json(HTTPStatus.OK, {"success": response.success, "message": response.message})
             elif method == "POST" and len(parts) == 5 and parts[:3] == ["api", "v1", "groups"] and parts[4] == "capture":
-                request = CaptureGroup.Request()
-                request.group_id = parts[3]
-                request.request_id = str(body.get("request_id", ""))
-                response = node.call_service(node.capture_client, request, timeout=15.0)
-                self._json(HTTPStatus.OK, {
-                    "success": response.success,
-                    "message": response.message,
-                    "capture_id": response.capture_id,
-                    "participating_sensor_ids": list(response.participating_sensor_ids),
-                    "missing_sensor_ids": list(response.missing_sensor_ids),
-                })
+                self._json(HTTPStatus.OK, node.record_capture(parts[3], body))
             else:
                 self._error(HTTPStatus.NOT_FOUND, "not found")
         except (ValueError, KeyError, RuntimeError, TimeoutError, json.JSONDecodeError) as error:

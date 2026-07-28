@@ -174,6 +174,20 @@ def test_legacy_lucid_provider_is_migrated_in_memory():
     assert machine["providers"]["genicam"]["imaging"]["frame_rate_hz"] == 10.0
 
 
+def test_recording_configuration_gets_safe_defaults():
+    machine = validate_machine(MACHINE)
+    assert machine["recording"]["root_directory"] == "/var/lib/vixel/captures"
+    assert machine["recording"]["minimum_free_bytes"] == 5 * 1024 * 1024 * 1024
+    assert machine["recording"]["capture_timeout_ms"] == 10000
+
+
+def test_invalid_recording_configuration_is_rejected():
+    broken = yaml.safe_load(yaml.safe_dump(MACHINE))
+    broken["recording"] = {"png_compression": 12}
+    with pytest.raises(RegistryError, match="png_compression"):
+        validate_machine(broken)
+
+
 def test_v1_inventory_is_migrated_with_backup(tmp_path):
     machine_path = tmp_path / "machine.yaml"
     inventory_path = tmp_path / "inventory.yaml"

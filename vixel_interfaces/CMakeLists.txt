@@ -22,6 +22,9 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ProviderAssignment.msg"
   "msg/ProviderAssignmentArray.msg"
   "msg/CameraFeature.msg"
+  "msg/CaptureRecord.msg"
+  "msg/CaptureRecordArray.msg"
+  "msg/CaptureFrameChunk.msg"
   "srv/UpdateSensorMetadata.srv"
   "srv/ForgetSensor.srv"
   "srv/UpdateKnownSensor.srv"
@@ -36,6 +39,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/GetCameraFeatures.srv"
   "action/EnrollSensor.action"
   "action/ResolveSensorPlacement.action"
+  "action/RecordCapture.action"
   DEPENDENCIES action_msgs builtin_interfaces geometry_msgs std_msgs
 )
 

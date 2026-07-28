@@ -11,6 +11,7 @@
 #include <sensor_msgs/msg/image.hpp>
 #include <std_msgs/msg/header.hpp>
 #include <vixel_interfaces/msg/camera_feature.hpp>
+#include <vixel_interfaces/msg/capture_frame_chunk.hpp>
 #include <vixel_interfaces/msg/provider_assignment.hpp>
 #include <vixel_interfaces/msg/provider_assignment_array.hpp>
 #include <vixel_interfaces/msg/sensor.hpp>
@@ -563,36 +564,74 @@ class CameraEndpoint
 {
 public:
   CameraEndpoint(rclcpp::Node * node, const Assignment & assignment, const GenicamConfig & config)
-  : frame_id_(assignment.frame_id), config_(config)
+  : assignment_sensor_id_(assignment.sensor_id), frame_id_(assignment.frame_id),
+    config_(config), logger_(node->get_logger())
   {
     const std::string base = "/vixel/sensors/" + assignment.sensor_id;
     image_publisher_ = node->create_publisher<sensor_msgs::msg::Image>(
       base + "/image_raw", rclcpp::SensorDataQoS());
     compressed_publisher_ = node->create_publisher<sensor_msgs::msg::CompressedImage>(
       base + "/image_raw/compressed", rclcpp::SensorDataQoS());
+    const auto capture_qos = rclcpp::QoS(rclcpp::KeepLast(128)).reliable();
+    capture_publisher_ = node->create_publisher<vixel_interfaces::msg::CaptureFrameChunk>(
+      base + "/image_capture/chunks", capture_qos);
     info_publisher_ = node->create_publisher<sensor_msgs::msg::CameraInfo>(
       base + "/camera_info", rclcpp::SensorDataQoS());
     info_manager_ = std::make_unique<camera_info_manager::CameraInfoManager>(
       node, assignment.sensor_id, assignment.calibration_url, base);
   }
 
-  void publish(const cv::Mat & image, const builtin_interfaces::msg::Time & stamp)
+  void publish(
+    const cv::Mat & image, const builtin_interfaces::msg::Time & stamp,
+    const std::string & capture_id = {})
   {
     std_msgs::msg::Header header;
     header.stamp = stamp;
     header.frame_id = frame_id_;
-    if (image_publisher_->get_subscription_count() != 0 ||
-      info_publisher_->get_subscription_count() != 0)
-    {
+    const bool publish_raw = image_publisher_->get_subscription_count() != 0;
+    if (publish_raw) {
       auto message = cv_bridge::CvImage(header, "bgr8", image).toImageMsg();
       image_publisher_->publish(*message);
+    }
+    if (!capture_id.empty() || publish_raw || info_publisher_->get_subscription_count() != 0) {
       auto info = info_manager_->getCameraInfo();
       info.header = header;
       if (info.width == 0 || info.height == 0) {
-        info.width = message->width;
-        info.height = message->height;
+        info.width = image.cols;
+        info.height = image.rows;
       }
       info_publisher_->publish(info);
+    }
+    if (!capture_id.empty()) {
+      std::vector<std::uint8_t> encoded;
+      if (!cv::imencode(
+          ".png", image, encoded,
+          {cv::IMWRITE_PNG_COMPRESSION, config_.png_compression}))
+      {
+        throw std::runtime_error("OpenCV failed to encode full-resolution capture as PNG");
+      }
+      constexpr std::size_t chunk_size = 256U * 1024U;
+      const auto chunk_count = static_cast<std::uint32_t>(
+        (encoded.size() + chunk_size - 1U) / chunk_size);
+      for (std::uint32_t index = 0; index < chunk_count; ++index) {
+        const auto begin = encoded.begin() + static_cast<std::ptrdiff_t>(index * chunk_size);
+        const auto remaining = encoded.size() - index * chunk_size;
+        const auto length = std::min(chunk_size, remaining);
+        vixel_interfaces::msg::CaptureFrameChunk chunk;
+        chunk.header = header;
+        chunk.capture_id = capture_id;
+        chunk.sensor_id = assignment_sensor_id_;
+        chunk.format = "png";
+        chunk.width = image.cols;
+        chunk.height = image.rows;
+        chunk.chunk_index = index;
+        chunk.chunk_count = chunk_count;
+        chunk.data.assign(begin, begin + static_cast<std::ptrdiff_t>(length));
+        capture_publisher_->publish(chunk);
+      }
+      RCLCPP_INFO(
+        logger_, "Published capture %s for %s as %u PNG chunk(s)",
+        capture_id.c_str(), assignment_sensor_id_.c_str(), chunk_count);
     }
 
     cv::Mat preview = image;
@@ -621,17 +660,26 @@ public:
   }
 
 private:
+  std::string assignment_sensor_id_;
   std::string frame_id_;
   GenicamConfig config_;
+  rclcpp::Logger logger_;
   std::unique_ptr<camera_info_manager::CameraInfoManager> info_manager_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr image_publisher_;
   rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr compressed_publisher_;
+  rclcpp::Publisher<vixel_interfaces::msg::CaptureFrameChunk>::SharedPtr capture_publisher_;
   rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr info_publisher_;
 };
 
 class CameraSession
 {
 public:
+  struct FrameRequest
+  {
+    builtin_interfaces::msg::Time stamp;
+    std::string capture_id;
+  };
+
   CameraSession(
     rclcpp::Node * node, Assignment assignment, DeviceRecord record, NetworkConfig network,
     GenicamConfig config)
@@ -710,11 +758,12 @@ public:
     return true;
   }
 
-  bool request_frame(const builtin_interfaces::msg::Time & stamp)
+  bool request_frame(
+    const builtin_interfaces::msg::Time & stamp, const std::string & capture_id = {})
   {
     std::lock_guard<std::mutex> lock(request_mutex_);
-    if (!ready_.load() || pending_stamp_.has_value()) {return false;}
-    pending_stamp_ = stamp;
+    if (!ready_.load() || pending_request_.has_value()) {return false;}
+    pending_request_ = FrameRequest{stamp, capture_id};
     request_cv_.notify_one();
     return true;
   }
@@ -1000,16 +1049,16 @@ private:
   void worker_loop()
   {
     while (!stopping_.load()) {
-      std::optional<builtin_interfaces::msg::Time> stamp;
+      std::optional<FrameRequest> request;
       {
         std::unique_lock<std::mutex> lock(request_mutex_);
         request_cv_.wait_for(lock, 200ms, [this]() {
-          return stopping_.load() || pending_stamp_.has_value();
+          return stopping_.load() || pending_request_.has_value();
         });
         if (stopping_.load()) {break;}
-        stamp.swap(pending_stamp_);
+        request.swap(pending_request_);
       }
-      if (!stamp) {continue;}
+      if (!request) {continue;}
       try {
         if (software_trigger_) {
           GError * error = nullptr;
@@ -1044,7 +1093,10 @@ private:
           throw;
         }
         arv_stream_push_buffer(stream_, buffer);
-        endpoint_->publish(image, *stamp);
+        // Full-resolution one-shot frames use a dedicated lossless compressed
+        // topic. Sending the 9 MiB BGR sample directly can stall synchronous
+        // DDS writers on hosts with several active camera interfaces.
+        endpoint_->publish(image, request->stamp, request->capture_id);
         completed_frames_.fetch_add(1);
         std::lock_guard<std::mutex> error_lock(error_mutex_);
         last_error_.clear();
@@ -1142,7 +1194,7 @@ private:
   bool transfer_start_required_{false};
   std::mutex request_mutex_;
   std::condition_variable request_cv_;
-  std::optional<builtin_interfaces::msg::Time> pending_stamp_;
+  std::optional<FrameRequest> pending_request_;
   std::chrono::steady_clock::time_point next_preview_{};
   std::chrono::steady_clock::time_point next_warning_{};
   mutable std::mutex error_mutex_;
@@ -1602,7 +1654,9 @@ private:
       const auto session = sessions_.find(sensor_id);
       if (session == sessions_.end() || !session->second->ready()) {
         response->missing_sensor_ids.push_back(sensor_id);
-      } else if (session->second->request_frame(response->scheduled_time)) {
+      } else if (session->second->request_frame(
+          response->scheduled_time, response->capture_id))
+      {
         response->participating_sensor_ids.push_back(sensor_id);
       } else {
         response->missing_sensor_ids.push_back(sensor_id);

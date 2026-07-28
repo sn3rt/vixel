@@ -20,6 +20,26 @@ ros2 run vixel_manager vixel -- inventory show acme_cam_test0001
 `VIXEL_MACHINE_FILE` and `VIXEL_INVENTORY_FILE` override the default paths for
 development or testing.
 
+## Capture recording
+
+Triggered capture sets are configured in the static machine file:
+
+```yaml
+recording:
+  root_directory: /var/lib/vixel/captures
+  minimum_free_bytes: 5368709120
+  capture_timeout_ms: 10000
+  png_compression: 3
+  recent_limit: 100
+```
+
+The recorder rejects a new capture when available space is below
+`minimum_free_bytes`; it never deletes old captures automatically.
+`capture_timeout_ms` applies after the group trigger is accepted.
+`png_compression` is OpenCV's lossless PNG compression level from 0 through 9.
+`recent_limit` limits the history loaded into ROS and the dashboard, not the
+number of capture directories retained on disk.
+
 ## Portable camera settings
 
 The **Known sensor details → Camera settings** field accepts JSON. Common

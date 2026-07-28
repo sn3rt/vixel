@@ -1,0 +1,13 @@
+builtin_interfaces/Time stamp
+string capture_id
+string group_id
+string status
+string directory
+string message
+string started_at
+string completed_at
+builtin_interfaces/Time scheduled_time
+string[] requested_sensor_ids
+string[] participating_sensor_ids
+string[] saved_sensor_ids
+string[] missing_sensor_ids

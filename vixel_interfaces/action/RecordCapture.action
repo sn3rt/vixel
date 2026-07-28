@@ -1,0 +1,15 @@
+string group_id
+string request_id
+---
+bool success
+string message
+string capture_id
+string directory
+string[] saved_sensor_ids
+string[] missing_sensor_ids
+---
+string stage
+string detail
+uint8 progress_percent
+string[] received_sensor_ids
+string[] pending_sensor_ids

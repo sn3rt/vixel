@@ -40,6 +40,17 @@ overwrite a camera's persistent static, DHCP, or link-local configuration.
 
 Camera providers publish beneath `/vixel/sensors/<sensor_id>`; the generic
 GenICam provider publishes `image_raw`, `image_raw/compressed`, and `camera_info`.
+Providers that support persistent camera capture also publish
+`image_capture/chunks` as reliable `CaptureFrameChunk` messages. Every chunk for
+one frame uses the `capture_id` and timestamp returned by `ProviderCapture`;
+indexes start at zero, `chunk_count` is constant, and the reassembled bytes must
+be a full-resolution lossless image. The current recorder accepts PNG and
+persists decoded BGR8 PNG files.
+
+Chunking is required because full-resolution raw images or a single compressed
+sample can exceed practical synchronous DDS sample sizes on multi-interface
+camera hosts. Preview transport remains independent and best-effort.
+
 Other sensor kinds can use the same base with conventional ROS data topics.
 Provider packages should keep transport-library objects and exceptions behind
 their package boundary.

@@ -61,6 +61,15 @@ def generate_launch_description():
             on_exit=Shutdown(reason="Vixel GenICam provider exited"),
         ),
         Node(
+            package="vixel_recorder",
+            executable="capture_recorder",
+            name="capture_recorder",
+            namespace="vixel",
+            output="screen",
+            emulate_tty=True,
+            parameters=[{"machine_file": machine_file}],
+        ),
+        Node(
             package="vixel_web",
             executable="web_gateway",
             name="web_gateway",
