@@ -67,6 +67,17 @@ supports a software `FrameStart` trigger. When SFNC `TransferControlMode` is
 available, Vixel defaults it to `Basic` to avoid frames being held by settings
 left behind by another application.
 
+For grouped cameras, configure the trigger source in the dashboard's group
+editor. The group value overrides the individual `trigger_source` setting while
+the camera is a member, keeping every member consistent. Changing it recreates
+active camera sessions automatically. Individual settings remain effective for
+ungrouped cameras.
+
+`providers.genicam.software_trigger_lead_time_ms` controls the short interval
+between arming all group workers and releasing their software triggers. It
+defaults to 10 ms and accepts values from 1 through 100 ms; it is preparation
+time, not a requested exposure offset.
+
 Arbitrary GenICam nodes can be set without vendor code:
 
 ```json

@@ -1,5 +1,6 @@
 string group_id
 string request_id
+bool trigger_only
 ---
 bool success
 string message
@@ -7,3 +8,4 @@ builtin_interfaces/Time scheduled_time
 string capture_id
 string[] participating_sensor_ids
 string[] missing_sensor_ids
+uint64 trigger_span_ns

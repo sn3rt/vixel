@@ -51,6 +51,13 @@ Chunking is required because full-resolution raw images or a single compressed
 sample can exceed practical synchronous DDS sample sizes on multi-interface
 camera hosts. Preview transport remains independent and best-effort.
 
+`ProviderCapture.trigger_only` distinguishes publish-only acquisition from the
+persistent recorder transport. Providers complete the call after participating
+frames have been published, return failed members separately, and report
+`trigger_span_ns` when they can measure host dispatch timing. Trigger-only
+requests need not publish lossless capture chunks; standard `image_raw` and
+camera-info topics remain the processing interface.
+
 Other sensor kinds can use the same base with conventional ROS data topics.
 Provider packages should keep transport-library objects and exceptions behind
 their package boundary.

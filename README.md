@@ -23,6 +23,7 @@ provides a dynamic browser dashboard through an SSH tunnel.
 - ROS image, compressed preview, camera-info, inventory, and control interfaces.
 - Editable location, pose, calibration, notes, and per-camera settings.
 - Preview and persistent grouped capture with full-resolution PNGs and manifests.
+- Coordinated software-triggered group publication with measured host dispatch span.
 - Explicit degraded/strict membership policies and capture disk safeguards.
 - Loopback-only web dashboard, API, snapshots, and cached image streams.
 

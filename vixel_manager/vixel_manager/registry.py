@@ -22,6 +22,7 @@ VALID_CATALOG_STATES = {"observed", "enrolled", "archived", "retired"}
 VALID_NETWORK_MODES = {"direct", "switched"}
 VALID_MISSING_POLICIES = {"strict", "degraded"}
 VALID_OPERATING_MODES = {"idle", "preview", "capture"}
+VALID_TRIGGER_SOURCES = {"FreeRun", "Software"}
 PLACEHOLDER_PREFIXES = ("REPLACE_", "UNKNOWN", "TODO")
 
 
@@ -408,6 +409,9 @@ def validate_inventory(data: dict[str, Any], machine: dict[str, Any]) -> dict[st
         policy = str(group.get("missing_policy", "strict"))
         if policy not in VALID_MISSING_POLICIES:
             raise RegistryError(f"sync group {group_id} has invalid missing_policy")
+        trigger_source = str(group.get("trigger_source", "FreeRun"))
+        if trigger_source not in VALID_TRIGGER_SOURCES:
+            raise RegistryError(f"sync group {group_id} has invalid trigger_source")
         if len(members) != len(set(members)):
             raise RegistryError(f"sync group {group_id} contains duplicate members")
         preview_rate = float(group.get("preview_rate_hz", machine["defaults"]["preview_rate_hz"]))
@@ -423,6 +427,7 @@ def validate_inventory(data: dict[str, Any], machine: dict[str, Any]) -> dict[st
                 raise RegistryError(f"sensor {member} belongs to multiple sync groups")
             member_to_group[member] = group_id
         group.setdefault("missing_policy", "strict")
+        group.setdefault("trigger_source", "FreeRun")
         group.setdefault("preview_rate_hz", machine["defaults"]["preview_rate_hz"])
         group.setdefault("preferred_master_id", "")
     return result
@@ -887,7 +892,7 @@ class Registry:
                 raise
 
     def upsert_group(self, group_id: str, provider: str, members: Iterable[str],
-                     missing_policy: str, preview_rate_hz: float,
+                     missing_policy: str, trigger_source: str, preview_rate_hz: float,
                      preferred_master_id: str) -> None:
         with self.lock:
             previous = copy.deepcopy(self.inventory)
@@ -897,6 +902,7 @@ class Registry:
                 "provider": provider,
                 "members": list(members),
                 "missing_policy": missing_policy,
+                "trigger_source": trigger_source,
                 "preview_rate_hz": float(preview_rate_hz),
                 "preferred_master_id": preferred_master_id,
             }

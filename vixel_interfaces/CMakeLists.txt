@@ -40,6 +40,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "action/EnrollSensor.action"
   "action/ResolveSensorPlacement.action"
   "action/RecordCapture.action"
+  "action/TriggerGroup.action"
   DEPENDENCIES action_msgs builtin_interfaces geometry_msgs std_msgs
 )
 

@@ -27,6 +27,7 @@ def test_capture_record_is_exposed_as_json():
         started_at = "2026-07-28T10:00:00.000Z"
         completed_at = "2026-07-28T10:00:01.000Z"
         scheduled_time = Stamp()
+        trigger_span_ns = 1200
         requested_sensor_ids = ["a", "b"]
         participating_sensor_ids = ["a", "b"]
         saved_sensor_ids = ["a", "b"]
@@ -36,6 +37,7 @@ def test_capture_record_is_exposed_as_json():
     assert value["capture_id"] == "capture_test"
     assert value["scheduled_time"] == {"sec": 12, "nanosec": 34}
     assert value["saved_sensor_ids"] == ["a", "b"]
+    assert value["trigger_span_ns"] == 1200
 
 
 def test_health_response_tracks_manager_age_and_counts():

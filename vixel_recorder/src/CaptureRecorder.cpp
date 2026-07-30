@@ -436,12 +436,14 @@ private:
       auto request = std::make_shared<CaptureGroup::Request>();
       request->group_id = record.group_id;
       request->request_id = record.capture_id;
+      request->trigger_only = false;
       auto response_future = capture_client_->async_send_request(request);
-      if (response_future.wait_for(10s) != std::future_status::ready) {
+      if (response_future.wait_for(config_.capture_timeout + 5s) != std::future_status::ready) {
         throw std::runtime_error("capture group service timed out");
       }
       const auto response = response_future.get();
       record.scheduled_time = response->scheduled_time;
+      record.trigger_span_ns = response->trigger_span_ns;
       record.participating_sensor_ids = response->participating_sensor_ids;
       record.missing_sensor_ids = response->missing_sensor_ids;
       if (!response->success) {throw std::runtime_error(response->message);}
@@ -660,6 +662,7 @@ private:
       {"message", record.message}, {"started_at", record.started_at},
       {"completed_at", record.completed_at},
       {"scheduled_time", stamp_json(record.scheduled_time)},
+      {"trigger_span_ns", record.trigger_span_ns},
       {"requested_sensor_ids", record.requested_sensor_ids},
       {"participating_sensor_ids", record.participating_sensor_ids},
       {"saved_sensor_ids", record.saved_sensor_ids},
@@ -751,6 +754,7 @@ private:
     const auto scheduled = value.value("scheduled_time", nlohmann::json::object());
     record.scheduled_time.sec = scheduled.value("sec", 0);
     record.scheduled_time.nanosec = scheduled.value("nanosec", 0U);
+    record.trigger_span_ns = value.value("trigger_span_ns", 0ULL);
     return record;
   }
 

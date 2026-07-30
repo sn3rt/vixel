@@ -41,6 +41,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -583,7 +584,7 @@ public:
 
   void publish(
     const cv::Mat & image, const builtin_interfaces::msg::Time & stamp,
-    const std::string & capture_id = {})
+    const std::string & capture_id = {}, bool publish_capture_chunks = false)
   {
     std_msgs::msg::Header header;
     header.stamp = stamp;
@@ -602,7 +603,7 @@ public:
       }
       info_publisher_->publish(info);
     }
-    if (!capture_id.empty()) {
+    if (publish_capture_chunks) {
       std::vector<std::uint8_t> encoded;
       if (!cv::imencode(
           ".png", image, encoded,
@@ -674,10 +675,24 @@ private:
 class CameraSession
 {
 public:
+  struct FrameCompletion
+  {
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool armed{false};
+    bool done{false};
+    bool success{false};
+    std::uint64_t trigger_started_ns{0};
+    std::string error;
+  };
+
   struct FrameRequest
   {
     builtin_interfaces::msg::Time stamp;
     std::string capture_id;
+    bool publish_capture_chunks{false};
+    std::chrono::steady_clock::time_point release_at{};
+    std::shared_ptr<FrameCompletion> completion;
   };
 
   CameraSession(
@@ -733,6 +748,20 @@ public:
   void shutdown()
   {
     if (stopping_.exchange(true)) {return;}
+    {
+      std::lock_guard<std::mutex> request_lock(request_mutex_);
+      if (pending_request_ && pending_request_->completion) {
+        auto completion = pending_request_->completion;
+        {
+          std::lock_guard<std::mutex> completion_lock(completion->mutex);
+          completion->error = "camera session stopped";
+          completion->done = true;
+        }
+        completion->changed.notify_all();
+      }
+      pending_request_.reset();
+      request_active_ = false;
+    }
     request_cv_.notify_all();
     if (worker_.joinable()) {worker_.join();}
     if (camera_ != nullptr && streaming_.exchange(false)) {
@@ -758,17 +787,26 @@ public:
     return true;
   }
 
-  bool request_frame(
-    const builtin_interfaces::msg::Time & stamp, const std::string & capture_id = {})
+  std::shared_ptr<FrameCompletion> request_frame(
+    const builtin_interfaces::msg::Time & stamp, const std::string & capture_id = {},
+    bool publish_capture_chunks = false,
+    std::chrono::steady_clock::time_point release_at = {})
   {
     std::lock_guard<std::mutex> lock(request_mutex_);
-    if (!ready_.load() || pending_request_.has_value()) {return false;}
-    pending_request_ = FrameRequest{stamp, capture_id};
+    if (!ready_.load() || request_active_) {return {};}
+    std::shared_ptr<FrameCompletion> completion;
+    if (!capture_id.empty()) {
+      completion = std::make_shared<FrameCompletion>();
+    }
+    pending_request_ = FrameRequest{
+      stamp, capture_id, publish_capture_chunks, release_at, completion};
+    request_active_ = true;
     request_cv_.notify_one();
-    return true;
+    return completion;
   }
 
   bool ready() const {return ready_.load();}
+  bool software_trigger() const {return software_trigger_;}
   const Assignment & assignment() const {return assignment_;}
 
   Sensor status() const
@@ -1059,8 +1097,23 @@ private:
         request.swap(pending_request_);
       }
       if (!request) {continue;}
+      if (request->completion) {
+        {
+          std::lock_guard<std::mutex> completion_lock(request->completion->mutex);
+          request->completion->armed = true;
+        }
+        request->completion->changed.notify_all();
+      }
       try {
+        if (request->release_at != std::chrono::steady_clock::time_point{}) {
+          std::this_thread::sleep_until(request->release_at);
+        }
         if (software_trigger_) {
+          if (request->completion) {
+            request->completion->trigger_started_ns =
+              static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+          }
           GError * error = nullptr;
           arv_camera_software_trigger(camera_, &error);
           throw_on_error(error, "software trigger");
@@ -1096,12 +1149,29 @@ private:
         // Full-resolution one-shot frames use a dedicated lossless compressed
         // topic. Sending the 9 MiB BGR sample directly can stall synchronous
         // DDS writers on hosts with several active camera interfaces.
-        endpoint_->publish(image, request->stamp, request->capture_id);
+        endpoint_->publish(
+          image, request->stamp, request->capture_id, request->publish_capture_chunks);
         completed_frames_.fetch_add(1);
+        if (request->completion) {
+          {
+            std::lock_guard<std::mutex> completion_lock(request->completion->mutex);
+            request->completion->success = true;
+            request->completion->done = true;
+          }
+          request->completion->changed.notify_all();
+        }
         std::lock_guard<std::mutex> error_lock(error_mutex_);
         last_error_.clear();
         warning_active_ = false;
       } catch (const std::exception & error) {
+        if (request->completion) {
+          {
+            std::lock_guard<std::mutex> completion_lock(request->completion->mutex);
+            request->completion->error = error.what();
+            request->completion->done = true;
+          }
+          request->completion->changed.notify_all();
+        }
         const auto now = std::chrono::steady_clock::now();
         bool should_log = false;
         {
@@ -1118,6 +1188,10 @@ private:
             node_->get_logger(), "Acquisition failed for %s: %s",
             assignment_.sensor_id.c_str(), error.what());
         }
+      }
+      {
+        std::lock_guard<std::mutex> request_lock(request_mutex_);
+        request_active_ = false;
       }
     }
   }
@@ -1195,6 +1269,7 @@ private:
   std::mutex request_mutex_;
   std::condition_variable request_cv_;
   std::optional<FrameRequest> pending_request_;
+  bool request_active_{false};
   std::chrono::steady_clock::time_point next_preview_{};
   std::chrono::steady_clock::time_point next_warning_{};
   mutable std::mutex error_mutex_;
@@ -1225,10 +1300,12 @@ public:
       "provision", std::bind(
         &GenicamProvider::provision_callback, this, std::placeholders::_1,
         std::placeholders::_2));
+    capture_callback_group_ = create_callback_group(
+      rclcpp::CallbackGroupType::Reentrant);
     capture_service_ = create_service<vixel_interfaces::srv::ProviderCapture>(
       "capture", std::bind(
         &GenicamProvider::capture_callback, this, std::placeholders::_1,
-        std::placeholders::_2));
+        std::placeholders::_2), rclcpp::ServicesQoS(), capture_callback_group_);
     feature_service_ = create_service<vixel_interfaces::srv::GetCameraFeatures>(
       "features", std::bind(
         &GenicamProvider::features_callback, this, std::placeholders::_1,
@@ -1567,6 +1644,7 @@ private:
       group.group_id = assignment.sync_group;
       group.provider = "genicam";
       group.missing_policy = assignment.group_missing_policy;
+      group.trigger_source = assignment.group_trigger_source;
       group.operating_mode = assignment.operating_mode;
       group.preview_rate_hz = assignment.preview_rate_hz;
       group.preferred_master_id = assignment.preferred_master_id;
@@ -1646,27 +1724,66 @@ private:
     const std::shared_ptr<vixel_interfaces::srv::ProviderCapture::Request> request,
     std::shared_ptr<vixel_interfaces::srv::ProviderCapture::Response> response)
   {
-    std::lock_guard<std::mutex> lock(mutex_);
-    response->scheduled_time = now();
+    std::unique_lock<std::mutex> lock(mutex_);
+    const auto lead = std::chrono::milliseconds(config_.software_trigger_lead_time_ms);
+    const auto release_at = std::chrono::steady_clock::now() + lead;
+    response->scheduled_time = now() + rclcpp::Duration::from_nanoseconds(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(lead).count());
     response->capture_id = request->request_id.empty() ?
       "software_" + std::to_string(++capture_sequence_) : request->request_id;
+    std::vector<std::pair<
+      std::string, std::shared_ptr<CameraSession::FrameCompletion>>> completions;
     for (const auto & sensor_id : request->member_ids) {
       const auto session = sessions_.find(sensor_id);
-      if (session == sessions_.end() || !session->second->ready()) {
-        response->missing_sensor_ids.push_back(sensor_id);
-      } else if (session->second->request_frame(
-          response->scheduled_time, response->capture_id))
+      if (session == sessions_.end() || !session->second->ready() ||
+        !session->second->software_trigger())
       {
-        response->participating_sensor_ids.push_back(sensor_id);
-      } else {
         response->missing_sensor_ids.push_back(sensor_id);
+      } else {
+        auto completion = session->second->request_frame(
+          response->scheduled_time, response->capture_id, !request->trigger_only, release_at);
+        if (completion) {
+          completions.emplace_back(sensor_id, std::move(completion));
+        } else {
+          response->missing_sensor_ids.push_back(sensor_id);
+        }
       }
+    }
+    lock.unlock();
+
+    for (const auto & item : completions) {
+      const auto & completion = item.second;
+      std::unique_lock<std::mutex> completion_lock(completion->mutex);
+      completion->changed.wait_until(
+        completion_lock, release_at, [&completion]() {return completion->armed;});
+    }
+    const auto deadline = release_at +
+      std::chrono::milliseconds(config_.image_timeout_ms + 1000);
+    std::uint64_t earliest_trigger = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t latest_trigger = 0;
+    for (const auto & item : completions) {
+      const auto & completion = item.second;
+      std::unique_lock<std::mutex> completion_lock(completion->mutex);
+      completion->changed.wait_until(
+        completion_lock, deadline, [&completion]() {return completion->done;});
+      if (completion->done && completion->success) {
+        response->participating_sensor_ids.push_back(item.first);
+        if (completion->trigger_started_ns != 0) {
+          earliest_trigger = std::min(earliest_trigger, completion->trigger_started_ns);
+          latest_trigger = std::max(latest_trigger, completion->trigger_started_ns);
+        }
+      } else {
+        response->missing_sensor_ids.push_back(item.first);
+      }
+    }
+    if (latest_trigger != 0 && earliest_trigger != std::numeric_limits<std::uint64_t>::max()) {
+      response->trigger_span_ns = latest_trigger - earliest_trigger;
     }
     response->success = response->missing_sensor_ids.empty() ||
       (request->missing_policy == "degraded" && !response->participating_sensor_ids.empty());
     response->message = response->success ?
-      "software-trigger capture queued (not PTP synchronized)" :
-      "one or more cameras were unavailable or busy";
+      "software-barrier frames published (not PTP synchronized)" :
+      "one or more cameras were unavailable, busy, or failed acquisition";
   }
 
   void features_callback(
@@ -1712,6 +1829,7 @@ private:
   rclcpp::Subscription<vixel_interfaces::msg::ProviderAssignmentArray>::SharedPtr assignment_subscription_;
   rclcpp::Service<vixel_interfaces::srv::ProvisionSensor>::SharedPtr provision_service_;
   rclcpp::Service<vixel_interfaces::srv::ProviderCapture>::SharedPtr capture_service_;
+  rclcpp::CallbackGroup::SharedPtr capture_callback_group_;
   rclcpp::Service<vixel_interfaces::srv::GetCameraFeatures>::SharedPtr feature_service_;
   rclcpp::TimerBase::SharedPtr startup_timer_;
   rclcpp::TimerBase::SharedPtr discovery_timer_;
@@ -1725,7 +1843,10 @@ private:
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<vixel_genicam::GenicamProvider>());
+  auto node = std::make_shared<vixel_genicam::GenicamProvider>();
+  rclcpp::executors::MultiThreadedExecutor executor;
+  executor.add_node(node);
+  executor.spin();
   rclcpp::shutdown();
   return 0;
 }

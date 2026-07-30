@@ -22,7 +22,12 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CompressedImage
 
-from vixel_interfaces.action import EnrollSensor, RecordCapture, ResolveSensorPlacement
+from vixel_interfaces.action import (
+    EnrollSensor,
+    RecordCapture,
+    ResolveSensorPlacement,
+    TriggerGroup,
+)
 from vixel_interfaces.msg import (
     CaptureRecordArray,
     KnownSensorArray,
@@ -177,6 +182,7 @@ def group_to_dict(group) -> dict[str, Any]:
         "provider": group.provider,
         "member_ids": list(group.member_ids),
         "missing_policy": group.missing_policy,
+        "trigger_source": group.trigger_source,
         "operating_mode": group.operating_mode,
         "preview_rate_hz": group.preview_rate_hz,
         "preferred_master_id": group.preferred_master_id,
@@ -219,6 +225,7 @@ def capture_record_to_dict(record) -> dict[str, Any]:
             "sec": record.scheduled_time.sec,
             "nanosec": record.scheduled_time.nanosec,
         },
+        "trigger_span_ns": int(record.trigger_span_ns),
         "requested_sensor_ids": list(record.requested_sensor_ids),
         "participating_sensor_ids": list(record.participating_sensor_ids),
         "saved_sensor_ids": list(record.saved_sensor_ids),
@@ -314,6 +321,9 @@ class GatewayNode(Node):
         )
         self.record_capture_client = ActionClient(
             self, RecordCapture, "/vixel/record_capture", callback_group=self.callback_group
+        )
+        self.trigger_group_client = ActionClient(
+            self, TriggerGroup, "/vixel/trigger_group", callback_group=self.callback_group
         )
 
     @staticmethod
@@ -521,7 +531,7 @@ class GatewayNode(Node):
             raise RuntimeError(
                 "Capture was rejected; check group mode and whether another capture is active"
             )
-        wrapped = self.wait_future(handle.get_result_async(), 30.0)
+        wrapped = self.wait_future(handle.get_result_async(), 35.0)
         return {
             "success": wrapped.result.success,
             "message": wrapped.result.message,
@@ -529,6 +539,35 @@ class GatewayNode(Node):
             "directory": wrapped.result.directory,
             "saved_sensor_ids": list(wrapped.result.saved_sensor_ids),
             "missing_sensor_ids": list(wrapped.result.missing_sensor_ids),
+        }
+
+    def trigger_group(self, group_id: str, body: dict[str, Any]):
+        if not self.trigger_group_client.wait_for_server(timeout_sec=2.0):
+            raise RuntimeError("Vixel group trigger action is unavailable")
+        goal = TriggerGroup.Goal()
+        goal.group_id = group_id
+        goal.request_id = str(body.get("request_id", ""))
+        handle = self.wait_future(
+            self.trigger_group_client.send_goal_async(goal), 5.0
+        )
+        if not handle.accepted:
+            raise RuntimeError(
+                "Trigger was rejected; check the group, request ID, and operating mode"
+            )
+        wrapped = self.wait_future(handle.get_result_async(), 35.0)
+        return {
+            "success": wrapped.result.success,
+            "message": wrapped.result.message,
+            "capture_id": wrapped.result.capture_id,
+            "scheduled_time": {
+                "sec": wrapped.result.scheduled_time.sec,
+                "nanosec": wrapped.result.scheduled_time.nanosec,
+            },
+            "participating_sensor_ids": list(
+                wrapped.result.participating_sensor_ids
+            ),
+            "missing_sensor_ids": list(wrapped.result.missing_sensor_ids),
+            "trigger_span_ns": int(wrapped.result.trigger_span_ns),
         }
 
     def start_operation(self, kind: str, target: str, worker) -> dict[str, Any]:
@@ -886,6 +925,10 @@ class Handler(BaseHTTPRequestHandler):
                 request.provider = str(body.get("provider", "genicam"))
                 request.member_ids = list(body.get("member_ids", []))
                 request.missing_policy = str(body.get("missing_policy", "strict"))
+                request.trigger_source = str(body.get(
+                    "trigger_source",
+                    node.groups.get(parts[3], {}).get("trigger_source", "Software"),
+                ))
                 request.preview_rate_hz = float(body.get("preview_rate_hz", 2.0))
                 request.preferred_master_id = str(body.get("preferred_master_id", ""))
                 response = node.call_service(node.group_client, request)
@@ -897,6 +940,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, {"success": response.success, "message": response.message})
             elif method == "POST" and len(parts) == 5 and parts[:3] == ["api", "v1", "groups"] and parts[4] == "capture":
                 self._json(HTTPStatus.OK, node.record_capture(parts[3], body))
+            elif method == "POST" and len(parts) == 5 and parts[:3] == ["api", "v1", "groups"] and parts[4] == "trigger":
+                self._json(HTTPStatus.OK, node.trigger_group(parts[3], body))
             else:
                 self._error(HTTPStatus.NOT_FOUND, "not found")
         except (ValueError, KeyError, RuntimeError, TimeoutError, json.JSONDecodeError) as error:

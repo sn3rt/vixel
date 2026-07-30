@@ -43,8 +43,33 @@ frames for the dashboard at the configured rate while retaining full-resolution
 ROS image topics. Capture belongs to a named sync group.
 
 A `strict` group requires every member. A `degraded` group captures ready
-members when another member is unavailable. The generic backend uses host
-software triggers and reports captures as not PTP synchronized.
+members when another member is unavailable. A group must use the `Software`
+trigger source before it can be triggered. The generic backend pre-arms each
+camera worker and releases them at one host deadline, but reports captures as
+not PTP synchronized. The returned `trigger_span_ns` is the measured span
+between host software-trigger calls, not exposure-time skew.
+
+Use **Trigger and publish** for processing without writing files. Subscribe to
+each member's `image_raw` topic before triggering; the resulting images use the
+shared `scheduled_time` returned by the request for correlation:
+
+```bash
+ros2 action send_goal /vixel/trigger_group \
+  vixel_interfaces/action/TriggerGroup \
+  "{group_id: inspection_pair, request_id: ''}" --feedback
+```
+
+The HTTP equivalent is:
+
+```bash
+curl -X POST -H 'Content-Type: application/json' -d '{}' \
+  http://127.0.0.1:8080/api/v1/groups/inspection_pair/trigger
+```
+
+Vixel does not schedule periodic triggers internally. A ROS node, cron job, or
+other application can call either interface at its required interval. Disjoint
+groups may run concurrently; a request using an already busy camera is rejected
+according to the group's missing-member policy.
 
 To persist a capture, put the group in capture mode and use **Capture and save**
 in the dashboard. A ROS client can invoke the same action:
@@ -87,6 +112,10 @@ Per-camera topics:
 Triggered recording uses the `/vixel/record_capture` action. Recent capture
 records are also available from `GET /api/v1/captures`; the dashboard currently
 lists results but intentionally provides no download or delete endpoint.
+
+Trigger-only acquisition uses the `/vixel/trigger_group` action. The HTTP API
+exposes the same operation at `POST /api/v1/groups/<group_id>/trigger`; saved
+capture remains at `POST /api/v1/groups/<group_id>/capture`.
 
 Control actions and services cover enrollment, placement resolution, operating
 mode, metadata, port mode, known-sensor maintenance, sync groups, capture, and

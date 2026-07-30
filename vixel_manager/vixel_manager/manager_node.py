@@ -4,6 +4,7 @@ import ipaddress
 import json
 import os
 import pathlib
+import re
 import threading
 import time
 from typing import Any
@@ -17,7 +18,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
 
-from vixel_interfaces.action import EnrollSensor, ResolveSensorPlacement
+from vixel_interfaces.action import EnrollSensor, ResolveSensorPlacement, TriggerGroup
 from vixel_interfaces.msg import (
     KnownSensor,
     KnownSensorArray,
@@ -227,6 +228,15 @@ class InventoryManager(Node):
             "resolve_sensor_placement",
             execute_callback=self._resolve_placement,
             goal_callback=self._resolve_goal,
+            cancel_callback=lambda _: CancelResponse.ACCEPT,
+            callback_group=self.callback_group,
+        )
+        self.trigger_action = ActionServer(
+            self,
+            TriggerGroup,
+            "trigger_group",
+            execute_callback=self._trigger_group,
+            goal_callback=self._trigger_goal,
             cancel_callback=lambda _: CancelResponse.ACCEPT,
             callback_group=self.callback_group,
         )
@@ -606,6 +616,7 @@ class InventoryManager(Node):
         if provider_message:
             result = provider_message
             result.missing_policy = record["missing_policy"]
+            result.trigger_source = record.get("trigger_source", "FreeRun")
             result.preview_rate_hz = float(record["preview_rate_hz"])
             result.preferred_master_id = record.get("preferred_master_id", "")
             result.operating_mode = self.group_modes.get(group_id, self.default_group_mode)
@@ -616,6 +627,7 @@ class InventoryManager(Node):
         result.provider = self._runtime_group_provider(record)
         result.member_ids = list(record["members"])
         result.missing_policy = record["missing_policy"]
+        result.trigger_source = record.get("trigger_source", "FreeRun")
         result.operating_mode = self.group_modes.get(group_id, self.default_group_mode)
         result.preview_rate_hz = float(record["preview_rate_hz"])
         result.preferred_master_id = record.get("preferred_master_id", "")
@@ -804,6 +816,7 @@ class InventoryManager(Node):
             group_id, group = groups_for_member.get(sensor_id, ("", {}))
             assignment.sync_group = group_id
             assignment.group_missing_policy = group.get("missing_policy", "")
+            assignment.group_trigger_source = group.get("trigger_source", "")
             assignment.preferred_master_id = group.get("preferred_master_id", "")
             assignment.operating_mode = (
                 self.group_modes.get(group_id, self.default_group_mode) if group_id
@@ -812,8 +825,13 @@ class InventoryManager(Node):
             assignment.preview_rate_hz = float(
                 group.get("preview_rate_hz", self.registry.machine["defaults"]["preview_rate_hz"])
             )
+            effective_settings = dict(
+                snapshot["known_sensors"].get(sensor_id, {}).get("provider_settings", {})
+            )
+            if group_id:
+                effective_settings["trigger_source"] = group.get("trigger_source", "FreeRun")
             assignment.provider_settings_json = json.dumps(
-                snapshot["known_sensors"].get(sensor_id, {}).get("provider_settings", {}),
+                effective_settings,
                 separators=(",", ":"), sort_keys=True,
             )
             by_provider.setdefault(runtime_provider, []).append(assignment)
@@ -1266,11 +1284,17 @@ class InventoryManager(Node):
 
     def _upsert_group(self, request, response):
         try:
+            existing = self.registry.inventory["sync_groups"].get(request.group_id, {})
+            trigger_source = (
+                request.trigger_source
+                or existing.get("trigger_source", "Software")
+            )
             self.registry.upsert_group(
                 request.group_id,
                 request.provider,
                 request.member_ids,
                 request.missing_policy,
+                trigger_source,
                 request.preview_rate_hz,
                 request.preferred_master_id,
             )
@@ -1304,25 +1328,33 @@ class InventoryManager(Node):
             response.message = str(error)
         return response
 
+    def _request_group_capture(
+        self, group_id: str, request_id: str, *, trigger_only: bool
+    ):
+        group = self.registry.inventory["sync_groups"].get(group_id)
+        if not group:
+            raise RegistryError(f"unknown sync group {group_id}")
+        if self.group_modes.get(group_id, self.default_group_mode) != "capture":
+            raise RegistryError("synchronization group is not in capture mode")
+        if group.get("trigger_source", "FreeRun") != "Software":
+            raise RegistryError("synchronization group trigger_source must be Software")
+        runtime_provider = self._runtime_group_provider(group)
+        client = self.capture_clients[runtime_provider]
+        if not client.wait_for_service(timeout_sec=3.0):
+            raise RegistryError(f"provider {runtime_provider} is unavailable")
+        provider_request = ProviderCapture.Request()
+        provider_request.group_id = group_id
+        provider_request.request_id = request_id
+        provider_request.member_ids = list(group["members"])
+        provider_request.missing_policy = group["missing_policy"]
+        provider_request.preferred_master_id = group.get("preferred_master_id", "")
+        provider_request.trigger_only = trigger_only
+        return self._wait_for_future(client.call_async(provider_request), timeout=30.0)
+
     def _capture_group(self, request, response):
         try:
-            group = self.registry.inventory["sync_groups"].get(request.group_id)
-            if not group:
-                raise RegistryError(f"unknown sync group {request.group_id}")
-            if self.group_modes.get(request.group_id, self.default_group_mode) != "capture":
-                raise RegistryError("synchronization group is not in capture mode")
-            runtime_provider = self._runtime_group_provider(group)
-            client = self.capture_clients[runtime_provider]
-            if not client.wait_for_service(timeout_sec=3.0):
-                raise RegistryError(f"provider {runtime_provider} is unavailable")
-            provider_request = ProviderCapture.Request()
-            provider_request.group_id = request.group_id
-            provider_request.request_id = request.request_id
-            provider_request.member_ids = list(group["members"])
-            provider_request.missing_policy = group["missing_policy"]
-            provider_request.preferred_master_id = group.get("preferred_master_id", "")
-            provider_response = self._wait_for_future(
-                client.call_async(provider_request), timeout=10.0
+            provider_response = self._request_group_capture(
+                request.group_id, request.request_id, trigger_only=request.trigger_only
             )
             response.success = provider_response.success
             response.message = provider_response.message
@@ -1330,10 +1362,54 @@ class InventoryManager(Node):
             response.capture_id = provider_response.capture_id
             response.participating_sensor_ids = provider_response.participating_sensor_ids
             response.missing_sensor_ids = provider_response.missing_sensor_ids
+            response.trigger_span_ns = provider_response.trigger_span_ns
         except (RegistryError, TimeoutError) as error:
             response.success = False
             response.message = str(error)
         return response
+
+    def _trigger_goal(self, goal_request):
+        if not goal_request.group_id:
+            return GoalResponse.REJECT
+        if goal_request.request_id and not re.fullmatch(
+            r"[A-Za-z0-9._-]{1,128}", goal_request.request_id
+        ):
+            return GoalResponse.REJECT
+        return GoalResponse.ACCEPT
+
+    def _trigger_group(self, goal_handle):
+        result = TriggerGroup.Result()
+        feedback = TriggerGroup.Feedback()
+        feedback.stage = "arming"
+        feedback.detail = "Arming grouped camera workers"
+        feedback.progress_percent = 10
+        goal_handle.publish_feedback(feedback)
+        try:
+            response = self._request_group_capture(
+                goal_handle.request.group_id,
+                goal_handle.request.request_id,
+                trigger_only=True,
+            )
+            result.success = response.success
+            result.message = response.message
+            result.capture_id = response.capture_id
+            result.scheduled_time = response.scheduled_time
+            result.participating_sensor_ids = response.participating_sensor_ids
+            result.missing_sensor_ids = response.missing_sensor_ids
+            result.trigger_span_ns = response.trigger_span_ns
+            if response.success:
+                feedback.stage = "published"
+                feedback.detail = "Triggered frames published"
+                feedback.progress_percent = 100
+                goal_handle.publish_feedback(feedback)
+                goal_handle.succeed()
+            else:
+                goal_handle.abort()
+        except (RegistryError, TimeoutError) as error:
+            result.success = False
+            result.message = str(error)
+            goal_handle.abort()
+        return result
 
     @staticmethod
     def _wait_for_future(future, timeout: float):

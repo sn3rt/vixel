@@ -87,6 +87,14 @@ GenicamConfig load_genicam_config(const std::string & path)
   config.buffer_count = std::max(4, read_or(provider, "buffer_count", config.buffer_count));
   config.socket_buffer_bytes = read_or(
     provider, "socket_buffer_bytes", config.socket_buffer_bytes);
+  config.software_trigger_lead_time_ms = read_or(
+    provider, "software_trigger_lead_time_ms", config.software_trigger_lead_time_ms);
+  if (config.software_trigger_lead_time_ms < 1 ||
+    config.software_trigger_lead_time_ms > 100)
+  {
+    throw std::runtime_error(
+            "providers.genicam.software_trigger_lead_time_ms must be between 1 and 100");
+  }
   const auto imaging = provider["imaging"];
   config.imaging.pixel_format = read_or(imaging, "pixel_format", config.imaging.pixel_format);
   config.imaging.use_max_width = read_or(

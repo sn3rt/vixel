@@ -3,6 +3,7 @@ string group_id
 string provider
 string[] member_ids
 string missing_policy
+string trigger_source
 string operating_mode
 float64 preview_rate_hz
 string preferred_master_id

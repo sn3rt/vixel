@@ -44,12 +44,14 @@ TEST(GenicamConfig, LoadsLegacyLucidSettingsDuringMigration)
 providers:
   lucid:
     discovery_period_ms: 3210
+    software_trigger_lead_time_ms: 12
     image_timeout_ms: 5000
     imaging:
       frame_rate_hz: 3.0
 )";
   const auto config = vixel_genicam::load_genicam_config(path.string());
   EXPECT_EQ(config.discovery_period_ms, 3210);
+  EXPECT_EQ(config.software_trigger_lead_time_ms, 12);
   EXPECT_EQ(config.image_timeout_ms, 1000);
   EXPECT_DOUBLE_EQ(config.imaging.frame_rate_hz, 3.0);
   std::filesystem::remove(path);

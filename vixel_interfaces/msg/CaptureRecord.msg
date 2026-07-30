@@ -7,6 +7,7 @@ string message
 string started_at
 string completed_at
 builtin_interfaces/Time scheduled_time
+uint64 trigger_span_ns
 string[] requested_sensor_ids
 string[] participating_sensor_ids
 string[] saved_sensor_ids

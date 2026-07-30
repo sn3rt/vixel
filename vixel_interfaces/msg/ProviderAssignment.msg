@@ -11,6 +11,7 @@ string network_id
 string assigned_address
 string sync_group
 string group_missing_policy
+string group_trigger_source
 string preferred_master_id
 string operating_mode
 float64 preview_rate_hz

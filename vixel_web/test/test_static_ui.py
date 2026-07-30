@@ -19,6 +19,9 @@ def test_dashboard_is_dynamic_and_uses_gateway_endpoints():
     assert "front_left" not in page
     assert "web_video_server" not in page
     assert "Capture and save" in page
+    assert "Trigger and publish" in page
+    assert "/trigger" in page
+    assert 'name="trigger_source"' in page
 
 
 def test_dashboard_javascript_parses():
