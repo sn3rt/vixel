@@ -23,6 +23,18 @@ source install/setup.bash
 the Ubuntu package. Vixel's network validation and service installer check for
 both `ptp4l` and `phc2sys` and print the install command when either is missing.
 
+The setup script must match the current shell. The examples use Bash. In zsh,
+use the corresponding scripts instead:
+
+```zsh
+source /opt/ros/lyrical/setup.zsh
+source /home/robotti/vixel/install/setup.zsh
+```
+
+Do not source a `.bash` setup script from zsh; it resolves its prefix using
+Bash-specific variables and can produce misleading missing-file and Python
+package errors.
+
 Aravis 0.8.34 or newer can be supplied by the system. If it is absent, the
 `vixel_aravis_vendor` package downloads and builds the pinned release. Building
 that fallback requires Git, Meson, GLib, GObject, GIO, and libxml2 development
@@ -58,6 +70,20 @@ ros2 run vixel_manager vixel -- config validate
 ros2 run vixel_network vixel-network-setup -- \
   --machine-file /etc/vixel/machine.yaml validate
 ```
+
+Provision the host services once on every new PC:
+
+```bash
+sudo env "PYTHONPATH=$PYTHONPATH" \
+  "$(ros2 pkg prefix vixel_network)/lib/vixel_network/vixel-network-setup" \
+  --machine-file /etc/vixel/machine.yaml install-service
+```
+
+This one command creates `vixel-network-setup.service` and
+`vixel-ptp.service`, enables both, applies the network configuration, and starts
+PTP immediately. Systemd starts them automatically on every subsequent boot;
+you do not need to start PTP manually again. Re-run the command after moving the
+workspace or changing which installation should own the services.
 
 The runtime inventory is created at `/var/lib/vixel/inventory.yaml`. In an
 unprivileged development environment, Vixel falls back to

@@ -77,6 +77,9 @@ colcon build --symlink-install
 source install/setup.bash
 ```
 
+When using zsh, source `/opt/ros/lyrical/setup.zsh` and
+`install/setup.zsh` instead of the Bash setup files.
+
 Create a machine configuration before launching:
 
 ```bash
@@ -90,13 +93,18 @@ ros2 run vixel_network vixel-network-setup -- \
   --machine-file /etc/vixel/machine.yaml apply --dry-run
 ```
 
-After checking the dry-run, apply the network setup as root and launch Vixel:
+After checking the dry-run, perform the one-time host service installation and
+launch Vixel:
 
 ```bash
-sudo "$(ros2 pkg prefix vixel_network)/lib/vixel_network/vixel-network-setup" \
-  --machine-file /etc/vixel/machine.yaml apply
+sudo env "PYTHONPATH=$PYTHONPATH" \
+  "$(ros2 pkg prefix vixel_network)/lib/vixel_network/vixel-network-setup" \
+  --machine-file /etc/vixel/machine.yaml install-service
 ros2 launch vixel cameras_launch.py web_preview:=true
 ```
+
+The installation command creates, enables, and immediately starts the managed
+network and PTP services. Systemd starts them automatically on later boots.
 
 From another computer, open an SSH tunnel and browse to
 <http://127.0.0.1:8080>:

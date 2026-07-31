@@ -26,7 +26,8 @@ Apply them using the installed executable's absolute path so `sudo` does not
 depend on a development shell's `PATH`:
 
 ```bash
-sudo "$(ros2 pkg prefix vixel_network)/lib/vixel_network/vixel-network-setup" \
+sudo env "PYTHONPATH=$PYTHONPATH" \
+  "$(ros2 pkg prefix vixel_network)/lib/vixel_network/vixel-network-setup" \
   --machine-file /etc/vixel/machine.yaml apply
 ```
 
@@ -51,13 +52,17 @@ non-overlapping subnets for every managed interface.
 
 ## Boot setup
 
-After validating the configuration, install the network setup service:
+After validating the configuration, provision both boot services once:
 
 ```bash
-sudo "$(ros2 pkg prefix vixel_network)/lib/vixel_network/vixel-network-setup" \
+sudo env "PYTHONPATH=$PYTHONPATH" \
+  "$(ros2 pkg prefix vixel_network)/lib/vixel_network/vixel-network-setup" \
   --machine-file /etc/vixel/machine.yaml install-service
-sudo systemctl enable --now vixel-ptp.service
 ```
+
+The command creates, enables, and immediately starts
+`vixel-network-setup.service` and `vixel-ptp.service`. Systemd starts them on
+every later boot, so no manual PTP start is required.
 
 Re-run `apply` after tuning or interface changes. The example configuration is
 documentation only; never apply it without replacing its synthetic values.

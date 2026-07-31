@@ -270,10 +270,10 @@ def install_service(machine_file: str, executable: str) -> None:
     ptp_unit_path.write_text(ptp_unit, encoding="utf-8")
     subprocess.run(["systemctl", "daemon-reload"], check=True)
     subprocess.run(["systemctl", "enable", "vixel-network-setup.service"], check=True)
-    subprocess.run(["systemctl", "enable", "vixel-ptp.service"], check=True)
+    subprocess.run(["systemctl", "enable", "--now", "vixel-ptp.service"], check=True)
     print(
         f"Installed {unit_path} and {ptp_unit_path}; "
-        "run 'sudo systemctl start vixel-ptp'"
+        "both are enabled and the PTP service is running"
     )
 
 
