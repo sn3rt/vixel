@@ -95,6 +95,20 @@ GenicamConfig load_genicam_config(const std::string & path)
     throw std::runtime_error(
             "providers.genicam.software_trigger_lead_time_ms must be between 1 and 100");
   }
+  const auto ptp = provider["ptp"];
+  config.ptp_action_lead_time_ms = read_or(
+    ptp, "action_lead_time_ms", config.ptp_action_lead_time_ms);
+  config.ptp_tolerance_ns = read_or(
+    ptp, "tolerance_ns", config.ptp_tolerance_ns);
+  config.action_device_key = read_or(
+    ptp, "action_device_key", config.action_device_key);
+  if (config.ptp_action_lead_time_ms < 20 ||
+    config.ptp_action_lead_time_ms > 2000 ||
+    config.ptp_tolerance_ns < 1000 ||
+    config.action_device_key == 0)
+  {
+    throw std::runtime_error("providers.genicam.ptp configuration is invalid");
+  }
   const auto imaging = provider["imaging"];
   config.imaging.pixel_format = read_or(imaging, "pixel_format", config.imaging.pixel_format);
   config.imaging.use_max_width = read_or(

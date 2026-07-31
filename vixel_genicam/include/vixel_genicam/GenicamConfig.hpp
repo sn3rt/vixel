@@ -39,6 +39,9 @@ struct GenicamConfig
   int buffer_count{16};
   int socket_buffer_bytes{33554432};
   int software_trigger_lead_time_ms{10};
+  int ptp_action_lead_time_ms{100};
+  std::int64_t ptp_tolerance_ns{100000};
+  std::uint32_t action_device_key{1};
   int preview_width{960};
   std::string preview_format{"jpeg"};
   int png_compression{3};

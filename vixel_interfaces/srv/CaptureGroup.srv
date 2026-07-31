@@ -9,3 +9,6 @@ string capture_id
 string[] participating_sensor_ids
 string[] missing_sensor_ids
 uint64 trigger_span_ns
+uint64 exposure_skew_ns
+bool within_tolerance
+CameraTiming[] camera_timings

@@ -9,6 +9,8 @@ Install ROS 2 Lyrical and the standard development tools using the official ROS
 instructions. Then clone the workspace and resolve package dependencies:
 
 ```bash
+sudo apt update
+sudo apt install -y linuxptp
 git clone https://github.com/sn3rt/vixel.git
 cd vixel
 rosdep install --from-paths . --ignore-src -r -y --rosdistro lyrical \
@@ -16,6 +18,10 @@ rosdep install --from-paths . --ignore-src -r -y --rosdistro lyrical \
 colcon build --symlink-install
 source install/setup.bash
 ```
+
+`linuxptp` is installed explicitly because ROS rosdep currently has no key for
+the Ubuntu package. Vixel's network validation and service installer check for
+both `ptp4l` and `phc2sys` and print the install command when either is missing.
 
 Aravis 0.8.34 or newer can be supplied by the system. If it is absent, the
 `vixel_aravis_vendor` package downloads and builds the pinned release. Building
@@ -49,6 +55,8 @@ sudo install -m 0644 \
 sudoedit /etc/vixel/machine.yaml
 ros2 run vixel_manager vixel -- config paths
 ros2 run vixel_manager vixel -- config validate
+ros2 run vixel_network vixel-network-setup -- \
+  --machine-file /etc/vixel/machine.yaml validate
 ```
 
 The runtime inventory is created at `/var/lib/vixel/inventory.yaml`. In an

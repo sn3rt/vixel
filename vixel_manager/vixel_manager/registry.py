@@ -22,7 +22,7 @@ VALID_CATALOG_STATES = {"observed", "enrolled", "archived", "retired"}
 VALID_NETWORK_MODES = {"direct", "switched"}
 VALID_MISSING_POLICIES = {"strict", "degraded"}
 VALID_OPERATING_MODES = {"idle", "preview", "capture"}
-VALID_TRIGGER_SOURCES = {"FreeRun", "Software"}
+VALID_TRIGGER_SOURCES = {"FreeRun", "Software", "Action0"}
 PLACEHOLDER_PREFIXES = ("REPLACE_", "UNKNOWN", "TODO")
 
 
@@ -409,17 +409,15 @@ def validate_inventory(data: dict[str, Any], machine: dict[str, Any]) -> dict[st
         policy = str(group.get("missing_policy", "strict"))
         if policy not in VALID_MISSING_POLICIES:
             raise RegistryError(f"sync group {group_id} has invalid missing_policy")
-        trigger_source = str(group.get("trigger_source", "FreeRun"))
-        if trigger_source not in VALID_TRIGGER_SOURCES:
-            raise RegistryError(f"sync group {group_id} has invalid trigger_source")
+        # Group membership defines synchronized capture. Legacy inventories may
+        # contain FreeRun or Software; normalize them instead of requiring an
+        # operator migration.
+        group["trigger_source"] = "Action0"
         if len(members) != len(set(members)):
             raise RegistryError(f"sync group {group_id} contains duplicate members")
         preview_rate = float(group.get("preview_rate_hz", machine["defaults"]["preview_rate_hz"]))
         if not 0.0 < preview_rate <= 10.0:
             raise RegistryError(f"sync group {group_id} has invalid preview_rate_hz")
-        preferred_master = str(group.get("preferred_master_id", ""))
-        if preferred_master and preferred_master not in members:
-            raise RegistryError(f"sync group {group_id} preferred master is not a member")
         for member in members:
             if member not in sensors:
                 raise RegistryError(f"sync group {group_id} references unknown sensor {member}")
@@ -427,9 +425,9 @@ def validate_inventory(data: dict[str, Any], machine: dict[str, Any]) -> dict[st
                 raise RegistryError(f"sensor {member} belongs to multiple sync groups")
             member_to_group[member] = group_id
         group.setdefault("missing_policy", "strict")
-        group.setdefault("trigger_source", "FreeRun")
+        group["trigger_source"] = "Action0"
         group.setdefault("preview_rate_hz", machine["defaults"]["preview_rate_hz"])
-        group.setdefault("preferred_master_id", "")
+        group["preferred_master_id"] = ""
     return result
 
 
@@ -902,9 +900,9 @@ class Registry:
                 "provider": provider,
                 "members": list(members),
                 "missing_policy": missing_policy,
-                "trigger_source": trigger_source,
+                "trigger_source": "Action0",
                 "preview_rate_hz": float(preview_rate_hz),
-                "preferred_master_id": preferred_master_id,
+                "preferred_master_id": "",
             }
             try:
                 self.save()

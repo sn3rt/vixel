@@ -67,16 +67,27 @@ supports a software `FrameStart` trigger. When SFNC `TransferControlMode` is
 available, Vixel defaults it to `Basic` to avoid frames being held by settings
 left behind by another application.
 
-For grouped cameras, configure the trigger source in the dashboard's group
-editor. The group value overrides the individual `trigger_source` setting while
-the camera is a member, keeping every member consistent. Changing it recreates
-active camera sessions automatically. Individual settings remain effective for
-ungrouped cameras.
+Grouped cameras automatically request `Action0` and PTP; there is no group
+trigger-source selector. Cameras without the required nodes fall back to the
+software barrier and remain part of the group, with their result marked
+unsynchronized. Individual settings remain effective for ungrouped cameras.
 
 `providers.genicam.software_trigger_lead_time_ms` controls the short interval
 between arming all group workers and releasing their software triggers. It
 defaults to 10 ms and accepts values from 1 through 100 ms; it is preparation
 time, not a requested exposure offset.
+
+PTP scheduled capture defaults can be tuned under `providers.genicam.ptp`:
+
+```yaml
+ptp:
+  action_lead_time_ms: 100
+  tolerance_ns: 100000
+  action_device_key: 1
+```
+
+The lead time is how far into the common PTP clock a group action is queued.
+The tolerance is used for camera lock status and measured exposure skew.
 
 Arbitrary GenICam nodes can be set without vendor code:
 

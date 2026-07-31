@@ -22,6 +22,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ProviderAssignment.msg"
   "msg/ProviderAssignmentArray.msg"
   "msg/CameraFeature.msg"
+  "msg/CameraTiming.msg"
   "msg/CaptureRecord.msg"
   "msg/CaptureRecordArray.msg"
   "msg/CaptureFrameChunk.msg"

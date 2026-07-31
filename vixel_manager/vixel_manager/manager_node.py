@@ -616,9 +616,9 @@ class InventoryManager(Node):
         if provider_message:
             result = provider_message
             result.missing_policy = record["missing_policy"]
-            result.trigger_source = record.get("trigger_source", "FreeRun")
+            result.trigger_source = "Action0"
             result.preview_rate_hz = float(record["preview_rate_hz"])
-            result.preferred_master_id = record.get("preferred_master_id", "")
+            result.preferred_master_id = ""
             result.operating_mode = self.group_modes.get(group_id, self.default_group_mode)
             return result
         result = SyncGroup()
@@ -627,10 +627,10 @@ class InventoryManager(Node):
         result.provider = self._runtime_group_provider(record)
         result.member_ids = list(record["members"])
         result.missing_policy = record["missing_policy"]
-        result.trigger_source = record.get("trigger_source", "FreeRun")
+        result.trigger_source = "Action0"
         result.operating_mode = self.group_modes.get(group_id, self.default_group_mode)
         result.preview_rate_hz = float(record["preview_rate_hz"])
-        result.preferred_master_id = record.get("preferred_master_id", "")
+        result.preferred_master_id = ""
         result.online_member_ids = [
             member for member in result.member_ids
             if member in self.runtime and self.runtime[member].online
@@ -816,8 +816,8 @@ class InventoryManager(Node):
             group_id, group = groups_for_member.get(sensor_id, ("", {}))
             assignment.sync_group = group_id
             assignment.group_missing_policy = group.get("missing_policy", "")
-            assignment.group_trigger_source = group.get("trigger_source", "")
-            assignment.preferred_master_id = group.get("preferred_master_id", "")
+            assignment.group_trigger_source = "Action0" if group_id else ""
+            assignment.preferred_master_id = ""
             assignment.operating_mode = (
                 self.group_modes.get(group_id, self.default_group_mode) if group_id
                 else self.sensor_modes.get(sensor_id, self.default_sensor_mode)
@@ -829,7 +829,7 @@ class InventoryManager(Node):
                 snapshot["known_sensors"].get(sensor_id, {}).get("provider_settings", {})
             )
             if group_id:
-                effective_settings["trigger_source"] = group.get("trigger_source", "FreeRun")
+                effective_settings["trigger_source"] = "Action0"
             assignment.provider_settings_json = json.dumps(
                 effective_settings,
                 separators=(",", ":"), sort_keys=True,
@@ -1284,19 +1284,14 @@ class InventoryManager(Node):
 
     def _upsert_group(self, request, response):
         try:
-            existing = self.registry.inventory["sync_groups"].get(request.group_id, {})
-            trigger_source = (
-                request.trigger_source
-                or existing.get("trigger_source", "Software")
-            )
             self.registry.upsert_group(
                 request.group_id,
                 request.provider,
                 request.member_ids,
                 request.missing_policy,
-                trigger_source,
+                "Action0",
                 request.preview_rate_hz,
-                request.preferred_master_id,
+                "",
             )
             self.group_modes.setdefault(request.group_id, self.default_group_mode)
             with self.lock:
@@ -1336,8 +1331,6 @@ class InventoryManager(Node):
             raise RegistryError(f"unknown sync group {group_id}")
         if self.group_modes.get(group_id, self.default_group_mode) != "capture":
             raise RegistryError("synchronization group is not in capture mode")
-        if group.get("trigger_source", "FreeRun") != "Software":
-            raise RegistryError("synchronization group trigger_source must be Software")
         runtime_provider = self._runtime_group_provider(group)
         client = self.capture_clients[runtime_provider]
         if not client.wait_for_service(timeout_sec=3.0):
@@ -1347,7 +1340,7 @@ class InventoryManager(Node):
         provider_request.request_id = request_id
         provider_request.member_ids = list(group["members"])
         provider_request.missing_policy = group["missing_policy"]
-        provider_request.preferred_master_id = group.get("preferred_master_id", "")
+        provider_request.preferred_master_id = ""
         provider_request.trigger_only = trigger_only
         return self._wait_for_future(client.call_async(provider_request), timeout=30.0)
 
@@ -1363,6 +1356,9 @@ class InventoryManager(Node):
             response.participating_sensor_ids = provider_response.participating_sensor_ids
             response.missing_sensor_ids = provider_response.missing_sensor_ids
             response.trigger_span_ns = provider_response.trigger_span_ns
+            response.exposure_skew_ns = provider_response.exposure_skew_ns
+            response.within_tolerance = provider_response.within_tolerance
+            response.camera_timings = provider_response.camera_timings
         except (RegistryError, TimeoutError) as error:
             response.success = False
             response.message = str(error)
@@ -1397,6 +1393,9 @@ class InventoryManager(Node):
             result.participating_sensor_ids = response.participating_sensor_ids
             result.missing_sensor_ids = response.missing_sensor_ids
             result.trigger_span_ns = response.trigger_span_ns
+            result.exposure_skew_ns = response.exposure_skew_ns
+            result.within_tolerance = response.within_tolerance
+            result.camera_timings = response.camera_timings
             if response.success:
                 feedback.stage = "published"
                 feedback.detail = "Triggered frames published"

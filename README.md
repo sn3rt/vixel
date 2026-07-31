@@ -67,6 +67,8 @@ are Python control-plane nodes. Public ROS interfaces live in
 Vixel targets ROS 2 Lyrical on Ubuntu 26.04.
 
 ```bash
+sudo apt update
+sudo apt install -y linuxptp
 git clone https://github.com/sn3rt/vixel.git
 cd vixel
 rosdep install --from-paths . --ignore-src -r -y --rosdistro lyrical \
@@ -112,6 +114,7 @@ loopback and use SSH or an authenticated reverse proxy.
 - [Networking and camera provisioning](docs/networking.md)
 - [Configuration and GenICam features](docs/configuration.md)
 - [Operations, ROS interfaces, and HTTP API](docs/operations.md)
+- [Runnable HTTP and ROS client examples](examples/README.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Provider contract](docs/provider_contract.md)
 - [Security policy](SECURITY.md)

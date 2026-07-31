@@ -38,7 +38,7 @@ jobs:
 
       - name: Install ROS and development tools
         run: |
-          apt-get install -y gjs ros-lyrical-ros-base ros-dev-tools
+          apt-get install -y gjs linuxptp ros-lyrical-ros-base ros-dev-tools
 
       - uses: actions/checkout@v4
 

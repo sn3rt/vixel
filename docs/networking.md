@@ -12,7 +12,8 @@ network settings to the wrong NIC.
 - Every managed interface has its own subnet and address pool.
 - Vixel uses volatile GVCP ForceIP assignments and does not overwrite camera
   persistent IP, DHCP, or link-local settings.
-- Root privileges are needed only for host network setup, not normal ROS nodes.
+- Root privileges are needed for host network and PTP clock services, not
+  normal ROS nodes.
 
 Always inspect the commands first:
 
@@ -34,6 +35,11 @@ MTU and reverse-path filtering, increases UDP receive/backlog limits, and
 adjusts NIC RX rings when supported. Disconnected ports remain configured and
 activate when link carrier appears.
 
+Every managed camera NIC with a hardware clock participates in the PC-mastered
+PTP domain. `vixel-ptp-supervisor` discovers interfaces dynamically, runs one
+`ptp4l` grandmaster port per link using E2E delay measurement, and disciplines
+secondary NIC clocks to a deterministic primary with `phc2sys`.
+
 ## Direct and switched ports
 
 `direct` mode reserves a port for one enrolled camera. A different camera on an
@@ -50,7 +56,7 @@ After validating the configuration, install the network setup service:
 ```bash
 sudo "$(ros2 pkg prefix vixel_network)/lib/vixel_network/vixel-network-setup" \
   --machine-file /etc/vixel/machine.yaml install-service
-sudo systemctl enable --now vixel-network-setup.service
+sudo systemctl enable --now vixel-ptp.service
 ```
 
 Re-run `apply` after tuning or interface changes. The example configuration is

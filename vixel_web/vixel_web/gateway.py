@@ -186,6 +186,11 @@ def group_to_dict(group) -> dict[str, Any]:
         "operating_mode": group.operating_mode,
         "preview_rate_hz": group.preview_rate_hz,
         "preferred_master_id": group.preferred_master_id,
+        "synchronization_method": group.synchronization_method,
+        "ptp_ready": group.ptp_ready,
+        "synchronized_member_ids": list(group.synchronized_member_ids),
+        "unsynchronized_member_ids": list(group.unsynchronized_member_ids),
+        "max_ptp_offset_ns": int(group.max_ptp_offset_ns),
         "ready": group.ready,
         "online_member_ids": list(group.online_member_ids),
         "missing_member_ids": list(group.missing_member_ids),
@@ -226,6 +231,17 @@ def capture_record_to_dict(record) -> dict[str, Any]:
             "nanosec": record.scheduled_time.nanosec,
         },
         "trigger_span_ns": int(record.trigger_span_ns),
+        "exposure_skew_ns": int(getattr(record, "exposure_skew_ns", 0)),
+        "within_tolerance": bool(getattr(record, "within_tolerance", False)),
+        "camera_timings": [
+            {
+                "sensor_id": timing.sensor_id,
+                "device_timestamp_ns": int(timing.device_timestamp_ns),
+                "ptp_offset_ns": int(timing.ptp_offset_ns),
+                "synchronized": timing.synchronized,
+            }
+            for timing in getattr(record, "camera_timings", [])
+        ],
         "requested_sensor_ids": list(record.requested_sensor_ids),
         "participating_sensor_ids": list(record.participating_sensor_ids),
         "saved_sensor_ids": list(record.saved_sensor_ids),
@@ -568,6 +584,17 @@ class GatewayNode(Node):
             ),
             "missing_sensor_ids": list(wrapped.result.missing_sensor_ids),
             "trigger_span_ns": int(wrapped.result.trigger_span_ns),
+            "exposure_skew_ns": int(wrapped.result.exposure_skew_ns),
+            "within_tolerance": wrapped.result.within_tolerance,
+            "camera_timings": [
+                {
+                    "sensor_id": timing.sensor_id,
+                    "device_timestamp_ns": int(timing.device_timestamp_ns),
+                    "ptp_offset_ns": int(timing.ptp_offset_ns),
+                    "synchronized": timing.synchronized,
+                }
+                for timing in wrapped.result.camera_timings
+            ],
         }
 
     def start_operation(self, kind: str, target: str, worker) -> dict[str, Any]:
@@ -925,12 +952,9 @@ class Handler(BaseHTTPRequestHandler):
                 request.provider = str(body.get("provider", "genicam"))
                 request.member_ids = list(body.get("member_ids", []))
                 request.missing_policy = str(body.get("missing_policy", "strict"))
-                request.trigger_source = str(body.get(
-                    "trigger_source",
-                    node.groups.get(parts[3], {}).get("trigger_source", "Software"),
-                ))
+                request.trigger_source = "Action0"
                 request.preview_rate_hz = float(body.get("preview_rate_hz", 2.0))
-                request.preferred_master_id = str(body.get("preferred_master_id", ""))
+                request.preferred_master_id = ""
                 response = node.call_service(node.group_client, request)
                 self._json(HTTPStatus.OK, {"success": response.success, "message": response.message})
             elif method == "DELETE" and len(parts) == 4 and parts[:3] == ["api", "v1", "groups"]:

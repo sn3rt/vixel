@@ -22,6 +22,7 @@ setup(
     entry_points={
         "console_scripts": [
             "vixel-network-setup = vixel_network.network_setup:main",
+            "vixel-ptp-supervisor = vixel_network.ptp_supervisor:main",
         ],
     },
 )

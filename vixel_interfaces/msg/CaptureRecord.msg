@@ -8,6 +8,9 @@ string started_at
 string completed_at
 builtin_interfaces/Time scheduled_time
 uint64 trigger_span_ns
+uint64 exposure_skew_ns
+bool within_tolerance
+CameraTiming[] camera_timings
 string[] requested_sensor_ids
 string[] participating_sensor_ids
 string[] saved_sensor_ids

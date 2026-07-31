@@ -8,6 +8,7 @@ from vixel_network.network_setup import (
     commands_for,
     host_tuning_commands,
     load_networks,
+    require_linuxptp,
 )
 
 
@@ -85,3 +86,12 @@ def test_overlapping_subnet_is_rejected(tmp_path):
     })
     with pytest.raises(NetworkSetupError, match="overlaps"):
         load_networks(str(machine))
+
+
+def test_missing_linuxptp_has_install_command():
+    with pytest.raises(NetworkSetupError, match="sudo apt install linuxptp"):
+        require_linuxptp(lambda _command: None)
+
+
+def test_linuxptp_check_accepts_both_commands():
+    require_linuxptp(lambda command: f"/usr/sbin/{command}")

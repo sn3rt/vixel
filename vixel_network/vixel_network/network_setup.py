@@ -18,6 +18,16 @@ class NetworkSetupError(RuntimeError):
     pass
 
 
+def require_linuxptp(which: Callable = shutil.which) -> None:
+    missing = [command for command in ("ptp4l", "phc2sys") if not which(command)]
+    if missing:
+        raise NetworkSetupError(
+            "linuxptp is required for synchronized camera groups; "
+            "install it with: sudo apt install linuxptp "
+            f"(missing: {', '.join(missing)})"
+        )
+
+
 @dataclass(frozen=True)
 class ManagedNetwork:
     network_id: str
@@ -193,6 +203,7 @@ def apply_networks(machine_file: str, dry_run: bool = False,
 
 
 def install_service(machine_file: str, executable: str) -> None:
+    require_linuxptp()
     if os.geteuid() != 0:
         raise NetworkSetupError("install-service must run as root")
     executable_path = pathlib.Path(executable).resolve()
@@ -227,9 +238,43 @@ def install_service(machine_file: str, executable: str) -> None:
     ])
     unit_path = pathlib.Path("/etc/systemd/system/vixel-network-setup.service")
     unit_path.write_text(unit, encoding="utf-8")
+    ptp_executable = executable_path.with_name("vixel-ptp-supervisor")
+    if not ptp_executable.exists():
+        discovered = shutil.which("vixel-ptp-supervisor")
+        if not discovered:
+            raise NetworkSetupError("cannot locate vixel-ptp-supervisor")
+        ptp_executable = pathlib.Path(discovered).resolve()
+    ptp_command = (
+        f"source /opt/ros/lyrical/setup.bash && "
+        f"source {shlex.quote(str(local_setup))} && "
+        f"exec {shlex.quote(str(ptp_executable))} "
+        f"--machine-file {shlex.quote(str(pathlib.Path(machine_file).resolve()))}"
+    )
+    ptp_unit = "\n".join([
+        "[Unit]",
+        "Description=Vixel camera Precision Time Protocol grandmaster",
+        "After=vixel-network-setup.service",
+        "Requires=vixel-network-setup.service",
+        "",
+        "[Service]",
+        "Type=simple",
+        f"ExecStart=/bin/bash -lc {shlex.quote(ptp_command)}",
+        "Restart=on-failure",
+        "RestartSec=2",
+        "",
+        "[Install]",
+        "WantedBy=multi-user.target",
+        "",
+    ])
+    ptp_unit_path = pathlib.Path("/etc/systemd/system/vixel-ptp.service")
+    ptp_unit_path.write_text(ptp_unit, encoding="utf-8")
     subprocess.run(["systemctl", "daemon-reload"], check=True)
     subprocess.run(["systemctl", "enable", "vixel-network-setup.service"], check=True)
-    print(f"Installed {unit_path}; run 'sudo systemctl start vixel-network-setup'")
+    subprocess.run(["systemctl", "enable", "vixel-ptp.service"], check=True)
+    print(
+        f"Installed {unit_path} and {ptp_unit_path}; "
+        "run 'sudo systemctl start vixel-ptp'"
+    )
 
 
 def main(argv=None) -> int:
@@ -244,7 +289,11 @@ def main(argv=None) -> int:
     try:
         if args.command == "validate":
             networks = load_networks(args.machine_file)
-            print(f"Valid configuration for {len(networks)} managed network(s)")
+            require_linuxptp()
+            print(
+                f"Valid configuration for {len(networks)} managed network(s); "
+                "linuxptp is installed"
+            )
         elif args.command == "apply":
             if not args.dry_run and os.geteuid() != 0:
                 raise NetworkSetupError("apply must run as root (or use --dry-run)")

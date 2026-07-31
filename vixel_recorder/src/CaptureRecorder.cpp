@@ -444,6 +444,9 @@ private:
       const auto response = response_future.get();
       record.scheduled_time = response->scheduled_time;
       record.trigger_span_ns = response->trigger_span_ns;
+      record.exposure_skew_ns = response->exposure_skew_ns;
+      record.within_tolerance = response->within_tolerance;
+      record.camera_timings = response->camera_timings;
       record.participating_sensor_ids = response->participating_sensor_ids;
       record.missing_sensor_ids = response->missing_sensor_ids;
       if (!response->success) {throw std::runtime_error(response->message);}
@@ -656,6 +659,15 @@ private:
     const std::filesystem::path & directory, const CaptureRecord & record,
     const nlohmann::json & sensors)
   {
+    nlohmann::json timings = nlohmann::json::array();
+    for (const auto & timing : record.camera_timings) {
+      timings.push_back({
+        {"sensor_id", timing.sensor_id},
+        {"device_timestamp_ns", timing.device_timestamp_ns},
+        {"ptp_offset_ns", timing.ptp_offset_ns},
+        {"synchronized", timing.synchronized},
+      });
+    }
     nlohmann::json manifest{
       {"schema_version", 1}, {"capture_id", record.capture_id},
       {"group_id", record.group_id}, {"status", record.status},
@@ -663,11 +675,14 @@ private:
       {"completed_at", record.completed_at},
       {"scheduled_time", stamp_json(record.scheduled_time)},
       {"trigger_span_ns", record.trigger_span_ns},
+      {"exposure_skew_ns", record.exposure_skew_ns},
+      {"within_tolerance", record.within_tolerance},
+      {"camera_timings", timings},
       {"requested_sensor_ids", record.requested_sensor_ids},
       {"participating_sensor_ids", record.participating_sensor_ids},
       {"saved_sensor_ids", record.saved_sensor_ids},
       {"missing_sensor_ids", record.missing_sensor_ids},
-      {"synchronization", "software_trigger_not_ptp_synchronized"},
+      {"synchronization", "ptp_scheduled_action_with_software_fallback"},
       {"sensors", sensors}
     };
     std::ofstream output(directory / "manifest.json");
@@ -755,6 +770,16 @@ private:
     record.scheduled_time.sec = scheduled.value("sec", 0);
     record.scheduled_time.nanosec = scheduled.value("nanosec", 0U);
     record.trigger_span_ns = value.value("trigger_span_ns", 0ULL);
+    record.exposure_skew_ns = value.value("exposure_skew_ns", 0ULL);
+    record.within_tolerance = value.value("within_tolerance", false);
+    for (const auto & item : value.value("camera_timings", nlohmann::json::array())) {
+      vixel_interfaces::msg::CameraTiming timing;
+      timing.sensor_id = item.value("sensor_id", "");
+      timing.device_timestamp_ns = item.value("device_timestamp_ns", 0ULL);
+      timing.ptp_offset_ns = item.value("ptp_offset_ns", 0LL);
+      timing.synchronized = item.value("synchronized", false);
+      record.camera_timings.push_back(timing);
+    }
     return record;
   }
 

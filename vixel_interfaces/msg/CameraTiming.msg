@@ -1,0 +1,4 @@
+string sensor_id
+uint64 device_timestamp_ns
+int64 ptp_offset_ns
+bool synchronized

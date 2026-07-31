@@ -11,6 +11,7 @@
 #include <sensor_msgs/msg/image.hpp>
 #include <std_msgs/msg/header.hpp>
 #include <vixel_interfaces/msg/camera_feature.hpp>
+#include <vixel_interfaces/msg/camera_timing.hpp>
 #include <vixel_interfaces/msg/capture_frame_chunk.hpp>
 #include <vixel_interfaces/msg/provider_assignment.hpp>
 #include <vixel_interfaces/msg/provider_assignment_array.hpp>
@@ -388,6 +389,89 @@ void write_u16(std::uint8_t * destination, std::uint16_t value)
   destination[1] = static_cast<std::uint8_t>(value & 0xff);
 }
 
+void write_u32(std::uint8_t * destination, std::uint32_t value)
+{
+  for (int shift = 24, index = 0; shift >= 0; shift -= 8, ++index) {
+    destination[index] = static_cast<std::uint8_t>((value >> shift) & 0xff);
+  }
+}
+
+void write_u64(std::uint8_t * destination, std::uint64_t value)
+{
+  for (int shift = 56, index = 0; shift >= 0; shift -= 8, ++index) {
+    destination[index] = static_cast<std::uint8_t>((value >> shift) & 0xff);
+  }
+}
+
+std::uint32_t action_group_key(const std::string & group_id)
+{
+  std::uint32_t value = 2166136261U;
+  for (const unsigned char character : group_id) {
+    value = (value ^ character) * 16777619U;
+  }
+  return value == 0 ? 1U : value;
+}
+
+void gvcp_scheduled_action(
+  const NetworkConfig & network, std::uint32_t device_key,
+  std::uint32_t group_key, std::uint64_t action_time)
+{
+  constexpr std::uint16_t gvcp_port = 3956;
+  constexpr std::uint16_t action_command = 0x0100;
+  constexpr std::uint16_t payload_size = 20;
+  static std::atomic<std::uint16_t> request_sequence{1};
+  std::array<std::uint8_t, 8 + payload_size> packet{};
+  packet[0] = 0x42;
+  packet[1] = 0x80;  // GigE Vision 2.x scheduled-action flag.
+  write_u16(packet.data() + 2, action_command);
+  write_u16(packet.data() + 4, payload_size);
+  const auto request_id = request_sequence.fetch_add(1);
+  write_u16(packet.data() + 6, request_id == 0 ? 1 : request_id);
+  write_u32(packet.data() + 8, device_key);
+  write_u32(packet.data() + 12, group_key);
+  write_u32(packet.data() + 16, 0xffffffffU);
+  write_u64(packet.data() + 20, action_time);
+
+  ScopedSocket command_socket(socket(AF_INET, SOCK_DGRAM, 0));
+  if (command_socket.get() < 0) {
+    throw std::runtime_error("cannot create scheduled-action socket");
+  }
+  int enabled = 1;
+  if (setsockopt(
+      command_socket.get(), SOL_SOCKET, SO_BROADCAST, &enabled, sizeof(enabled)) != 0)
+  {
+    throw std::runtime_error("cannot enable scheduled-action broadcast");
+  }
+  sockaddr_in source{};
+  source.sin_family = AF_INET;
+  source.sin_port = 0;
+  const auto source_address = host_address_for_cidr(network.host_cidr);
+  if (inet_pton(AF_INET, source_address.c_str(), &source.sin_addr) != 1 ||
+    bind(
+      command_socket.get(), reinterpret_cast<const sockaddr *>(&source),
+      sizeof(source)) != 0)
+  {
+    throw std::runtime_error(
+            "cannot bind scheduled-action source " + source_address);
+  }
+  sockaddr_in destination{};
+  destination.sin_family = AF_INET;
+  destination.sin_port = htons(gvcp_port);
+  const auto broadcast = broadcast_address_for_cidr(network.host_cidr);
+  if (inet_pton(AF_INET, broadcast.c_str(), &destination.sin_addr) != 1) {
+    throw std::runtime_error("invalid scheduled-action broadcast " + broadcast);
+  }
+  if (sendto(
+      command_socket.get(), packet.data(), packet.size(), 0,
+      reinterpret_cast<const sockaddr *>(&destination), sizeof(destination)) !=
+    static_cast<ssize_t>(packet.size()))
+  {
+    throw std::runtime_error(
+            "scheduled-action send failed on " + network.interface + ": " +
+            std::strerror(errno));
+  }
+}
+
 void write_ipv4(std::uint8_t * destination, const std::string & value)
 {
   in_addr address{};
@@ -683,6 +767,9 @@ public:
     bool done{false};
     bool success{false};
     std::uint64_t trigger_started_ns{0};
+    std::uint64_t device_timestamp_ns{0};
+    std::int64_t ptp_offset_ns{0};
+    bool synchronized{false};
     std::string error;
   };
 
@@ -807,6 +894,55 @@ public:
 
   bool ready() const {return ready_.load();}
   bool software_trigger() const {return software_trigger_;}
+  bool ptp_action() const {return ptp_action_;}
+  void fall_back_to_software_trigger()
+  {
+    if (!ptp_action_) {return;}
+    std::lock_guard<std::mutex> lock(camera_control_mutex_);
+    GError * error = nullptr;
+    arv_camera_set_trigger(camera_, "Software", &error);
+    throw_on_error(error, "switching unlocked PTP camera to software trigger");
+    ptp_action_ = false;
+    software_trigger_ = true;
+    RCLCPP_WARN(
+      node_->get_logger(),
+      "%s is not PTP-locked; continuing as an unsynchronized group member",
+      assignment_.sensor_id.c_str());
+  }
+  const NetworkConfig & network() const {return network_;}
+  std::int64_t ptp_offset_ns()
+  {
+    if (!ptp_action_) {return 0;}
+    std::lock_guard<std::mutex> lock(camera_control_mutex_);
+    GError * error = nullptr;
+    const auto value = arv_camera_get_integer(camera_, "PtpOffsetFromMaster", &error);
+    if (error != nullptr) {g_error_free(error); return std::numeric_limits<std::int64_t>::max();}
+    return value;
+  }
+  bool ptp_locked()
+  {
+    if (!ptp_action_) {return false;}
+    GError * error = nullptr;
+    std::string value;
+    {
+      std::lock_guard<std::mutex> lock(camera_control_mutex_);
+      value = value_or_empty(arv_camera_get_string(camera_, "PtpStatus", &error));
+    }
+    if (error != nullptr) {g_error_free(error); return false;}
+    return lower(value) == "slave" &&
+           std::llabs(ptp_offset_ns()) <= config_.ptp_tolerance_ns;
+  }
+  std::uint64_t ptp_time_ns()
+  {
+    if (!ptp_action_) {throw std::runtime_error("camera has no PTP action clock");}
+    std::lock_guard<std::mutex> lock(camera_control_mutex_);
+    GError * error = nullptr;
+    arv_camera_execute_command(camera_, "PtpDataSetLatch", &error);
+    throw_on_error(error, "latching PTP time");
+    const auto value = arv_camera_get_integer(camera_, "PtpTimestampLatchValue", &error);
+    throw_on_error(error, "reading latched PTP time");
+    return static_cast<std::uint64_t>(value);
+  }
   const Assignment & assignment() const {return assignment_;}
 
   Sensor status() const
@@ -835,6 +971,7 @@ public:
     result.capabilities = {
       "image", "compressed_preview", "genicam", "camera_settings",
       "software_capture"};
+    result.capabilities.push_back(ptp_action_ ? "ptp_scheduled_action" : "unsynchronized_group_capture");
     result.applied_settings_json = applied_settings_;
     {
       std::lock_guard<std::mutex> lock(error_mutex_);
@@ -945,6 +1082,67 @@ private:
       arv_camera_set_trigger(camera_, "Software", &error);
       throw_on_error(error, "enabling software trigger");
       software_trigger_ = true;
+    } else if (normalized_trigger == "action0") {
+      const std::array<const char *, 8> required{
+        "PtpEnable", "PtpStatus", "PtpOffsetFromMaster", "PtpDataSetLatch",
+        "PtpTimestampLatchValue", "ActionDeviceKey", "ActionGroupKey", "ActionGroupMask"};
+      bool supported = arv_camera_is_gv_device(camera_);
+      for (const auto * feature : required) {
+        error = nullptr;
+        supported = supported && arv_camera_is_feature_available(camera_, feature, &error);
+        if (error != nullptr) {g_error_free(error); error = nullptr;}
+      }
+      guint trigger_count = 0;
+      const auto trigger_values = arv_camera_dup_available_enumerations_as_strings(
+        camera_, "TriggerSource", &trigger_count, &error);
+      bool has_action0 = false;
+      if (error == nullptr) {
+        for (guint index = 0; trigger_values != nullptr && index < trigger_count; ++index) {
+          has_action0 = has_action0 || lower(value_or_empty(trigger_values[index])) == "action0";
+        }
+      } else {
+        g_error_free(error);
+        error = nullptr;
+      }
+      g_free(trigger_values);
+      supported = supported && has_action0;
+      if (supported) {
+        arv_camera_set_boolean(camera_, "PtpEnable", true, &error);
+        throw_on_error(error, "enabling PTP");
+        error = nullptr;
+        if (arv_camera_is_feature_available(camera_, "ActionSelector", &error) &&
+          error == nullptr)
+        {
+          arv_camera_set_integer(camera_, "ActionSelector", 0, &error);
+          throw_on_error(error, "selecting Action0");
+        } else if (error != nullptr) {g_error_free(error); error = nullptr;}
+        arv_camera_set_integer(
+          camera_, "ActionDeviceKey", config_.action_device_key, &error);
+        throw_on_error(error, "setting ActionDeviceKey");
+        arv_camera_set_integer(
+          camera_, "ActionGroupKey", action_group_key(assignment_.sync_group), &error);
+        throw_on_error(error, "setting ActionGroupKey");
+        arv_camera_set_integer(camera_, "ActionGroupMask", 0xffffffffU, &error);
+        throw_on_error(error, "setting ActionGroupMask");
+        error = nullptr;
+        if (arv_camera_is_feature_available(camera_, "ActionUnconditionalMode", &error) &&
+          error == nullptr)
+        {
+          arv_camera_set_string(camera_, "ActionUnconditionalMode", "On", &error);
+          throw_on_error(error, "enabling unconditional action command");
+        } else if (error != nullptr) {g_error_free(error); error = nullptr;}
+        arv_camera_set_trigger(camera_, "Action0", &error);
+        throw_on_error(error, "enabling Action0 trigger");
+        ptp_action_ = true;
+      } else {
+        RCLCPP_WARN(
+          node_->get_logger(),
+          "%s lacks PTP scheduled-action nodes; using unsynchronized software trigger",
+          assignment_.sensor_id.c_str());
+        arv_camera_set_trigger(camera_, "Software", &error);
+        throw_on_error(error, "enabling software fallback trigger");
+        software_trigger_ = true;
+      }
     } else if (normalized_trigger == "freerun" || normalized_trigger == "free_run") {
       error = nullptr;
       const bool trigger_mode_available =
@@ -983,7 +1181,7 @@ private:
     } else {
       throw std::runtime_error(
               "unsupported trigger_source " + trigger_source +
-              "; use FreeRun or Software");
+              "; use FreeRun, Software, or Action0");
     }
 
     const auto feature_values = settings["features"];
@@ -1115,7 +1313,10 @@ private:
                 std::chrono::steady_clock::now().time_since_epoch()).count());
           }
           GError * error = nullptr;
-          arv_camera_software_trigger(camera_, &error);
+          {
+            std::lock_guard<std::mutex> lock(camera_control_mutex_);
+            arv_camera_software_trigger(camera_, &error);
+          }
           throw_on_error(error, "software trigger");
         }
         auto * buffer = arv_stream_timeout_pop_buffer(
@@ -1144,6 +1345,11 @@ private:
         try {image = to_bgr(buffer);} catch (...) {
           arv_stream_push_buffer(stream_, buffer);
           throw;
+        }
+        if (request->completion) {
+          request->completion->device_timestamp_ns = arv_buffer_get_timestamp(buffer);
+          request->completion->synchronized = ptp_action_;
+          request->completion->ptp_offset_ns = ptp_action_ ? ptp_offset_ns() : 0;
         }
         arv_stream_push_buffer(stream_, buffer);
         // Full-resolution one-shot frames use a dedicated lossless compressed
@@ -1265,6 +1471,8 @@ private:
   std::atomic<std::uint64_t> completed_frames_{0};
   std::atomic<std::uint64_t> incomplete_frames_{0};
   bool software_trigger_{false};
+  bool ptp_action_{false};
+  std::mutex camera_control_mutex_;
   bool transfer_start_required_{false};
   std::mutex request_mutex_;
   std::condition_variable request_cv_;
@@ -1624,7 +1832,7 @@ private:
       sensor.operating_mode = item.second.operating_mode;
       sensor.capabilities = {
         "image", "compressed_preview", "genicam", "camera_settings",
-        "software_capture"};
+        "software_capture", "ptp_capability_unknown"};
       const auto error = initialization_errors_.find(item.first);
       if (error != initialization_errors_.end()) {sensor.last_error = error->second;}
       status.sensors.push_back(sensor);
@@ -1652,6 +1860,15 @@ private:
       const auto session = sessions_.find(item.first);
       if (session != sessions_.end() && session->second->ready()) {
         group.online_member_ids.push_back(item.first);
+        if (session->second->ptp_action() && session->second->ptp_locked()) {
+          group.synchronized_member_ids.push_back(item.first);
+          const auto offset = static_cast<std::int64_t>(
+            std::llabs(session->second->ptp_offset_ns()));
+          group.max_ptp_offset_ns = std::max<std::int64_t>(
+            group.max_ptp_offset_ns, offset);
+        } else {
+          group.unsynchronized_member_ids.push_back(item.first);
+        }
       } else {
         group.missing_member_ids.push_back(item.first);
       }
@@ -1661,11 +1878,14 @@ private:
     result.generation = generation_;
     for (auto & item : groups) {
       auto & group = item.second;
+      group.synchronization_method = group.unsynchronized_member_ids.empty() ?
+        "ptp_scheduled_action" : "mixed";
+      group.ptp_ready = !group.synchronized_member_ids.empty();
       group.ready = group.operating_mode == "idle" || group.missing_member_ids.empty() ||
         (group.missing_policy == "degraded" && !group.online_member_ids.empty());
-      if (group.operating_mode == "capture") {
-        group.last_error = "generic backend currently provides host software trigger only; "
-          "PTP Action Command is not active";
+      if (group.operating_mode == "capture" && !group.unsynchronized_member_ids.empty()) {
+        group.last_error =
+          "some members do not support or have not locked PTP; they will trigger unsynchronized";
       }
       result.groups.push_back(group);
     }
@@ -1725,23 +1945,58 @@ private:
     std::shared_ptr<vixel_interfaces::srv::ProviderCapture::Response> response)
   {
     std::unique_lock<std::mutex> lock(mutex_);
-    const auto lead = std::chrono::milliseconds(config_.software_trigger_lead_time_ms);
+    const auto lead = std::chrono::milliseconds(config_.ptp_action_lead_time_ms);
     const auto release_at = std::chrono::steady_clock::now() + lead;
-    response->scheduled_time = now() + rclcpp::Duration::from_nanoseconds(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(lead).count());
     response->capture_id = request->request_id.empty() ?
-      "software_" + std::to_string(++capture_sequence_) : request->request_id;
+      "group_" + std::to_string(++capture_sequence_) : request->request_id;
     std::vector<std::pair<
       std::string, std::shared_ptr<CameraSession::FrameCompletion>>> completions;
+    std::map<std::string, NetworkConfig> action_networks;
+    std::optional<std::uint64_t> action_time;
+    for (const auto & sensor_id : request->member_ids) {
+      const auto session = sessions_.find(sensor_id);
+      if (session != sessions_.end() && session->second->ready() &&
+        session->second->ptp_action() && !session->second->ptp_locked())
+      {
+        try {
+          session->second->fall_back_to_software_trigger();
+        } catch (const std::exception & error) {
+          RCLCPP_WARN(
+            get_logger(), "Unable to software-fallback %s: %s",
+            sensor_id.c_str(), error.what());
+        }
+      }
+      if (session != sessions_.end() && session->second->ready() &&
+        session->second->ptp_action() && session->second->ptp_locked())
+      {
+        if (!action_time) {
+          action_time = session->second->ptp_time_ns() +
+            static_cast<std::uint64_t>(config_.ptp_action_lead_time_ms) * 1000000ULL;
+        }
+        action_networks[session->second->network().id] = session->second->network();
+      }
+    }
+    if (action_time) {
+      response->scheduled_time.sec = static_cast<std::int32_t>(*action_time / 1000000000ULL);
+      response->scheduled_time.nanosec =
+        static_cast<std::uint32_t>(*action_time % 1000000000ULL);
+    } else {
+      response->scheduled_time = now() + rclcpp::Duration::from_nanoseconds(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(lead).count());
+    }
     for (const auto & sensor_id : request->member_ids) {
       const auto session = sessions_.find(sensor_id);
       if (session == sessions_.end() || !session->second->ready() ||
-        !session->second->software_trigger())
+        (!session->second->software_trigger() &&
+        !(session->second->ptp_action() && session->second->ptp_locked())))
       {
         response->missing_sensor_ids.push_back(sensor_id);
       } else {
+        const auto session_release = session->second->software_trigger() ?
+          release_at : std::chrono::steady_clock::time_point{};
         auto completion = session->second->request_frame(
-          response->scheduled_time, response->capture_id, !request->trigger_only, release_at);
+          response->scheduled_time, response->capture_id,
+          !request->trigger_only, session_release);
         if (completion) {
           completions.emplace_back(sensor_id, std::move(completion));
         } else {
@@ -1757,10 +2012,32 @@ private:
       completion->changed.wait_until(
         completion_lock, release_at, [&completion]() {return completion->armed;});
     }
+    std::uint64_t earliest_dispatch = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t latest_dispatch = 0;
+    if (action_time) {
+      for (const auto & item : action_networks) {
+        const auto dispatch = static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+        earliest_dispatch = std::min(earliest_dispatch, dispatch);
+        try {
+          gvcp_scheduled_action(
+            item.second, config_.action_device_key,
+            action_group_key(request->group_id), *action_time);
+          latest_dispatch = dispatch;
+        } catch (const std::exception & error) {
+          RCLCPP_ERROR(
+            get_logger(), "Scheduled action failed on %s: %s",
+            item.second.interface.c_str(), error.what());
+        }
+      }
+    }
     const auto deadline = release_at +
       std::chrono::milliseconds(config_.image_timeout_ms + 1000);
-    std::uint64_t earliest_trigger = std::numeric_limits<std::uint64_t>::max();
-    std::uint64_t latest_trigger = 0;
+    std::uint64_t earliest_trigger = earliest_dispatch;
+    std::uint64_t latest_trigger = latest_dispatch;
+    std::uint64_t earliest_exposure = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t latest_exposure = 0;
     for (const auto & item : completions) {
       const auto & completion = item.second;
       std::unique_lock<std::mutex> completion_lock(completion->mutex);
@@ -1768,6 +2045,17 @@ private:
         completion_lock, deadline, [&completion]() {return completion->done;});
       if (completion->done && completion->success) {
         response->participating_sensor_ids.push_back(item.first);
+        vixel_interfaces::msg::CameraTiming timing;
+        timing.sensor_id = item.first;
+        timing.device_timestamp_ns = completion->device_timestamp_ns;
+        timing.ptp_offset_ns = completion->ptp_offset_ns;
+        timing.synchronized = completion->synchronized;
+        response->camera_timings.push_back(timing);
+        if (completion->synchronized && completion->device_timestamp_ns != 0) {
+          earliest_exposure = std::min(
+            earliest_exposure, completion->device_timestamp_ns);
+          latest_exposure = std::max(latest_exposure, completion->device_timestamp_ns);
+        }
         if (completion->trigger_started_ns != 0) {
           earliest_trigger = std::min(earliest_trigger, completion->trigger_started_ns);
           latest_trigger = std::max(latest_trigger, completion->trigger_started_ns);
@@ -1779,11 +2067,23 @@ private:
     if (latest_trigger != 0 && earliest_trigger != std::numeric_limits<std::uint64_t>::max()) {
       response->trigger_span_ns = latest_trigger - earliest_trigger;
     }
+    if (latest_exposure != 0 &&
+      earliest_exposure != std::numeric_limits<std::uint64_t>::max())
+    {
+      response->exposure_skew_ns = latest_exposure - earliest_exposure;
+    }
+    response->within_tolerance =
+      response->exposure_skew_ns <= static_cast<std::uint64_t>(config_.ptp_tolerance_ns);
     response->success = response->missing_sensor_ids.empty() ||
       (request->missing_policy == "degraded" && !response->participating_sensor_ids.empty());
+    const auto synchronized_count = std::count_if(
+      response->camera_timings.begin(), response->camera_timings.end(),
+      [](const auto & timing) {return timing.synchronized;});
     response->message = response->success ?
-      "software-barrier frames published (not PTP synchronized)" :
-      "one or more cameras were unavailable, busy, or failed acquisition";
+      std::to_string(synchronized_count) + " PTP-synchronized and " +
+      std::to_string(response->camera_timings.size() - synchronized_count) +
+      " unsynchronized frame(s) published" :
+      "one or more cameras were unavailable, PTP-unlocked, busy, or failed acquisition";
   }
 
   void features_callback(

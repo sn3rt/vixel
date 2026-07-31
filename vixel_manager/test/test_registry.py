@@ -109,7 +109,8 @@ def test_replacement_transfers_slot_metadata_and_group_membership(tmp_path):
     assert record["assigned_address"] == "192.168.2.10"
     assert record["location_label"] == "front_left"
     assert registry.inventory["sync_groups"]["pair"]["members"] == [replacement]
-    assert registry.inventory["sync_groups"]["pair"]["preferred_master_id"] == replacement
+    assert registry.inventory["sync_groups"]["pair"]["preferred_master_id"] == ""
+    assert registry.inventory["sync_groups"]["pair"]["trigger_source"] == "Action0"
     retired = registry.inventory["known_sensors"][original]
     assert retired["catalog_state"] == "retired"
     assert retired["replaced_by"] == replacement
@@ -130,20 +131,20 @@ def test_sensor_can_belong_to_only_one_sync_group(tmp_path):
     assert "group_b" not in registry.inventory["sync_groups"]
 
 
-def test_preferred_master_must_be_a_group_member(tmp_path):
+def test_pc_is_always_group_ptp_master(tmp_path):
     registry, _ = make_registry(tmp_path)
     sensor_id = registry.enroll(
         observation(), registry.allocate("switch"), "Camera", "unknown"
     )
-    with pytest.raises(RegistryError, match="preferred master"):
-        registry.upsert_group(
-            "group_a", "lucid", [sensor_id], "strict", "Software", 2.0,
-            "lucid_missing"
-        )
-    assert registry.inventory["sync_groups"] == {}
+    registry.upsert_group(
+        "group_a", "lucid", [sensor_id], "strict", "Software", 2.0,
+        "lucid_missing"
+    )
+    assert registry.inventory["sync_groups"]["group_a"]["preferred_master_id"] == ""
+    assert registry.inventory["sync_groups"]["group_a"]["trigger_source"] == "Action0"
 
 
-def test_existing_group_defaults_to_free_run_and_trigger_source_is_validated(tmp_path):
+def test_existing_group_is_migrated_to_ptp_action(tmp_path):
     registry, _ = make_registry(tmp_path)
     sensor_id = registry.enroll(
         observation(), registry.allocate("switch"), "Camera", "unknown"
@@ -156,12 +157,11 @@ def test_existing_group_defaults_to_free_run_and_trigger_source_is_validated(tmp
         "preferred_master_id": "",
     }
     registry.save()
-    assert registry.inventory["sync_groups"]["legacy"]["trigger_source"] == "FreeRun"
-
-    with pytest.raises(RegistryError, match="trigger_source"):
-        registry.upsert_group(
-            "legacy", "lucid", [sensor_id], "strict", "Line0", 2.0, ""
-        )
+    assert registry.inventory["sync_groups"]["legacy"]["trigger_source"] == "Action0"
+    registry.upsert_group(
+        "legacy", "lucid", [sensor_id], "strict", "Line0", 2.0, ""
+    )
+    assert registry.inventory["sync_groups"]["legacy"]["trigger_source"] == "Action0"
 
 
 def test_legacy_import_ignores_placeholders(tmp_path):

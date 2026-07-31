@@ -21,7 +21,8 @@ def test_dashboard_is_dynamic_and_uses_gateway_endpoints():
     assert "Capture and save" in page
     assert "Trigger and publish" in page
     assert "/trigger" in page
-    assert 'name="trigger_source"' in page
+    assert 'name="trigger_source"' not in page
+    assert "PTP synchronized" in page
 
 
 def test_dashboard_javascript_parses():

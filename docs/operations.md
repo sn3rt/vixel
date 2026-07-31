@@ -43,11 +43,14 @@ frames for the dashboard at the configured rate while retaining full-resolution
 ROS image topics. Capture belongs to a named sync group.
 
 A `strict` group requires every member. A `degraded` group captures ready
-members when another member is unavailable. A group must use the `Software`
-trigger source before it can be triggered. The generic backend pre-arms each
-camera worker and releases them at one host deadline, but reports captures as
-not PTP synchronized. The returned `trigger_span_ns` is the measured span
-between host software-trigger calls, not exposure-time skew.
+members when another member is unavailable. Group membership automatically
+selects `Action0`: cameras with PTP scheduled-action support synchronize to the
+PC grandmaster, while unsupported cameras remain in the capture using the
+software barrier and are reported as unsynchronized.
+
+Results include per-camera timing records, `exposure_skew_ns` for synchronized
+members, and `within_tolerance`. `trigger_span_ns` remains command-dispatch
+timing and must not be interpreted as exposure skew.
 
 Use **Trigger and publish** for processing without writing files. Subscribe to
 each member's `image_raw` topic before triggering; the resulting images use the
@@ -65,6 +68,9 @@ The HTTP equivalent is:
 curl -X POST -H 'Content-Type: application/json' -d '{}' \
   http://127.0.0.1:8080/api/v1/groups/inspection_pair/trigger
 ```
+
+Runnable Python clients for HTTP triggering and ROS image reception are in
+[the examples guide](../examples/README.md).
 
 Vixel does not schedule periodic triggers internally. A ROS node, cron job, or
 other application can call either interface at its required interval. Disjoint
