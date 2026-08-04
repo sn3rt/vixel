@@ -15,7 +15,7 @@ struct NetworkConfig
   std::string host_cidr;
   std::string gateway{"0.0.0.0"};
   std::int64_t packet_size{9000};
-  std::int64_t packet_delay{1000};
+  std::int64_t packet_delay{100000};
 };
 
 struct ImagingConfig

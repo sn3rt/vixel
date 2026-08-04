@@ -15,6 +15,7 @@ git clone https://github.com/sn3rt/vixel.git
 cd vixel
 rosdep install --from-paths . --ignore-src -r -y --rosdistro lyrical \
   --skip-keys "ament_pytest gjs"
+source /opt/ros/lyrical/setup.bash
 colcon build --symlink-install
 source install/setup.bash
 ```
@@ -34,6 +35,26 @@ source /home/robotti/vixel/install/setup.zsh
 Do not source a `.bash` setup script from zsh; it resolves its prefix using
 Bash-specific variables and can produce misleading missing-file and Python
 package errors.
+
+Re-source the ROS underlay and Vixel overlay after every build. In particular,
+an already-open terminal can retain Python paths from a previous normal or
+symlink install even though `ros2` finds the newly generated executables. The
+result is an `importlib.metadata.PackageNotFoundError` for a Vixel package. Use
+this clean reset in zsh:
+
+```zsh
+unset COLCON_CURRENT_PREFIX AMENT_CURRENT_PREFIX PYTHONPATH \
+  AMENT_PREFIX_PATH CMAKE_PREFIX_PATH COLCON_PREFIX_PATH
+source /opt/ros/lyrical/setup.zsh
+source /home/robotti/vixel/install/setup.zsh
+```
+
+For Bash, use the two corresponding `.bash` files. You can verify the overlay
+before launching with:
+
+```bash
+python3 -c 'from importlib.metadata import version; print(version("vixel-manager"), version("vixel-web"))'
+```
 
 Aravis 0.8.34 or newer can be supplied by the system. If it is absent, the
 `vixel_aravis_vendor` package downloads and builds the pinned release. Building
@@ -96,6 +117,7 @@ unprivileged development environment, Vixel falls back to
 ## Build and test
 
 ```bash
+source /opt/ros/lyrical/setup.bash
 colcon build --symlink-install
 source install/setup.bash
 colcon test

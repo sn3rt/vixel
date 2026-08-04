@@ -267,7 +267,7 @@ def validate_machine(data: dict[str, Any]) -> dict[str, Any]:
         network.setdefault("switched_max_devices", int(end) - int(start) + 1)
         network.setdefault("gateway", "0.0.0.0")
         network.setdefault("packet_size", min(int(network["mtu"]), 9000))
-        network.setdefault("packet_delay", 1000)
+        network.setdefault("packet_delay", 100000)
         network.setdefault("transfer_slot_ms", 100)
         if int(network["mtu"]) < 1500 or int(network["max_devices"]) <= 0:
             raise RegistryError(f"managed network {network_id} has invalid MTU or max_devices")

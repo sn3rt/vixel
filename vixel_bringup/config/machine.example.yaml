@@ -22,7 +22,8 @@ managed_networks:
     rp_filter: 0
     gateway: 0.0.0.0
     packet_size: 9000
-    packet_delay: 1000
+    # Safe for several full-resolution cameras sharing a PCIe uplink.
+    packet_delay: 100000
     transfer_slot_ms: 100
 
   # A switch may host multiple cameras. Give each switched port its own subnet.
@@ -40,7 +41,7 @@ managed_networks:
     rp_filter: 0
     gateway: 0.0.0.0
     packet_size: 9000
-    packet_delay: 1000
+    packet_delay: 100000
     transfer_slot_ms: 100
 
 providers:

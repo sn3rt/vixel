@@ -432,8 +432,8 @@ void gvcp_scheduled_action(
   static std::atomic<std::uint16_t> request_sequence{1};
   std::array<std::uint8_t, 8 + payload_size> packet{};
   packet[0] = 0x42;
-  // Request an acknowledgement and permit acknowledgement of a broadcast command.
-  packet[1] = 0x11;
+  // Scheduled Action bit plus acknowledgement request.
+  packet[1] = 0x81;
   write_u16(packet.data() + 2, action_command);
   write_u16(packet.data() + 4, payload_size);
   const auto request_id = request_sequence.fetch_add(1);
@@ -476,9 +476,11 @@ void gvcp_scheduled_action(
   sockaddr_in destination{};
   destination.sin_family = AF_INET;
   destination.sin_port = htons(gvcp_port);
-  const auto broadcast = broadcast_address_for_cidr(network.host_cidr);
-  if (inet_pton(AF_INET, broadcast.c_str(), &destination.sin_addr) != 1) {
-    throw std::runtime_error("invalid scheduled-action broadcast " + broadcast);
+  // GigE Vision Action Commands use the limited broadcast address. Some
+  // cameras reject a subnet-directed broadcast even on an otherwise direct link.
+  const std::string target_address{"255.255.255.255"};
+  if (inet_pton(AF_INET, target_address.c_str(), &destination.sin_addr) != 1) {
+    throw std::runtime_error("invalid scheduled-action target " + target_address);
   }
   if (sendto(
       command_socket.get(), packet.data(), packet.size(), 0,

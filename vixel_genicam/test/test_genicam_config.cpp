@@ -27,6 +27,7 @@ defaults:
   const auto config = vixel_genicam::load_genicam_config(path.string());
   EXPECT_EQ(config.networks.at("link").interface, "enp1s0");
   EXPECT_EQ(config.networks.at("link").packet_size, 8192);
+  EXPECT_EQ(config.networks.at("link").packet_delay, 100000);
   EXPECT_EQ(config.buffer_count, 20);
   EXPECT_DOUBLE_EQ(config.imaging.frame_rate_hz, 4.0);
   EXPECT_EQ(config.preview_width, 800);

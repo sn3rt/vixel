@@ -56,7 +56,7 @@ portable settings include:
   "gain_db": 2.0,
   "frame_rate_hz": 4.0,
   "packet_size": 9000,
-  "packet_delay_ns": 1000,
+  "packet_delay_ns": 100000,
   "trigger_source": "FreeRun",
   "transfer_control_mode": "Basic"
 }
@@ -66,6 +66,12 @@ portable settings include:
 supports a software `FrameStart` trigger. When SFNC `TransferControlMode` is
 available, Vixel defaults it to `Basic` to avoid frames being held by settings
 left behind by another application.
+
+`packet_delay_ns` paces GigE Vision image packets without changing exposure
+time or PTP synchronization. The conservative 100,000 ns default prevents
+simultaneous full-resolution streams from overrunning a shared PCIe uplink.
+Machines with independently provisioned NIC bandwidth may lower it after
+checking the NIC drop counters under simultaneous capture.
 
 Grouped cameras automatically request `Action0` and PTP; there is no group
 trigger-source selector. Cameras without the required nodes fall back to the

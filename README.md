@@ -73,12 +73,16 @@ git clone https://github.com/sn3rt/vixel.git
 cd vixel
 rosdep install --from-paths . --ignore-src -r -y --rosdistro lyrical \
   --skip-keys "ament_pytest gjs"
+source /opt/ros/lyrical/setup.bash
 colcon build --symlink-install
 source install/setup.bash
 ```
 
 When using zsh, source `/opt/ros/lyrical/setup.zsh` and
 `install/setup.zsh` instead of the Bash setup files.
+Re-source both setup files after every build. An already-open terminal keeps
+the old Python paths; after a symlink-install rebuild that can leave ROS able
+to find an executable whose Python package metadata is no longer on its path.
 
 Create a machine configuration before launching:
 

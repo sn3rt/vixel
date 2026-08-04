@@ -200,6 +200,7 @@ def test_legacy_lucid_provider_is_migrated_in_memory():
     machine = validate_machine(MACHINE)
     assert "lucid" not in machine["providers"]
     assert machine["providers"]["genicam"]["imaging"]["frame_rate_hz"] == 10.0
+    assert machine["managed_networks"]["left"]["packet_delay"] == 100000
 
 
 def test_recording_configuration_gets_safe_defaults():
