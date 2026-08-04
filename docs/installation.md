@@ -85,6 +85,10 @@ PTP immediately. Systemd starts them automatically on every subsequent boot;
 you do not need to start PTP manually again. Re-run the command after moving the
 workspace or changing which installation should own the services.
 
+The installer also writes `/etc/linuxptp/vixel-ptp4l.conf`. This location is
+readable by Ubuntu's packaged `ptp4l` AppArmor profile; do not move the generated
+configuration under `/run/vixel` without adding an equivalent AppArmor rule.
+
 The runtime inventory is created at `/var/lib/vixel/inventory.yaml`. In an
 unprivileged development environment, Vixel falls back to
 `$XDG_STATE_HOME/vixel/inventory.yaml`.

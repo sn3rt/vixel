@@ -40,6 +40,8 @@ Every managed camera NIC with a hardware clock participates in the PC-mastered
 PTP domain. `vixel-ptp-supervisor` discovers interfaces dynamically, runs one
 `ptp4l` grandmaster port per link using E2E delay measurement, and disciplines
 secondary NIC clocks to a deterministic primary with `phc2sys`.
+Its generated configuration is installed at `/etc/linuxptp/vixel-ptp4l.conf`
+so it works with the default Ubuntu `ptp4l` AppArmor profile.
 
 ## Direct and switched ports
 

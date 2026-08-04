@@ -47,6 +47,11 @@ members when another member is unavailable. Group membership automatically
 selects `Action0`: cameras with PTP scheduled-action support synchronize to the
 PC grandmaster, while unsupported cameras remain in the capture using the
 software barrier and are reported as unsynchronized.
+Capability detection follows GenICam/SFNC features rather than camera brand. It
+accepts current `Ptp*` nodes and legacy `GevIEEE1588*` timestamp aliases used by
+some vendors. A capable camera that is still acquiring lock uses software only
+for requests received during that interval and automatically returns to
+scheduled `Action0` capture after lock.
 
 Results include per-camera timing records, `exposure_skew_ns` for synchronized
 members, and `within_tolerance`. `trigger_span_ns` remains command-dispatch

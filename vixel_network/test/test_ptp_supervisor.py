@@ -38,10 +38,23 @@ def test_missing_hardware_clock_is_actionable(tmp_path):
 def test_linuxptp_commands_use_e2e_and_primary_phc():
     primary = PtpPort("a", "enp7s0", "/dev/ptp1")
     follower = PtpPort("b", "enp8s0", "/dev/ptp2")
-    assert ptp4l_command(primary, "/run/vixel/ptp4l.conf")[-2:] == ["enp7s0", "-m"]
+    assert ptp4l_command(primary, "/etc/linuxptp/vixel-ptp4l.conf")[-2:] == [
+        "enp7s0", "-m"
+    ]
     assert phc2sys_command(primary, follower)[1:5] == [
         "-s", "/dev/ptp1", "-c", "/dev/ptp2"
     ]
     config = render_ptp4l_config()
     assert "delay_mechanism E2E" in config
     assert "serverOnly 1" in config
+
+
+def test_supervisor_requires_a_readable_installed_config(tmp_path):
+    from vixel_network.ptp_supervisor import PtpSupervisor
+
+    supervisor = PtpSupervisor(
+        [PtpPort("front", "enp7s0", "/dev/ptp1")],
+        config_path=tmp_path / "missing.conf",
+    )
+    with pytest.raises(NetworkSetupError, match="re-run vixel-network-setup"):
+        supervisor.start()

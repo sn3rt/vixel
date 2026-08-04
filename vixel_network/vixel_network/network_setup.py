@@ -18,6 +18,21 @@ class NetworkSetupError(RuntimeError):
     pass
 
 
+def render_ptp4l_config() -> str:
+    return "\n".join([
+        "[global]",
+        "time_stamping hardware",
+        "network_transport UDPv4",
+        "delay_mechanism E2E",
+        "serverOnly 1",
+        "gmCapable 1",
+        "priority1 10",
+        "priority2 10",
+        "logging_level 6",
+        "",
+    ])
+
+
 def require_linuxptp(which: Callable = shutil.which) -> None:
     missing = [command for command in ("ptp4l", "phc2sys") if not which(command)]
     if missing:
@@ -244,6 +259,11 @@ def install_service(machine_file: str, executable: str) -> None:
         if not discovered:
             raise NetworkSetupError("cannot locate vixel-ptp-supervisor")
         ptp_executable = pathlib.Path(discovered).resolve()
+    linuxptp_directory = pathlib.Path("/etc/linuxptp")
+    linuxptp_directory.mkdir(parents=True, exist_ok=True)
+    ptp_config_path = linuxptp_directory / "vixel-ptp4l.conf"
+    ptp_config_path.write_text(render_ptp4l_config(), encoding="ascii")
+    ptp_config_path.chmod(0o644)
     ptp_command = (
         f"source /opt/ros/lyrical/setup.bash && "
         f"source {shlex.quote(str(local_setup))} && "
@@ -255,12 +275,14 @@ def install_service(machine_file: str, executable: str) -> None:
         "Description=Vixel camera Precision Time Protocol grandmaster",
         "After=vixel-network-setup.service",
         "Requires=vixel-network-setup.service",
+        "StartLimitIntervalSec=60",
+        "StartLimitBurst=5",
         "",
         "[Service]",
         "Type=simple",
         f"ExecStart=/bin/bash -lc {shlex.quote(ptp_command)}",
         "Restart=on-failure",
-        "RestartSec=2",
+        "RestartSec=5",
         "",
         "[Install]",
         "WantedBy=multi-user.target",
@@ -270,9 +292,12 @@ def install_service(machine_file: str, executable: str) -> None:
     ptp_unit_path.write_text(ptp_unit, encoding="utf-8")
     subprocess.run(["systemctl", "daemon-reload"], check=True)
     subprocess.run(["systemctl", "enable", "vixel-network-setup.service"], check=True)
-    subprocess.run(["systemctl", "enable", "--now", "vixel-ptp.service"], check=True)
+    subprocess.run(["systemctl", "enable", "vixel-ptp.service"], check=True)
+    # An earlier unit may still be active while install-service replaces it.
+    # Restart explicitly so the new unit and AppArmor-readable config take effect now.
+    subprocess.run(["systemctl", "restart", "vixel-ptp.service"], check=True)
     print(
-        f"Installed {unit_path} and {ptp_unit_path}; "
+        f"Installed {unit_path}, {ptp_unit_path}, and {ptp_config_path}; "
         "both are enabled and the PTP service is running"
     )
 

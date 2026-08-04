@@ -11,7 +11,12 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
-from .network_setup import ManagedNetwork, NetworkSetupError, load_networks
+from .network_setup import (
+    ManagedNetwork,
+    NetworkSetupError,
+    load_networks,
+    render_ptp4l_config,
+)
 
 
 @dataclass(frozen=True)
@@ -53,43 +58,33 @@ def phc2sys_command(primary: PtpPort, follower: PtpPort) -> list[str]:
     ]
 
 
-def render_ptp4l_config() -> str:
-    return "\n".join([
-        "[global]",
-        "time_stamping hardware",
-        "network_transport UDPv4",
-        "delay_mechanism E2E",
-        "serverOnly 1",
-        "gmCapable 1",
-        "priority1 10",
-        "priority2 10",
-        "logging_level 6",
-        "",
-    ])
-
-
 class PtpSupervisor:
     def __init__(
         self,
         ports: list[PtpPort],
-        runtime_directory: pathlib.Path = pathlib.Path("/run/vixel"),
+        config_path: pathlib.Path = pathlib.Path("/etc/linuxptp/vixel-ptp4l.conf"),
         popen: Callable = subprocess.Popen,
     ):
         if not ports:
             raise NetworkSetupError("no managed PTP camera interfaces are configured")
         self.ports = ports
-        self.runtime_directory = runtime_directory
+        self.config_path = config_path
         self.popen = popen
         self.children: list[subprocess.Popen] = []
         self.stopping = False
 
     def start(self) -> None:
-        self.runtime_directory.mkdir(parents=True, exist_ok=True)
-        config_path = self.runtime_directory / "ptp4l.conf"
-        config_path.write_text(render_ptp4l_config(), encoding="ascii")
+        try:
+            with self.config_path.open("r", encoding="ascii") as stream:
+                stream.read(1)
+        except OSError as error:
+            raise NetworkSetupError(
+                f"cannot read linuxptp configuration {self.config_path}: {error}; "
+                "re-run vixel-network-setup install-service"
+            ) from error
         primary = self.ports[0]
         for port in self.ports:
-            self.children.append(self.popen(ptp4l_command(port, str(config_path))))
+            self.children.append(self.popen(ptp4l_command(port, str(self.config_path))))
         for port in self.ports[1:]:
             self.children.append(self.popen(phc2sys_command(primary, port)))
         print(
@@ -117,8 +112,11 @@ class PtpSupervisor:
             for child in self.children:
                 result = child.poll()
                 if result is not None:
+                    command = getattr(child, "args", "linuxptp child")
+                    if isinstance(command, (list, tuple)):
+                        command = " ".join(str(part) for part in command)
                     print(
-                        f"vixel-ptp: child process exited with status {result}",
+                        f"vixel-ptp: child process exited with status {result}: {command}",
                         file=sys.stderr,
                     )
                     self.stop()

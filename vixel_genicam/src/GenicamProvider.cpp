@@ -42,6 +42,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <initializer_list>
 #include <limits>
 #include <map>
 #include <memory>
@@ -779,6 +780,7 @@ public:
     std::string capture_id;
     bool publish_capture_chunks{false};
     std::chrono::steady_clock::time_point release_at{};
+    bool force_software_trigger{false};
     std::shared_ptr<FrameCompletion> completion;
   };
 
@@ -877,7 +879,8 @@ public:
   std::shared_ptr<FrameCompletion> request_frame(
     const builtin_interfaces::msg::Time & stamp, const std::string & capture_id = {},
     bool publish_capture_chunks = false,
-    std::chrono::steady_clock::time_point release_at = {})
+    std::chrono::steady_clock::time_point release_at = {},
+    bool force_software_trigger = false)
   {
     std::lock_guard<std::mutex> lock(request_mutex_);
     if (!ready_.load() || request_active_) {return {};}
@@ -886,7 +889,7 @@ public:
       completion = std::make_shared<FrameCompletion>();
     }
     pending_request_ = FrameRequest{
-      stamp, capture_id, publish_capture_chunks, release_at, completion};
+      stamp, capture_id, publish_capture_chunks, release_at, force_software_trigger, completion};
     request_active_ = true;
     request_cv_.notify_one();
     return completion;
@@ -895,27 +898,13 @@ public:
   bool ready() const {return ready_.load();}
   bool software_trigger() const {return software_trigger_;}
   bool ptp_action() const {return ptp_action_;}
-  void fall_back_to_software_trigger()
-  {
-    if (!ptp_action_) {return;}
-    std::lock_guard<std::mutex> lock(camera_control_mutex_);
-    GError * error = nullptr;
-    arv_camera_set_trigger(camera_, "Software", &error);
-    throw_on_error(error, "switching unlocked PTP camera to software trigger");
-    ptp_action_ = false;
-    software_trigger_ = true;
-    RCLCPP_WARN(
-      node_->get_logger(),
-      "%s is not PTP-locked; continuing as an unsynchronized group member",
-      assignment_.sensor_id.c_str());
-  }
   const NetworkConfig & network() const {return network_;}
   std::int64_t ptp_offset_ns()
   {
     if (!ptp_action_) {return 0;}
     std::lock_guard<std::mutex> lock(camera_control_mutex_);
     GError * error = nullptr;
-    const auto value = arv_camera_get_integer(camera_, "PtpOffsetFromMaster", &error);
+    const auto value = arv_camera_get_integer(camera_, ptp_offset_feature_.c_str(), &error);
     if (error != nullptr) {g_error_free(error); return std::numeric_limits<std::int64_t>::max();}
     return value;
   }
@@ -926,7 +915,7 @@ public:
     std::string value;
     {
       std::lock_guard<std::mutex> lock(camera_control_mutex_);
-      value = value_or_empty(arv_camera_get_string(camera_, "PtpStatus", &error));
+      value = value_or_empty(arv_camera_get_string(camera_, ptp_status_feature_.c_str(), &error));
     }
     if (error != nullptr) {g_error_free(error); return false;}
     return lower(value) == "slave" &&
@@ -937,15 +926,15 @@ public:
     if (!ptp_action_) {throw std::runtime_error("camera has no PTP action clock");}
     std::lock_guard<std::mutex> lock(camera_control_mutex_);
     GError * error = nullptr;
-    arv_camera_execute_command(camera_, "PtpDataSetLatch", &error);
+    arv_camera_execute_command(camera_, ptp_latch_feature_.c_str(), &error);
     throw_on_error(error, "latching PTP time");
-    const auto value = arv_camera_get_integer(camera_, "PtpTimestampLatchValue", &error);
+    const auto value = arv_camera_get_integer(camera_, ptp_latch_value_feature_.c_str(), &error);
     throw_on_error(error, "reading latched PTP time");
     return static_cast<std::uint64_t>(value);
   }
   const Assignment & assignment() const {return assignment_;}
 
-  Sensor status() const
+  Sensor status()
   {
     Sensor result;
     result.stamp = node_->now();
@@ -977,7 +966,25 @@ public:
       std::lock_guard<std::mutex> lock(error_mutex_);
       result.last_error = last_error_;
     }
-    result.status_detail = "Aravis " ARAVIS_VERSION;
+    if (ptp_action_) {
+      const auto offset = ptp_offset_ns();
+      GError * error = nullptr;
+      std::string ptp_status;
+      {
+        std::lock_guard<std::mutex> lock(camera_control_mutex_);
+        ptp_status = value_or_empty(
+          arv_camera_get_string(camera_, ptp_status_feature_.c_str(), &error));
+      }
+      if (error != nullptr) {g_error_free(error); ptp_status = "unreadable";}
+      result.status_detail = "PTP " + ptp_status + ", offset " +
+        (offset == std::numeric_limits<std::int64_t>::max() ? std::string("unreadable") :
+        std::to_string(offset) + " ns");
+    } else {
+      result.status_detail = ptp_capability_detail_;
+    }
+    if (!device_version_.empty()) {
+      result.status_detail += "; firmware " + device_version_;
+    }
     return result;
   }
 
@@ -994,6 +1001,18 @@ public:
   }
 
 private:
+  std::string first_available_feature(
+    std::initializer_list<const char *> candidates)
+  {
+    for (const auto * candidate : candidates) {
+      GError * error = nullptr;
+      const bool available = arv_camera_is_feature_available(camera_, candidate, &error);
+      if (error != nullptr) {g_error_free(error);}
+      if (available) {return candidate;}
+    }
+    return {};
+  }
+
   void apply_configuration()
   {
     YAML::Node settings;
@@ -1072,6 +1091,12 @@ private:
       throw_on_error(error, "setting GigE packet delay");
     }
 
+    error = nullptr;
+    if (arv_camera_is_feature_available(camera_, "DeviceVersion", &error) && error == nullptr) {
+      device_version_ = value_or_empty(arv_camera_get_string(camera_, "DeviceVersion", &error));
+      if (error != nullptr) {g_error_free(error); error = nullptr; device_version_.clear();}
+    } else if (error != nullptr) {g_error_free(error); error = nullptr;}
+
     const auto trigger_source = setting(settings, "trigger_source", std::string("FreeRun"));
     const auto normalized_trigger = lower(trigger_source);
     error = nullptr;
@@ -1083,15 +1108,30 @@ private:
       throw_on_error(error, "enabling software trigger");
       software_trigger_ = true;
     } else if (normalized_trigger == "action0") {
-      const std::array<const char *, 8> required{
-        "PtpEnable", "PtpStatus", "PtpOffsetFromMaster", "PtpDataSetLatch",
-        "PtpTimestampLatchValue", "ActionDeviceKey", "ActionGroupKey", "ActionGroupMask"};
       bool supported = arv_camera_is_gv_device(camera_);
-      for (const auto * feature : required) {
-        error = nullptr;
-        supported = supported && arv_camera_is_feature_available(camera_, feature, &error);
-        if (error != nullptr) {g_error_free(error); error = nullptr;}
+      ptp_enable_feature_ = first_available_feature({"PtpEnable", "GevIEEE1588"});
+      ptp_status_feature_ = first_available_feature({"PtpStatus", "GevIEEE1588Status"});
+      ptp_offset_feature_ = first_available_feature(
+        {"PtpOffsetFromMaster", "GevIEEE1588OffsetFromMaster"});
+      ptp_latch_feature_ = first_available_feature(
+        {"PtpDataSetLatch", "GevTimestampControlLatch"});
+      ptp_latch_value_feature_ = first_available_feature(
+        {"PtpDataSetLatchValue", "PtpTimestampLatchValue", "GevTimestampValue"});
+      std::vector<std::string> missing;
+      const std::array<std::pair<const char *, const std::string *>, 5> ptp_features{{
+        {"PTP enable", &ptp_enable_feature_},
+        {"PTP status", &ptp_status_feature_},
+        {"PTP offset", &ptp_offset_feature_},
+        {"PTP clock latch", &ptp_latch_feature_},
+        {"PTP latched value", &ptp_latch_value_feature_},
+      }};
+      for (const auto & feature : ptp_features) {
+        if (feature.second->empty()) {missing.emplace_back(feature.first);}
       }
+      for (const auto * feature : {"ActionDeviceKey", "ActionGroupKey", "ActionGroupMask"}) {
+        if (first_available_feature({feature}).empty()) {missing.emplace_back(feature);}
+      }
+      supported = supported && missing.empty();
       guint trigger_count = 0;
       const auto trigger_values = arv_camera_dup_available_enumerations_as_strings(
         camera_, "TriggerSource", &trigger_count, &error);
@@ -1106,9 +1146,16 @@ private:
       }
       g_free(trigger_values);
       supported = supported && has_action0;
+      if (!has_action0) {missing.emplace_back("TriggerSource=Action0");}
       if (supported) {
-        arv_camera_set_boolean(camera_, "PtpEnable", true, &error);
+        arv_camera_set_boolean(camera_, ptp_enable_feature_.c_str(), true, &error);
         throw_on_error(error, "enabling PTP");
+        const auto slave_only = first_available_feature(
+          {"PtpSlaveOnly", "GevIEEE1588SlaveOnly"});
+        if (!slave_only.empty() && feature_writable(camera_, slave_only.c_str())) {
+          arv_camera_set_boolean(camera_, slave_only.c_str(), true, &error);
+          throw_on_error(error, "configuring camera as a PTP slave");
+        }
         error = nullptr;
         if (arv_camera_is_feature_available(camera_, "ActionSelector", &error) &&
           error == nullptr)
@@ -1134,11 +1181,19 @@ private:
         arv_camera_set_trigger(camera_, "Action0", &error);
         throw_on_error(error, "enabling Action0 trigger");
         ptp_action_ = true;
+        ptp_capability_detail_ = "PTP supported; waiting for lock";
       } else {
+        std::ostringstream detail;
+        detail << "PTP scheduled action unsupported; missing ";
+        for (std::size_t index = 0; index < missing.size(); ++index) {
+          if (index != 0) {detail << ", ";}
+          detail << missing[index];
+        }
+        ptp_capability_detail_ = detail.str();
         RCLCPP_WARN(
           node_->get_logger(),
-          "%s lacks PTP scheduled-action nodes; using unsynchronized software trigger",
-          assignment_.sensor_id.c_str());
+          "%s: %s; using unsynchronized software trigger",
+          assignment_.sensor_id.c_str(), ptp_capability_detail_.c_str());
         arv_camera_set_trigger(camera_, "Software", &error);
         throw_on_error(error, "enabling software fallback trigger");
         software_trigger_ = true;
@@ -1306,7 +1361,16 @@ private:
         if (request->release_at != std::chrono::steady_clock::time_point{}) {
           std::this_thread::sleep_until(request->release_at);
         }
-        if (software_trigger_) {
+        const bool software_for_request = software_trigger_ || request->force_software_trigger;
+        bool restore_action_trigger = false;
+        if (request->force_software_trigger && ptp_action_) {
+          GError * error = nullptr;
+          std::lock_guard<std::mutex> lock(camera_control_mutex_);
+          arv_camera_set_trigger(camera_, "Software", &error);
+          throw_on_error(error, "temporarily selecting software trigger while PTP is unlocked");
+          restore_action_trigger = true;
+        }
+        if (software_for_request) {
           if (request->completion) {
             request->completion->trigger_started_ns =
               static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1317,7 +1381,15 @@ private:
             std::lock_guard<std::mutex> lock(camera_control_mutex_);
             arv_camera_software_trigger(camera_, &error);
           }
-          throw_on_error(error, "software trigger");
+          const auto trigger_error = error == nullptr ? std::string{} :
+            error_text(error, "software trigger");
+          error = nullptr;
+          if (restore_action_trigger) {
+            std::lock_guard<std::mutex> lock(camera_control_mutex_);
+            arv_camera_set_trigger(camera_, "Action0", &error);
+            throw_on_error(error, "restoring Action0 after temporary software trigger");
+          }
+          if (!trigger_error.empty()) {throw std::runtime_error(trigger_error);}
         }
         auto * buffer = arv_stream_timeout_pop_buffer(
           stream_, static_cast<std::uint64_t>(config_.image_timeout_ms) * 1000U);
@@ -1325,7 +1397,7 @@ private:
         // Free-running preview streams can accumulate completed buffers while the
         // browser requests fewer frames than the camera produces. Discard every
         // older completed buffer and process only the newest one available now.
-        if (!software_trigger_) {
+        if (!software_for_request) {
           for (int index = 1; index < config_.buffer_count; ++index) {
             auto * newer = arv_stream_try_pop_buffer(stream_);
             if (newer == nullptr) {break;}
@@ -1348,8 +1420,9 @@ private:
         }
         if (request->completion) {
           request->completion->device_timestamp_ns = arv_buffer_get_timestamp(buffer);
-          request->completion->synchronized = ptp_action_;
-          request->completion->ptp_offset_ns = ptp_action_ ? ptp_offset_ns() : 0;
+          request->completion->synchronized = ptp_action_ && !request->force_software_trigger;
+          request->completion->ptp_offset_ns = request->completion->synchronized ?
+            ptp_offset_ns() : 0;
         }
         arv_stream_push_buffer(stream_, buffer);
         // Full-resolution one-shot frames use a dedicated lossless compressed
@@ -1472,6 +1545,13 @@ private:
   std::atomic<std::uint64_t> incomplete_frames_{0};
   bool software_trigger_{false};
   bool ptp_action_{false};
+  std::string ptp_enable_feature_;
+  std::string ptp_status_feature_;
+  std::string ptp_offset_feature_;
+  std::string ptp_latch_feature_;
+  std::string ptp_latch_value_feature_;
+  std::string ptp_capability_detail_{"PTP not requested"};
+  std::string device_version_;
   std::mutex camera_control_mutex_;
   bool transfer_start_required_{false};
   std::mutex request_mutex_;
@@ -1844,6 +1924,8 @@ private:
   void publish_group_status(const builtin_interfaces::msg::Time & stamp)
   {
     std::map<std::string, SyncGroup> groups;
+    std::map<std::string, std::vector<std::string>> locking_members;
+    std::map<std::string, std::vector<std::string>> unsupported_members;
     for (const auto & item : assignments_) {
       const auto & assignment = item.second;
       if (assignment.sync_group.empty()) {continue;}
@@ -1868,6 +1950,11 @@ private:
             group.max_ptp_offset_ns, offset);
         } else {
           group.unsynchronized_member_ids.push_back(item.first);
+          if (session->second->ptp_action()) {
+            locking_members[assignment.sync_group].push_back(item.first);
+          } else {
+            unsupported_members[assignment.sync_group].push_back(item.first);
+          }
         }
       } else {
         group.missing_member_ids.push_back(item.first);
@@ -1880,12 +1967,32 @@ private:
       auto & group = item.second;
       group.synchronization_method = group.unsynchronized_member_ids.empty() ?
         "ptp_scheduled_action" : "mixed";
-      group.ptp_ready = !group.synchronized_member_ids.empty();
+      group.ptp_ready = !group.online_member_ids.empty() &&
+        group.unsynchronized_member_ids.empty();
       group.ready = group.operating_mode == "idle" || group.missing_member_ids.empty() ||
         (group.missing_policy == "degraded" && !group.online_member_ids.empty());
       if (group.operating_mode == "capture" && !group.unsynchronized_member_ids.empty()) {
-        group.last_error =
-          "some members do not support or have not locked PTP; they will trigger unsynchronized";
+        std::ostringstream notice;
+        const auto & locking = locking_members[group.group_id];
+        const auto & unsupported = unsupported_members[group.group_id];
+        if (!locking.empty()) {
+          notice << "PTP-capable member(s) waiting for lock: ";
+          for (std::size_t index = 0; index < locking.size(); ++index) {
+            if (index != 0) {notice << ", ";}
+            notice << locking[index];
+          }
+          notice << "; requests temporarily use software trigger";
+        }
+        if (!unsupported.empty()) {
+          if (!locking.empty()) {notice << ". ";}
+          notice << "Member(s) without usable PTP scheduled actions: ";
+          for (std::size_t index = 0; index < unsupported.size(); ++index) {
+            if (index != 0) {notice << ", ";}
+            notice << unsupported[index];
+          }
+          notice << "; they remain unsynchronized";
+        }
+        group.last_error = notice.str();
       }
       result.groups.push_back(group);
     }
@@ -1952,23 +2059,15 @@ private:
     std::vector<std::pair<
       std::string, std::shared_ptr<CameraSession::FrameCompletion>>> completions;
     std::map<std::string, NetworkConfig> action_networks;
+    std::map<std::string, bool> request_ptp_locked;
     std::optional<std::uint64_t> action_time;
     for (const auto & sensor_id : request->member_ids) {
       const auto session = sessions_.find(sensor_id);
-      if (session != sessions_.end() && session->second->ready() &&
-        session->second->ptp_action() && !session->second->ptp_locked())
-      {
-        try {
-          session->second->fall_back_to_software_trigger();
-        } catch (const std::exception & error) {
-          RCLCPP_WARN(
-            get_logger(), "Unable to software-fallback %s: %s",
-            sensor_id.c_str(), error.what());
-        }
-      }
-      if (session != sessions_.end() && session->second->ready() &&
-        session->second->ptp_action() && session->second->ptp_locked())
-      {
+      if (session == sessions_.end() || !session->second->ready() ||
+        !session->second->ptp_action()) {continue;}
+      const bool locked = session->second->ptp_locked();
+      request_ptp_locked[sensor_id] = locked;
+      if (locked) {
         if (!action_time) {
           action_time = session->second->ptp_time_ns() +
             static_cast<std::uint64_t>(config_.ptp_action_lead_time_ms) * 1000000ULL;
@@ -1988,15 +2087,17 @@ private:
       const auto session = sessions_.find(sensor_id);
       if (session == sessions_.end() || !session->second->ready() ||
         (!session->second->software_trigger() &&
-        !(session->second->ptp_action() && session->second->ptp_locked())))
+        !session->second->ptp_action()))
       {
         response->missing_sensor_ids.push_back(sensor_id);
       } else {
-        const auto session_release = session->second->software_trigger() ?
+        const bool force_software = session->second->ptp_action() &&
+          !request_ptp_locked[sensor_id];
+        const auto session_release = session->second->software_trigger() || force_software ?
           release_at : std::chrono::steady_clock::time_point{};
         auto completion = session->second->request_frame(
           response->scheduled_time, response->capture_id,
-          !request->trigger_only, session_release);
+          !request->trigger_only, session_release, force_software);
         if (completion) {
           completions.emplace_back(sensor_id, std::move(completion));
         } else {
