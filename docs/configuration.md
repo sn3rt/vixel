@@ -81,7 +81,7 @@ PTP scheduled capture defaults can be tuned under `providers.genicam.ptp`:
 
 ```yaml
 ptp:
-  action_lead_time_ms: 100
+    action_lead_time_ms: 500
   tolerance_ns: 100000
   action_device_key: 1
 ```

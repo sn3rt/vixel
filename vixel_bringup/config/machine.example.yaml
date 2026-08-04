@@ -52,7 +52,7 @@ providers:
     socket_buffer_bytes: 33554432
     software_trigger_lead_time_ms: 10
     ptp:
-      action_lead_time_ms: 100
+      action_lead_time_ms: 500
       tolerance_ns: 100000
       action_device_key: 1
     imaging:

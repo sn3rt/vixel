@@ -390,6 +390,13 @@ void write_u16(std::uint8_t * destination, std::uint16_t value)
   destination[1] = static_cast<std::uint8_t>(value & 0xff);
 }
 
+std::uint16_t read_u16(const std::uint8_t * source)
+{
+  return static_cast<std::uint16_t>(
+    (static_cast<std::uint16_t>(source[0]) << 8) |
+    static_cast<std::uint16_t>(source[1]));
+}
+
 void write_u32(std::uint8_t * destination, std::uint32_t value)
 {
   for (int shift = 24, index = 0; shift >= 0; shift -= 8, ++index) {
@@ -413,6 +420,8 @@ std::uint32_t action_group_key(const std::string & group_id)
   return value == 0 ? 1U : value;
 }
 
+constexpr std::uint32_t action_group_mask = 0xffffffffU;
+
 void gvcp_scheduled_action(
   const NetworkConfig & network, std::uint32_t device_key,
   std::uint32_t group_key, std::uint64_t action_time)
@@ -423,14 +432,15 @@ void gvcp_scheduled_action(
   static std::atomic<std::uint16_t> request_sequence{1};
   std::array<std::uint8_t, 8 + payload_size> packet{};
   packet[0] = 0x42;
-  packet[1] = 0x80;  // GigE Vision 2.x scheduled-action flag.
+  // Request an acknowledgement and permit acknowledgement of a broadcast command.
+  packet[1] = 0x11;
   write_u16(packet.data() + 2, action_command);
   write_u16(packet.data() + 4, payload_size);
   const auto request_id = request_sequence.fetch_add(1);
   write_u16(packet.data() + 6, request_id == 0 ? 1 : request_id);
   write_u32(packet.data() + 8, device_key);
   write_u32(packet.data() + 12, group_key);
-  write_u32(packet.data() + 16, 0xffffffffU);
+  write_u32(packet.data() + 16, action_group_mask);
   write_u64(packet.data() + 20, action_time);
 
   ScopedSocket command_socket(socket(AF_INET, SOCK_DGRAM, 0));
@@ -442,6 +452,14 @@ void gvcp_scheduled_action(
       command_socket.get(), SOL_SOCKET, SO_BROADCAST, &enabled, sizeof(enabled)) != 0)
   {
     throw std::runtime_error("cannot enable scheduled-action broadcast");
+  }
+  timeval receive_timeout{};
+  receive_timeout.tv_usec = 50000;
+  if (setsockopt(
+      command_socket.get(), SOL_SOCKET, SO_RCVTIMEO,
+      &receive_timeout, sizeof(receive_timeout)) != 0)
+  {
+    throw std::runtime_error("cannot set scheduled-action acknowledgement timeout");
   }
   sockaddr_in source{};
   source.sin_family = AF_INET;
@@ -470,6 +488,31 @@ void gvcp_scheduled_action(
     throw std::runtime_error(
             "scheduled-action send failed on " + network.interface + ": " +
             std::strerror(errno));
+  }
+  std::array<std::uint8_t, 64> acknowledgement{};
+  sockaddr_in acknowledgement_source{};
+  socklen_t acknowledgement_source_size = sizeof(acknowledgement_source);
+  const auto received = recvfrom(
+    command_socket.get(), acknowledgement.data(), acknowledgement.size(), 0,
+    reinterpret_cast<sockaddr *>(&acknowledgement_source),
+    &acknowledgement_source_size);
+  if (received < 0) {
+    throw std::runtime_error(
+            "no ACTION_ACK received on " + network.interface + ": " +
+            std::strerror(errno));
+  }
+  constexpr std::uint16_t action_acknowledge = 0x0101;
+  if (received < 8 || read_u16(acknowledgement.data() + 2) != action_acknowledge ||
+    read_u16(acknowledgement.data() + 6) != (request_id == 0 ? 1 : request_id))
+  {
+    throw std::runtime_error("invalid ACTION_ACK received on " + network.interface);
+  }
+  const auto status = read_u16(acknowledgement.data());
+  if (status != 0) {
+    std::ostringstream message;
+    message << "camera rejected scheduled action on " << network.interface <<
+      " with GVCP status 0x" << std::hex << status;
+    throw std::runtime_error(message.str());
   }
 }
 
@@ -1171,6 +1214,13 @@ private:
           throw_on_error(error, "configuring camera as a PTP slave");
         }
         error = nullptr;
+        if (arv_camera_is_feature_available(camera_, "ActionUnconditionalMode", &error) &&
+          error == nullptr)
+        {
+          arv_camera_set_string(camera_, "ActionUnconditionalMode", "On", &error);
+          throw_on_error(error, "enabling unconditional action command");
+        } else if (error != nullptr) {g_error_free(error); error = nullptr;}
+        error = nullptr;
         if (arv_camera_is_feature_available(camera_, "ActionSelector", &error) &&
           error == nullptr)
         {
@@ -1183,15 +1233,8 @@ private:
         arv_camera_set_integer(
           camera_, "ActionGroupKey", action_group_key(assignment_.sync_group), &error);
         throw_on_error(error, "setting ActionGroupKey");
-        arv_camera_set_integer(camera_, "ActionGroupMask", 0xffffffffU, &error);
+        arv_camera_set_integer(camera_, "ActionGroupMask", action_group_mask, &error);
         throw_on_error(error, "setting ActionGroupMask");
-        error = nullptr;
-        if (arv_camera_is_feature_available(camera_, "ActionUnconditionalMode", &error) &&
-          error == nullptr)
-        {
-          arv_camera_set_string(camera_, "ActionUnconditionalMode", "On", &error);
-          throw_on_error(error, "enabling unconditional action command");
-        } else if (error != nullptr) {g_error_free(error); error = nullptr;}
         arv_camera_set_trigger(camera_, "Action0", &error);
         throw_on_error(error, "enabling Action0 trigger");
         ptp_action_ = true;
@@ -1203,6 +1246,16 @@ private:
           software_trigger_ = true;
           action_trigger_armed_ = false;
         }
+        RCLCPP_INFO(
+          node_->get_logger(),
+          "%s PTP action configuration: trigger=%s device_key=%lld "
+          "group_key=%lld group_mask=0x%llx lead=%d ms",
+          assignment_.sensor_id.c_str(),
+          assignment_.operating_mode == "preview" ? "Software" : "Action0",
+          static_cast<long long>(config_.action_device_key),
+          static_cast<long long>(action_group_key(assignment_.sync_group)),
+          static_cast<unsigned long long>(action_group_mask),
+          config_.ptp_action_lead_time_ms);
         ptp_capability_detail_ = "PTP supported; waiting for lock";
       } else {
         std::ostringstream detail;
@@ -2101,6 +2154,8 @@ private:
     std::map<std::string, NetworkConfig> action_networks;
     std::map<std::string, bool> request_ptp_locked;
     std::optional<std::uint64_t> action_time;
+    std::optional<std::uint64_t> minimum_ptp_time;
+    std::optional<std::uint64_t> maximum_ptp_time;
     for (const auto & sensor_id : request->member_ids) {
       const auto session = sessions_.find(sensor_id);
       if (session == sessions_.end() || !session->second->ready() ||
@@ -2108,12 +2163,26 @@ private:
       const bool locked = session->second->ptp_locked();
       request_ptp_locked[sensor_id] = locked;
       if (locked) {
-        if (!action_time) {
-          action_time = session->second->ptp_time_ns() +
-            static_cast<std::uint64_t>(config_.ptp_action_lead_time_ms) * 1000000ULL;
-        }
+        const auto current_ptp_time = session->second->ptp_time_ns();
+        minimum_ptp_time = minimum_ptp_time ?
+          std::min(*minimum_ptp_time, current_ptp_time) : current_ptp_time;
+        maximum_ptp_time = maximum_ptp_time ?
+          std::max(*maximum_ptp_time, current_ptp_time) : current_ptp_time;
         action_networks[session->second->network().id] = session->second->network();
       }
+    }
+    if (maximum_ptp_time) {
+      action_time = *maximum_ptp_time +
+        static_cast<std::uint64_t>(config_.ptp_action_lead_time_ms) * 1000000ULL;
+      RCLCPP_INFO(
+        get_logger(),
+        "Scheduling group %s at PTP %llu from camera range %llu..%llu (%llu ns spread, %d ms lead)",
+        request->group_id.c_str(),
+        static_cast<unsigned long long>(*action_time),
+        static_cast<unsigned long long>(*minimum_ptp_time),
+        static_cast<unsigned long long>(*maximum_ptp_time),
+        static_cast<unsigned long long>(*maximum_ptp_time - *minimum_ptp_time),
+        config_.ptp_action_lead_time_ms);
     }
     if (action_time) {
       response->scheduled_time.sec = static_cast<std::int32_t>(*action_time / 1000000000ULL);
@@ -2122,6 +2191,30 @@ private:
     } else {
       response->scheduled_time = now() + rclcpp::Duration::from_nanoseconds(
         std::chrono::duration_cast<std::chrono::nanoseconds>(lead).count());
+    }
+    std::uint64_t earliest_dispatch = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t latest_dispatch = 0;
+    std::vector<std::string> action_errors;
+    std::set<std::string> failed_action_networks;
+    if (action_time) {
+      for (const auto & item : action_networks) {
+        const auto dispatch = static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+        earliest_dispatch = std::min(earliest_dispatch, dispatch);
+        try {
+          gvcp_scheduled_action(
+            item.second, config_.action_device_key,
+            action_group_key(request->group_id), *action_time);
+          latest_dispatch = dispatch;
+        } catch (const std::exception & error) {
+          failed_action_networks.insert(item.first);
+          action_errors.push_back(item.second.interface + ": " + error.what());
+          RCLCPP_WARN(
+            get_logger(), "Scheduled action failed on %s; using software fallback: %s",
+            item.second.interface.c_str(), error.what());
+        }
+      }
     }
     for (const auto & sensor_id : request->member_ids) {
       const auto session = sessions_.find(sensor_id);
@@ -2132,7 +2225,8 @@ private:
         response->missing_sensor_ids.push_back(sensor_id);
       } else {
         const bool force_software = session->second->ptp_action() &&
-          !request_ptp_locked[sensor_id];
+          (!request_ptp_locked[sensor_id] ||
+          failed_action_networks.count(session->second->network().id) != 0);
         const auto session_release = session->second->software_trigger() || force_software ?
           release_at : std::chrono::steady_clock::time_point{};
         auto completion = session->second->request_frame(
@@ -2152,26 +2246,6 @@ private:
       std::unique_lock<std::mutex> completion_lock(completion->mutex);
       completion->changed.wait_until(
         completion_lock, release_at, [&completion]() {return completion->armed;});
-    }
-    std::uint64_t earliest_dispatch = std::numeric_limits<std::uint64_t>::max();
-    std::uint64_t latest_dispatch = 0;
-    if (action_time) {
-      for (const auto & item : action_networks) {
-        const auto dispatch = static_cast<std::uint64_t>(
-          std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count());
-        earliest_dispatch = std::min(earliest_dispatch, dispatch);
-        try {
-          gvcp_scheduled_action(
-            item.second, config_.action_device_key,
-            action_group_key(request->group_id), *action_time);
-          latest_dispatch = dispatch;
-        } catch (const std::exception & error) {
-          RCLCPP_ERROR(
-            get_logger(), "Scheduled action failed on %s: %s",
-            item.second.interface.c_str(), error.what());
-        }
-      }
     }
     const auto deadline = release_at +
       std::chrono::milliseconds(config_.image_timeout_ms + 1000);
@@ -2223,7 +2297,8 @@ private:
     response->message = response->success ?
       std::to_string(synchronized_count) + " PTP-synchronized and " +
       std::to_string(response->camera_timings.size() - synchronized_count) +
-      " unsynchronized frame(s) published" :
+      " unsynchronized frame(s) published" : !action_errors.empty() ?
+      "scheduled action and software fallback failed: " + action_errors.front() :
       "one or more cameras were unavailable, PTP-unlocked, busy, or failed acquisition";
   }
 
