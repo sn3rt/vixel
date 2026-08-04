@@ -52,6 +52,10 @@ accepts current `Ptp*` nodes and legacy `GevIEEE1588*` timestamp aliases used by
 some vendors. A capable camera that is still acquiring lock uses software only
 for requests received during that interval and automatically returns to
 scheduled `Action0` capture after lock.
+`PtpOffsetFromMaster` is optional because some compliant cameras do not expose
+it. For those cameras Vixel uses `PtpStatus=Slave` for readiness and validates
+the resulting synchronization from the per-frame device timestamps and reported
+exposure skew.
 
 Results include per-camera timing records, `exposure_skew_ns` for synchronized
 members, and `within_tolerance`. `trigger_span_ns` remains command-dispatch

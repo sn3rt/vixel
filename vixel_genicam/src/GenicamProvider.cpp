@@ -902,6 +902,7 @@ public:
   std::int64_t ptp_offset_ns()
   {
     if (!ptp_action_) {return 0;}
+    if (ptp_offset_feature_.empty()) {return 0;}
     std::lock_guard<std::mutex> lock(camera_control_mutex_);
     GError * error = nullptr;
     const auto value = arv_camera_get_integer(camera_, ptp_offset_feature_.c_str(), &error);
@@ -918,7 +919,8 @@ public:
       value = value_or_empty(arv_camera_get_string(camera_, ptp_status_feature_.c_str(), &error));
     }
     if (error != nullptr) {g_error_free(error); return false;}
-    return lower(value) == "slave" &&
+    if (lower(value) != "slave") {return false;}
+    return ptp_offset_feature_.empty() ||
            std::llabs(ptp_offset_ns()) <= config_.ptp_tolerance_ns;
   }
   std::uint64_t ptp_time_ns()
@@ -977,7 +979,8 @@ public:
       }
       if (error != nullptr) {g_error_free(error); ptp_status = "unreadable";}
       result.status_detail = "PTP " + ptp_status + ", offset " +
-        (offset == std::numeric_limits<std::int64_t>::max() ? std::string("unreadable") :
+        (ptp_offset_feature_.empty() ? std::string("not exposed by camera") :
+        offset == std::numeric_limits<std::int64_t>::max() ? std::string("unreadable") :
         std::to_string(offset) + " ns");
     } else {
       result.status_detail = ptp_capability_detail_;
@@ -1118,10 +1121,9 @@ private:
       ptp_latch_value_feature_ = first_available_feature(
         {"PtpDataSetLatchValue", "PtpTimestampLatchValue", "GevTimestampValue"});
       std::vector<std::string> missing;
-      const std::array<std::pair<const char *, const std::string *>, 5> ptp_features{{
+      const std::array<std::pair<const char *, const std::string *>, 4> ptp_features{{
         {"PTP enable", &ptp_enable_feature_},
         {"PTP status", &ptp_status_feature_},
-        {"PTP offset", &ptp_offset_feature_},
         {"PTP clock latch", &ptp_latch_feature_},
         {"PTP latched value", &ptp_latch_value_feature_},
       }};
@@ -1132,6 +1134,18 @@ private:
         if (first_available_feature({feature}).empty()) {missing.emplace_back(feature);}
       }
       supported = supported && missing.empty();
+      const auto trigger_selector = first_available_feature({"TriggerSelector"});
+      if (!trigger_selector.empty() && feature_writable(camera_, trigger_selector.c_str())) {
+        error = nullptr;
+        arv_camera_set_string(camera_, trigger_selector.c_str(), "FrameStart", &error);
+        if (error != nullptr) {
+          RCLCPP_WARN(
+            node_->get_logger(), "%s could not select TriggerSelector=FrameStart: %s",
+            assignment_.sensor_id.c_str(), error->message);
+          g_error_free(error);
+          error = nullptr;
+        }
+      }
       guint trigger_count = 0;
       const auto trigger_values = arv_camera_dup_available_enumerations_as_strings(
         camera_, "TriggerSource", &trigger_count, &error);
@@ -1192,8 +1206,9 @@ private:
         ptp_capability_detail_ = detail.str();
         RCLCPP_WARN(
           node_->get_logger(),
-          "%s: %s; using unsynchronized software trigger",
-          assignment_.sensor_id.c_str(), ptp_capability_detail_.c_str());
+          "%s: %s%s%s; using unsynchronized software trigger",
+          assignment_.sensor_id.c_str(), ptp_capability_detail_.c_str(),
+          device_version_.empty() ? "" : "; firmware ", device_version_.c_str());
         arv_camera_set_trigger(camera_, "Software", &error);
         throw_on_error(error, "enabling software fallback trigger");
         software_trigger_ = true;
@@ -1877,7 +1892,13 @@ private:
     const auto tick = std::chrono::steady_clock::now();
     const auto stamp = now();
     for (auto & item : sessions_) {
-      if (item.second->preview_due(tick)) {item.second->request_frame(stamp);}
+      if (item.second->preview_due(tick)) {
+        // A grouped camera remains armed for Action0, but dashboard preview is
+        // intentionally asynchronous. Trigger only this preview request in
+        // software and restore Action0 immediately afterwards.
+        item.second->request_frame(
+          stamp, {}, false, {}, item.second->ptp_action());
+      }
     }
   }
 
