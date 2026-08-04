@@ -1195,6 +1195,14 @@ private:
         arv_camera_set_trigger(camera_, "Action0", &error);
         throw_on_error(error, "enabling Action0 trigger");
         ptp_action_ = true;
+        action_trigger_armed_ = true;
+        if (assignment_.operating_mode == "preview") {
+          error = nullptr;
+          arv_camera_set_trigger(camera_, "Software", &error);
+          throw_on_error(error, "selecting software trigger for preview mode");
+          software_trigger_ = true;
+          action_trigger_armed_ = false;
+        }
         ptp_capability_detail_ = "PTP supported; waiting for lock";
       } else {
         std::ostringstream detail;
@@ -1372,13 +1380,13 @@ private:
         }
         request->completion->changed.notify_all();
       }
+      bool restore_action_trigger = false;
       try {
         if (request->release_at != std::chrono::steady_clock::time_point{}) {
           std::this_thread::sleep_until(request->release_at);
         }
         const bool software_for_request = software_trigger_ || request->force_software_trigger;
-        bool restore_action_trigger = false;
-        if (request->force_software_trigger && ptp_action_) {
+        if (request->force_software_trigger && action_trigger_armed_) {
           GError * error = nullptr;
           std::lock_guard<std::mutex> lock(camera_control_mutex_);
           arv_camera_set_trigger(camera_, "Software", &error);
@@ -1398,12 +1406,6 @@ private:
           }
           const auto trigger_error = error == nullptr ? std::string{} :
             error_text(error, "software trigger");
-          error = nullptr;
-          if (restore_action_trigger) {
-            std::lock_guard<std::mutex> lock(camera_control_mutex_);
-            arv_camera_set_trigger(camera_, "Action0", &error);
-            throw_on_error(error, "restoring Action0 after temporary software trigger");
-          }
           if (!trigger_error.empty()) {throw std::runtime_error(trigger_error);}
         }
         auto * buffer = arv_stream_timeout_pop_buffer(
@@ -1440,6 +1442,13 @@ private:
             ptp_offset_ns() : 0;
         }
         arv_stream_push_buffer(stream_, buffer);
+        if (restore_action_trigger) {
+          GError * error = nullptr;
+          std::lock_guard<std::mutex> lock(camera_control_mutex_);
+          arv_camera_set_trigger(camera_, "Action0", &error);
+          throw_on_error(error, "restoring Action0 after temporary software-triggered frame");
+          restore_action_trigger = false;
+        }
         // Full-resolution one-shot frames use a dedicated lossless compressed
         // topic. Sending the 9 MiB BGR sample directly can stall synchronous
         // DDS writers on hosts with several active camera interfaces.
@@ -1458,6 +1467,19 @@ private:
         last_error_.clear();
         warning_active_ = false;
       } catch (const std::exception & error) {
+        if (restore_action_trigger) {
+          GError * restore_error = nullptr;
+          {
+            std::lock_guard<std::mutex> lock(camera_control_mutex_);
+            arv_camera_set_trigger(camera_, "Action0", &restore_error);
+          }
+          if (restore_error != nullptr) {
+            RCLCPP_ERROR(
+              node_->get_logger(), "Unable to restore Action0 for %s after failed frame: %s",
+              assignment_.sensor_id.c_str(), restore_error->message);
+            g_error_free(restore_error);
+          }
+        }
         if (request->completion) {
           {
             std::lock_guard<std::mutex> completion_lock(request->completion->mutex);
@@ -1560,6 +1582,7 @@ private:
   std::atomic<std::uint64_t> incomplete_frames_{0};
   bool software_trigger_{false};
   bool ptp_action_{false};
+  bool action_trigger_armed_{false};
   std::string ptp_enable_feature_;
   std::string ptp_status_feature_;
   std::string ptp_offset_feature_;
@@ -1893,11 +1916,7 @@ private:
     const auto stamp = now();
     for (auto & item : sessions_) {
       if (item.second->preview_due(tick)) {
-        // A grouped camera remains armed for Action0, but dashboard preview is
-        // intentionally asynchronous. Trigger only this preview request in
-        // software and restore Action0 immediately afterwards.
-        item.second->request_frame(
-          stamp, {}, false, {}, item.second->ptp_action());
+        item.second->request_frame(stamp);
       }
     }
   }

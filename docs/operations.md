@@ -57,6 +57,11 @@ it. For those cameras Vixel uses `PtpStatus=Slave` for readiness and validates
 the resulting synchronization from the per-frame device timestamps and reported
 exposure skew.
 
+Grouped cameras keep PTP enabled in every active mode. Preview mode uses a
+software trigger so the dashboard can fetch independent frames; changing the
+group to capture mode rebuilds the session with `Action0` armed for synchronized
+group requests.
+
 Results include per-camera timing records, `exposure_skew_ns` for synchronized
 members, and `within_tolerance`. `trigger_span_ns` remains command-dispatch
 timing and must not be interpreted as exposure skew.
