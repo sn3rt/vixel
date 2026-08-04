@@ -32,6 +32,21 @@ curl -X POST -H 'Content-Type: application/json' -d '{}' \
   http://127.0.0.1:8080/api/v1/groups/front/trigger
 ```
 
+## Trigger front and back every two seconds
+
+The periodic example sends the `front` and `back` HTTP requests concurrently:
+
+```bash
+python3 examples/http_trigger_groups_periodic.py front back --interval 2
+```
+
+Use `--count 10` for a finite run; the default continues until Ctrl-C. Each
+group gets one PTP scheduled action, so cameras within `front` are synchronized
+and cameras within `back` are synchronized. The two API requests currently
+choose their future timestamps independently: all four cameras fire roughly
+together, but cross-group synchronization is not guaranteed. The script prints
+the scheduled-time difference between groups on every cycle.
+
 ## Trigger through ROS and save the images
 
 This client discovers every member of `front`, subscribes to their full-size

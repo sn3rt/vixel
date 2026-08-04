@@ -85,12 +85,37 @@ def test_ros_example_timestamp_and_output_names_are_deterministic():
 
 def test_example_parsers_have_runnable_defaults():
     http = load_example("http_trigger").parser().parse_args(["front"])
+    periodic = load_example("http_trigger_groups_periodic").parser().parse_args(
+        ["front", "back"]
+    )
     ros = load_example("ros_trigger_and_receive").parser().parse_args(["front"])
 
     assert http.base_url == "http://127.0.0.1:8080"
     assert http.timeout == 35.0
+    assert periodic.interval == 2.0
+    assert periodic.count == 0
     assert ros.output_dir == Path("vixel-triggered-images")
     assert ros.timeout == 35.0
+
+
+def test_periodic_example_triggers_groups_and_reports_schedule_delta():
+    example = load_example("http_trigger_groups_periodic")
+    calls = []
+
+    def trigger(base_url, group_id, request_id, timeout):
+        calls.append((base_url, group_id, request_id, timeout))
+        nanosec = 100 if group_id == "front" else 130
+        return {"scheduled_time": {"sec": 12, "nanosec": nanosec}}
+
+    results = example.trigger_cycle(
+        ["front", "back"], "http://127.0.0.1:8080", 5.0, 3, trigger
+    )
+    times = [example.scheduled_ns(result) for result in results.values()]
+
+    assert set(results) == {"front", "back"}
+    assert max(times) - min(times) == 30
+    assert {call[1] for call in calls} == {"front", "back"}
+    assert {call[2] for call in calls} == {"periodic_3_front", "periodic_3_back"}
 
 
 def test_examples_are_linked_from_documentation():
