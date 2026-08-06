@@ -41,8 +41,9 @@ def test_linuxptp_commands_use_e2e_and_primary_phc():
     assert ptp4l_command(primary, "/etc/linuxptp/vixel-ptp4l.conf")[-2:] == [
         "enp7s0", "-m"
     ]
-    assert phc2sys_command(primary, follower)[1:5] == [
-        "-s", "/dev/ptp1", "-c", "/dev/ptp2"
+    assert phc2sys_command(primary, follower) == [
+        "phc2sys", "-s", "/dev/ptp1", "-c", "/dev/ptp2",
+        "-O", "0", "-R", "16", "-S", "0.001", "-m",
     ]
     config = render_ptp4l_config()
     assert "delay_mechanism E2E" in config

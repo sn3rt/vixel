@@ -19,6 +19,12 @@ from .network_setup import (
 )
 
 
+# Direct-link hotplug can reset an individual NIC PHC by several seconds. Normal
+# follower offsets are only a few microseconds, so step abnormal offsets instead
+# of letting the default 6.25% maximum slew take minutes to recover.
+PHC_STEP_THRESHOLD_SECONDS = "0.001"
+
+
 @dataclass(frozen=True)
 class PtpPort:
     network_id: str
@@ -54,7 +60,7 @@ def ptp4l_command(port: PtpPort, config_path: str) -> list[str]:
 def phc2sys_command(primary: PtpPort, follower: PtpPort) -> list[str]:
     return [
         "phc2sys", "-s", primary.phc, "-c", follower.phc,
-        "-O", "0", "-R", "16", "-m",
+        "-O", "0", "-R", "16", "-S", PHC_STEP_THRESHOLD_SECONDS, "-m",
     ]
 
 
