@@ -851,6 +851,13 @@ public:
     std::shared_ptr<FrameCompletion> completion;
   };
 
+  struct PtpState
+  {
+    std::string status;
+    bool offset_exposed{false};
+    std::int64_t offset_ns{0};
+  };
+
   CameraSession(
     rclcpp::Node * node, Assignment assignment, DeviceRecord record, NetworkConfig network,
     GenicamConfig config)
@@ -969,26 +976,16 @@ public:
   std::int64_t ptp_offset_ns()
   {
     if (!ptp_action_) {return 0;}
-    if (ptp_offset_feature_.empty()) {return 0;}
-    std::lock_guard<std::mutex> lock(camera_control_mutex_);
-    GError * error = nullptr;
-    const auto value = arv_camera_get_integer(camera_, ptp_offset_feature_.c_str(), &error);
-    if (error != nullptr) {g_error_free(error); return std::numeric_limits<std::int64_t>::max();}
-    return value;
+    const auto state = read_ptp_state();
+    return state.offset_exposed ? state.offset_ns : 0;
   }
   bool ptp_locked()
   {
     if (!ptp_action_) {return false;}
-    GError * error = nullptr;
-    std::string value;
-    {
-      std::lock_guard<std::mutex> lock(camera_control_mutex_);
-      value = value_or_empty(arv_camera_get_string(camera_, ptp_status_feature_.c_str(), &error));
-    }
-    if (error != nullptr) {g_error_free(error); return false;}
-    if (lower(value) != "slave") {return false;}
-    return ptp_offset_feature_.empty() ||
-           std::llabs(ptp_offset_ns()) <= config_.ptp_tolerance_ns;
+    const auto state = read_ptp_state();
+    if (lower(state.status) != "slave") {return false;}
+    return !state.offset_exposed ||
+           std::llabs(state.offset_ns) <= config_.ptp_tolerance_ns;
   }
   std::uint64_t ptp_time_ns()
   {
@@ -1036,19 +1033,11 @@ public:
       result.last_error = last_error_;
     }
     if (ptp_action_) {
-      const auto offset = ptp_offset_ns();
-      GError * error = nullptr;
-      std::string ptp_status;
-      {
-        std::lock_guard<std::mutex> lock(camera_control_mutex_);
-        ptp_status = value_or_empty(
-          arv_camera_get_string(camera_, ptp_status_feature_.c_str(), &error));
-      }
-      if (error != nullptr) {g_error_free(error); ptp_status = "unreadable";}
-      result.status_detail = "PTP " + ptp_status + ", offset " +
-        (ptp_offset_feature_.empty() ? std::string("not exposed by camera") :
-        offset == std::numeric_limits<std::int64_t>::max() ? std::string("unreadable") :
-        std::to_string(offset) + " ns");
+      const auto state = read_ptp_state();
+      result.status_detail = "PTP " + state.status + ", offset " +
+        (!state.offset_exposed ? std::string("not exposed by camera") :
+        state.offset_ns == std::numeric_limits<std::int64_t>::max() ?
+        std::string("unreadable") : std::to_string(state.offset_ns) + " ns");
     } else {
       result.status_detail = ptp_capability_detail_;
     }
@@ -1071,6 +1060,48 @@ public:
   }
 
 private:
+  PtpState read_ptp_state()
+  {
+    std::lock_guard<std::mutex> lock(camera_control_mutex_);
+    PtpState result;
+    GError * error = nullptr;
+    result.status = value_or_empty(
+      arv_camera_get_string(camera_, ptp_status_feature_.c_str(), &error));
+    if (error != nullptr) {
+      g_error_free(error);
+      result.status = "unreadable";
+      return result;
+    }
+
+    // Some cameras, including LUCID firmware RQQ51, hide the optional offset
+    // node until PTP has reached Slave. The initial configuration probe can
+    // therefore miss a node that becomes readable later. Re-probe it while
+    // locked so hotplug recovery does not require rebuilding the session.
+    const auto now = std::chrono::steady_clock::now();
+    if (lower(result.status) == "slave" && ptp_offset_feature_.empty() &&
+      now >= next_ptp_offset_probe_)
+    {
+      next_ptp_offset_probe_ = now + 1s;
+      ptp_offset_feature_ = first_available_feature(
+        {"PtpOffsetFromMaster", "GevIEEE1588OffsetFromMaster"});
+      if (!ptp_offset_feature_.empty()) {
+        RCLCPP_INFO(
+          node_->get_logger(), "%s PTP offset feature %s became available after lock",
+          assignment_.sensor_id.c_str(), ptp_offset_feature_.c_str());
+      }
+    }
+
+    result.offset_exposed = !ptp_offset_feature_.empty();
+    if (!result.offset_exposed) {return result;}
+    error = nullptr;
+    result.offset_ns = arv_camera_get_integer(camera_, ptp_offset_feature_.c_str(), &error);
+    if (error != nullptr) {
+      g_error_free(error);
+      result.offset_ns = std::numeric_limits<std::int64_t>::max();
+    }
+    return result;
+  }
+
   std::string first_available_feature(
     std::initializer_list<const char *> candidates)
   {
@@ -1665,6 +1696,7 @@ private:
   std::string ptp_offset_feature_;
   std::string ptp_latch_feature_;
   std::string ptp_latch_value_feature_;
+  std::chrono::steady_clock::time_point next_ptp_offset_probe_{};
   std::string ptp_capability_detail_{"PTP not requested"};
   std::string device_version_;
   std::mutex camera_control_mutex_;

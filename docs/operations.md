@@ -49,13 +49,15 @@ PC grandmaster, while unsupported cameras remain in the capture using the
 software barrier and are reported as unsynchronized.
 Capability detection follows GenICam/SFNC features rather than camera brand. It
 accepts current `Ptp*` nodes and legacy `GevIEEE1588*` timestamp aliases used by
-some vendors. A capable camera that is still acquiring lock uses software only
-for requests received during that interval and automatically returns to
-scheduled `Action0` capture after lock.
+some vendors. Capture requests for a capable camera that is still acquiring
+lock are rejected before any trigger is dispatched; scheduled `Action0` capture
+becomes available automatically after lock.
 `PtpOffsetFromMaster` is optional because some compliant cameras do not expose
 it. For those cameras Vixel uses `PtpStatus=Slave` for readiness and validates
 the resulting synchronization from the per-frame device timestamps and reported
-exposure skew.
+exposure skew. Some cameras expose the optional offset node only after reaching
+`Slave`; Vixel re-probes the node after lock so a hotplug does not require a mode
+change or session restart.
 
 Grouped cameras keep PTP enabled in every active mode. Preview mode uses a
 software trigger so the dashboard can fetch independent frames; changing the
