@@ -38,6 +38,13 @@ Enrollment-time network provisioning should be reversible by default. The
 generic GigE Vision provider uses volatile GVCP ForceIP assignments and must not
 overwrite a camera's persistent static, DHCP, or link-local configuration.
 
+Group status distinguishes PTP-capable members that are still acquiring lock
+(`locking_member_ids`) from members that cannot participate in PTP scheduled
+actions (`unsynchronized_member_ids`). A group with locking members is not ready:
+capture requests must fail before dispatching any trigger. Cameras without PTP
+support may still participate through the provider's documented software-trigger
+fallback. While locking, `synchronization_method` is `ptp_relocking`.
+
 Camera providers publish beneath `/vixel/sensors/<sensor_id>`; the generic
 GenICam provider publishes `image_raw`, `image_raw/compressed`, and `camera_info`.
 Providers that support persistent camera capture also publish

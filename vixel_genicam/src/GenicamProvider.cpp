@@ -270,6 +270,28 @@ std::string lower(std::string value)
   return value;
 }
 
+std::string joined(const std::vector<std::string> & values)
+{
+  std::ostringstream result;
+  for (std::size_t index = 0; index < values.size(); ++index) {
+    if (index != 0) {result << ", ";}
+    result << values[index];
+  }
+  return result.str();
+}
+
+std::string ptp_lock_error(const std::vector<std::string> & sensor_ids)
+{
+  return "PTP lock not ready for: " + joined(sensor_ids) +
+         "; trigger request rejected before dispatch";
+}
+
+std::string ptp_lock_status(const std::vector<std::string> & sensor_ids)
+{
+  return "Waiting for PTP lock: " + joined(sensor_ids) +
+         "; trigger requests are disabled";
+}
+
 std::string ros_slug(const std::string & value)
 {
   std::string result;
@@ -2037,19 +2059,20 @@ private:
       const auto session = sessions_.find(item.first);
       if (session != sessions_.end() && session->second->ready()) {
         group.online_member_ids.push_back(item.first);
-        if (session->second->ptp_action() && session->second->ptp_locked()) {
-          group.synchronized_member_ids.push_back(item.first);
-          const auto offset = static_cast<std::int64_t>(
-            std::llabs(session->second->ptp_offset_ns()));
-          group.max_ptp_offset_ns = std::max<std::int64_t>(
-            group.max_ptp_offset_ns, offset);
+        if (session->second->ptp_action()) {
+          if (session->second->ptp_locked()) {
+            group.synchronized_member_ids.push_back(item.first);
+            const auto offset = static_cast<std::int64_t>(
+              std::llabs(session->second->ptp_offset_ns()));
+            group.max_ptp_offset_ns = std::max<std::int64_t>(
+              group.max_ptp_offset_ns, offset);
+          } else {
+            group.locking_member_ids.push_back(item.first);
+            locking_members[assignment.sync_group].push_back(item.first);
+          }
         } else {
           group.unsynchronized_member_ids.push_back(item.first);
-          if (session->second->ptp_action()) {
-            locking_members[assignment.sync_group].push_back(item.first);
-          } else {
-            unsupported_members[assignment.sync_group].push_back(item.first);
-          }
+          unsupported_members[assignment.sync_group].push_back(item.first);
         }
       } else {
         group.missing_member_ids.push_back(item.first);
@@ -2060,31 +2083,28 @@ private:
     result.generation = generation_;
     for (auto & item : groups) {
       auto & group = item.second;
-      group.synchronization_method = group.unsynchronized_member_ids.empty() ?
+      group.synchronization_method = !group.locking_member_ids.empty() ?
+        "ptp_relocking" : group.unsynchronized_member_ids.empty() ?
         "ptp_scheduled_action" : "mixed";
       group.ptp_ready = !group.online_member_ids.empty() &&
-        group.unsynchronized_member_ids.empty();
-      group.ready = group.operating_mode == "idle" || group.missing_member_ids.empty() ||
+        group.locking_member_ids.empty() && group.unsynchronized_member_ids.empty();
+      const bool members_ready = group.operating_mode == "idle" ||
+        group.missing_member_ids.empty() ||
         (group.missing_policy == "degraded" && !group.online_member_ids.empty());
-      if (group.operating_mode == "capture" && !group.unsynchronized_member_ids.empty()) {
+      group.ready = members_ready && group.locking_member_ids.empty();
+      if (!group.locking_member_ids.empty() ||
+        (group.operating_mode == "capture" && !group.unsynchronized_member_ids.empty()))
+      {
         std::ostringstream notice;
         const auto & locking = locking_members[group.group_id];
         const auto & unsupported = unsupported_members[group.group_id];
         if (!locking.empty()) {
-          notice << "PTP-capable member(s) waiting for lock: ";
-          for (std::size_t index = 0; index < locking.size(); ++index) {
-            if (index != 0) {notice << ", ";}
-            notice << locking[index];
-          }
-          notice << "; requests temporarily use software trigger";
+          notice << ptp_lock_status(locking);
         }
         if (!unsupported.empty()) {
           if (!locking.empty()) {notice << ". ";}
           notice << "Member(s) without usable PTP scheduled actions: ";
-          for (std::size_t index = 0; index < unsupported.size(); ++index) {
-            if (index != 0) {notice << ", ";}
-            notice << unsupported[index];
-          }
+          notice << joined(unsupported);
           notice << "; they remain unsynchronized";
         }
         group.last_error = notice.str();
@@ -2158,20 +2178,31 @@ private:
     std::optional<std::uint64_t> action_time;
     std::optional<std::uint64_t> minimum_ptp_time;
     std::optional<std::uint64_t> maximum_ptp_time;
+    std::vector<std::string> locking_member_ids;
     for (const auto & sensor_id : request->member_ids) {
       const auto session = sessions_.find(sensor_id);
       if (session == sessions_.end() || !session->second->ready() ||
         !session->second->ptp_action()) {continue;}
       const bool locked = session->second->ptp_locked();
       request_ptp_locked[sensor_id] = locked;
-      if (locked) {
-        const auto current_ptp_time = session->second->ptp_time_ns();
-        minimum_ptp_time = minimum_ptp_time ?
-          std::min(*minimum_ptp_time, current_ptp_time) : current_ptp_time;
-        maximum_ptp_time = maximum_ptp_time ?
-          std::max(*maximum_ptp_time, current_ptp_time) : current_ptp_time;
-        action_networks[session->second->network().id] = session->second->network();
+      if (!locked) {
+        locking_member_ids.push_back(sensor_id);
+        continue;
       }
+      const auto current_ptp_time = session->second->ptp_time_ns();
+      minimum_ptp_time = minimum_ptp_time ?
+        std::min(*minimum_ptp_time, current_ptp_time) : current_ptp_time;
+      maximum_ptp_time = maximum_ptp_time ?
+        std::max(*maximum_ptp_time, current_ptp_time) : current_ptp_time;
+      action_networks[session->second->network().id] = session->second->network();
+    }
+    if (!locking_member_ids.empty()) {
+      response->success = false;
+      response->message = ptp_lock_error(locking_member_ids);
+      RCLCPP_WARN(
+        get_logger(), "Group %s capture rejected: %s", request->group_id.c_str(),
+        response->message.c_str());
+      return;
     }
     if (maximum_ptp_time) {
       action_time = *maximum_ptp_time +

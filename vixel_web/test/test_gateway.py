@@ -5,12 +5,42 @@ from types import SimpleNamespace
 
 from vixel_web.gateway import (
     capture_record_to_dict,
+    group_to_dict,
     Handler,
     VixelHTTPServer,
     health_response,
     is_routine_snapshot_request,
     known_sensor_to_dict,
 )
+
+
+def test_group_ptp_locking_members_are_exposed_as_json():
+    group = SimpleNamespace(
+        group_id="front",
+        provider="genicam",
+        member_ids=["camera_a", "camera_b"],
+        missing_policy="strict",
+        trigger_source="Action0",
+        operating_mode="capture",
+        preview_rate_hz=2.0,
+        preferred_master_id="",
+        synchronization_method="ptp_relocking",
+        ptp_ready=False,
+        synchronized_member_ids=["camera_a"],
+        locking_member_ids=["camera_b"],
+        unsynchronized_member_ids=[],
+        max_ptp_offset_ns=1200,
+        ready=False,
+        online_member_ids=["camera_a", "camera_b"],
+        missing_member_ids=[],
+        last_error="PTP lock not ready for: camera_b",
+    )
+
+    value = group_to_dict(group)
+
+    assert value["locking_member_ids"] == ["camera_b"]
+    assert value["ready"] is False
+    assert value["synchronization_method"] == "ptp_relocking"
 
 
 def test_capture_record_is_exposed_as_json():

@@ -23,6 +23,8 @@ def test_dashboard_is_dynamic_and_uses_gateway_endpoints():
     assert "/trigger" in page
     assert 'name="trigger_source"' not in page
     assert "PTP synchronized" in page
+    assert "Waiting for PTP lock" in page
+    assert "locking_member_ids" in page
 
 
 def test_dashboard_javascript_parses():

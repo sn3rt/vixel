@@ -189,6 +189,7 @@ def group_to_dict(group) -> dict[str, Any]:
         "synchronization_method": group.synchronization_method,
         "ptp_ready": group.ptp_ready,
         "synchronized_member_ids": list(group.synchronized_member_ids),
+        "locking_member_ids": list(group.locking_member_ids),
         "unsynchronized_member_ids": list(group.unsynchronized_member_ids),
         "max_ptp_offset_ns": int(group.max_ptp_offset_ns),
         "ready": group.ready,

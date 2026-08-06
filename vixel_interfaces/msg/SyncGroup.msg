@@ -10,6 +10,7 @@ string preferred_master_id
 string synchronization_method
 bool ptp_ready
 string[] synchronized_member_ids
+string[] locking_member_ids
 string[] unsynchronized_member_ids
 int64 max_ptp_offset_ns
 bool ready

@@ -439,7 +439,9 @@ private:
         throw std::runtime_error("set synchronization group to capture mode first");
       }
       if (!group.ready) {
-        throw std::runtime_error("synchronization group is not ready");
+        throw std::runtime_error(
+                group.last_error.empty() ? "synchronization group is not ready" :
+                group.last_error);
       }
       record.requested_sensor_ids = group.member_ids;
       record.capture_id = handle->get_goal()->request_id.empty() ?
