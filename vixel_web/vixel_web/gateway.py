@@ -545,7 +545,7 @@ class GatewayNode(Node):
         )
         if not handle.accepted:
             raise RuntimeError(
-                "Capture was rejected; check group mode and whether another capture is active"
+                "Capture was rejected; check the group or whether one of its cameras is busy"
             )
         wrapped = self.wait_future(handle.get_result_async(), 35.0)
         return {

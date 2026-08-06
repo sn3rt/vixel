@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Trigger multiple Vixel groups concurrently at a fixed interval."""
+"""Trigger multiple Vixel groups concurrently and publish or save each cycle."""
 
 from __future__ import annotations
 
@@ -15,11 +15,14 @@ import urllib.request
 from typing import Any, Callable
 
 
-def trigger_group(
-    base_url: str, group_id: str, request_id: str, timeout: float
+def request_group(
+    base_url: str, group_id: str, request_id: str, timeout: float, mode: str
 ) -> dict[str, Any]:
+    if mode not in {"publish", "save"}:
+        raise ValueError(f"unsupported mode: {mode}")
     group = urllib.parse.quote(group_id, safe="")
-    url = f"{base_url.rstrip('/')}/api/v1/groups/{group}/trigger"
+    operation = "trigger" if mode == "publish" else "capture"
+    url = f"{base_url.rstrip('/')}/api/v1/groups/{group}/{operation}"
     request = urllib.request.Request(
         url,
         data=json.dumps({"request_id": request_id}).encode("utf-8"),
@@ -37,14 +40,23 @@ def trigger_group(
         raise RuntimeError(detail or f"HTTP {error.code}: {error.reason}") from error
     except urllib.error.URLError as error:
         raise RuntimeError(f"cannot reach Vixel API: {error.reason}") from error
+    except json.JSONDecodeError as error:
+        raise RuntimeError("Vixel API returned invalid JSON") from error
     if not isinstance(result, dict) or result.get("success") is False:
         message = (
-            result.get("message", "group trigger failed")
+            result.get("message", f"group {mode} failed")
             if isinstance(result, dict)
             else "invalid API response"
         )
         raise RuntimeError(str(message))
     return result
+
+
+def trigger_group(
+    base_url: str, group_id: str, request_id: str, timeout: float
+) -> dict[str, Any]:
+    """Backward-compatible trigger-and-publish helper."""
+    return request_group(base_url, group_id, request_id, timeout, "publish")
 
 
 def scheduled_ns(result: dict[str, Any]) -> int:
@@ -54,13 +66,17 @@ def scheduled_ns(result: dict[str, Any]) -> int:
 
 def trigger_cycle(
     groups: list[str], base_url: str, timeout: float, sequence: int,
-    trigger: Callable[[str, str, str, float], dict[str, Any]] = trigger_group,
+    mode: str = "publish",
+    request: Callable[[str, str, str, float, str], dict[str, Any]] = request_group,
+    request_prefix: str = "periodic",
 ) -> dict[str, dict[str, Any]]:
     barrier = threading.Barrier(len(groups))
 
     def invoke(group_id: str) -> dict[str, Any]:
         barrier.wait()
-        return trigger(base_url, group_id, f"periodic_{sequence}_{group_id}", timeout)
+        return request(
+            base_url, group_id, f"{request_prefix}_{sequence}_{group_id}", timeout, mode
+        )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(groups)) as executor:
         futures = {group: executor.submit(invoke, group) for group in groups}
@@ -72,10 +88,21 @@ def parser() -> argparse.ArgumentParser:
         description="Trigger multiple disjoint Vixel groups concurrently and periodically."
     )
     value.add_argument("group_ids", nargs="+", help="Groups, for example: front back")
+    value.add_argument(
+        "--mode",
+        choices=("publish", "save"),
+        default="publish",
+        help="Publish each triggered set or save separate group capture directories",
+    )
     value.add_argument("--interval", type=float, default=2.0, help="Seconds between cycles")
     value.add_argument("--count", type=int, default=0, help="Cycles; 0 runs until Ctrl-C")
     value.add_argument("--base-url", default="http://127.0.0.1:8080")
     value.add_argument("--timeout", type=float, default=35.0)
+    value.add_argument(
+        "--request-prefix",
+        default="",
+        help="Capture ID prefix; default includes the current UTC time",
+    )
     return value
 
 
@@ -86,29 +113,50 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     sequence = 0
     next_deadline = time.monotonic()
+    request_prefix = args.request_prefix or time.strftime(
+        "periodic_%Y%m%dT%H%M%SZ", time.gmtime()
+    )
     try:
         while args.count == 0 or sequence < args.count:
             sequence += 1
             results = trigger_cycle(
-                args.group_ids, args.base_url, args.timeout, sequence
+                args.group_ids, args.base_url, args.timeout, sequence, args.mode,
+                request_group, request_prefix,
             )
-            times = [scheduled_ns(result) for result in results.values()]
-            group_delta = max(times) - min(times) if times else 0
-            print(f"cycle {sequence}: group scheduled-time delta={group_delta} ns")
-            for group, result in results.items():
-                timings = result.get("camera_timings", [])
-                synchronized = sum(bool(item.get("synchronized")) for item in timings)
-                print(
-                    f"  {group}: capture={result.get('capture_id', '')} "
-                    f"members={len(result.get('participating_sensor_ids', []))} "
-                    f"ptp={synchronized} exposure_skew={result.get('exposure_skew_ns', 0)} ns"
-                )
+            if args.mode == "save":
+                print(f"cycle {sequence}: saved {len(results)} group(s)")
+                for group, result in results.items():
+                    print(
+                        f"  {group}: capture={result.get('capture_id', '')} "
+                        f"saved={len(result.get('saved_sensor_ids', []))} "
+                        f"directory={result.get('directory', '')}"
+                    )
+            else:
+                times = [scheduled_ns(result) for result in results.values()]
+                group_delta = max(times) - min(times) if times else 0
+                print(f"cycle {sequence}: group scheduled-time delta={group_delta} ns")
+                for group, result in results.items():
+                    timings = result.get("camera_timings", [])
+                    synchronized = sum(bool(item.get("synchronized")) for item in timings)
+                    print(
+                        f"  {group}: trigger={result.get('capture_id', '')} "
+                        f"members={len(result.get('participating_sensor_ids', []))} "
+                        f"ptp={synchronized} "
+                        f"exposure_skew={result.get('exposure_skew_ns', 0)} ns"
+                    )
             next_deadline += args.interval
-            time.sleep(max(0.0, next_deadline - time.monotonic()))
+            remaining = next_deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(remaining)
+            else:
+                print(
+                    f"cycle {sequence}: interval overrun={-remaining:.3f} s",
+                    file=sys.stderr,
+                )
     except KeyboardInterrupt:
         return 0
-    except RuntimeError as error:
-        print(f"Periodic trigger failed: {error}", file=sys.stderr)
+    except (RuntimeError, ValueError) as error:
+        print(f"Periodic trigger-and-{args.mode} failed: {error}", file=sys.stderr)
         return 1
     return 0
 

@@ -10,13 +10,20 @@ source install/setup.bash
 The target group must be online and in `capture` mode. Grouped cameras use PTP
 scheduled actions when supported and software fallback otherwise.
 
-## Trigger through HTTP
+## Trigger through HTTP: publish or save
 
 This asks the `front` group to publish a new frame and prints the trigger
-result. It does not download image data because images use ROS topics.
+result. Publish mode is the default and does not save a file:
 
 ```bash
-python3 examples/http_trigger.py front
+python3 examples/http_trigger.py front --mode publish
+```
+
+Use save mode to make Vixel's recorder persist one lossless PNG per camera and
+print the resulting directory:
+
+```bash
+python3 examples/http_trigger.py front --mode save
 ```
 
 Use `--base-url` when the gateway is forwarded to a different local port:
@@ -32,6 +39,22 @@ curl -X POST -H 'Content-Type: application/json' -d '{}' \
   http://127.0.0.1:8080/api/v1/groups/front/trigger
 ```
 
+For trigger-and-save, replace the final `trigger` with `capture`. A successful
+response contains `directory` and `saved_sensor_ids`.
+
+## Trigger through ROS: publish or save
+
+The ROS client selects the corresponding Vixel action from the same mode:
+
+```bash
+python3 examples/ros_trigger.py front --mode publish
+python3 examples/ros_trigger.py front --mode save
+```
+
+Publish mode calls `/vixel/trigger_group`. Save mode calls
+`/vixel/record_capture` and prints the server-side directory below
+`/var/lib/vixel/captures`.
+
 ## Trigger front and back every two seconds
 
 The periodic example sends the `front` and `back` HTTP requests concurrently:
@@ -45,9 +68,24 @@ group gets one PTP scheduled action, so cameras within `front` are synchronized
 and cameras within `back` are synchronized. The two API requests currently
 choose their future timestamps independently: all four cameras fire roughly
 together, but cross-group synchronization is not guaranteed. The script prints
-the scheduled-time difference between groups on every cycle.
+the scheduled-time difference between groups on every cycle. This example is
+publish-only unless `--mode save` is supplied. To persist separate front and
+back capture directories on every cycle:
 
-## Trigger through ROS and save the images
+```bash
+python3 examples/http_trigger_groups_periodic.py \
+  front back --interval 2 --mode save
+```
+
+Save mode submits the group recording requests concurrently. Disjoint groups
+record in parallel, preserving PTP synchronization within each group and
+keeping their images and manifests in separate directories. Groups that share
+a camera cannot record concurrently and one request will be rejected. If PNG
+encoding or storage takes longer than the requested interval, the script prints
+an interval-overrun warning and begins the next cycle as soon as the previous
+one has finished.
+
+## Trigger through ROS and save in the client
 
 This client discovers every member of `front`, subscribes to their full-size
 `image_raw` topics, triggers the group, matches frames by the returned
@@ -90,6 +128,6 @@ ros2 topic echo --once \
 Start the topic subscriber before sending the trigger. Trigger-only frames are
 not retained for subscribers that connect afterward.
 
-Use **Capture and save** in the dashboard, the `/vixel/record_capture` action,
-or `POST /api/v1/groups/front/capture` when Vixel itself should persist PNGs and
-a full capture manifest under its configured recording directory.
+Use **Capture and save** in the dashboard, `ros_trigger.py --mode save`, or
+`http_trigger.py --mode save` when Vixel itself should persist PNGs and a full
+capture manifest under its configured recording directory.

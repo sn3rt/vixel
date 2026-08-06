@@ -101,7 +101,37 @@ ros2 action send_goal /vixel/record_capture \
 ```
 
 An empty request ID generates one. A supplied ID may contain letters, numbers,
-`.`, `_`, and `-`. Only one recording runs at a time.
+`.`, `_`, and `-`. Recordings for disjoint groups may run concurrently; a new
+recording is rejected when any of its cameras already belongs to an active
+recording.
+
+The example clients expose both operations with the same mode names:
+
+```bash
+# ROS action client
+python3 examples/ros_trigger.py front --mode publish
+python3 examples/ros_trigger.py front --mode save
+
+# HTTP client
+python3 examples/http_trigger.py front --mode publish
+python3 examples/http_trigger.py front --mode save
+```
+
+Only save mode produces files. Publish mode returns a trigger ID and publishes
+the frames on the camera topics for subscribers.
+
+To record separate disjoint groups on the same interval, dispatch their save
+requests together:
+
+```bash
+python3 examples/http_trigger_groups_periodic.py \
+  front back --interval 2 --mode save
+```
+
+Each cycle creates a separate capture directory and manifest per group. The
+groups choose scheduled PTP times independently, so cameras within each group
+are synchronized while the groups fire close together rather than sharing one
+guaranteed exposure timestamp.
 
 Successful sets are stored below
 `/var/lib/vixel/captures/YYYY/MM/DD/<capture_id>/` by default. Each directory

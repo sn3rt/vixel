@@ -24,8 +24,9 @@
 #include <map>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <numeric>
+#include <optional>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -288,9 +289,26 @@ private:
     if (!goal->request_id.empty() && !safe_identifier(goal->request_id)) {
       return rclcpp_action::GoalResponse::REJECT;
     }
-    bool expected = false;
-    if (!active_capture_.compare_exchange_strong(expected, true)) {
-      return rclcpp_action::GoalResponse::REJECT;
+    std::vector<std::string> member_ids;
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      const auto group = groups_.find(goal->group_id);
+      if (group == groups_.end() || group->second.member_ids.empty()) {
+        return rclcpp_action::GoalResponse::REJECT;
+      }
+      member_ids = group->second.member_ids;
+    }
+    {
+      std::lock_guard<std::mutex> lock(active_captures_mutex_);
+      if (active_capture_groups_.count(goal->group_id) != 0 ||
+        std::any_of(member_ids.begin(), member_ids.end(), [this](const auto & sensor_id) {
+          return active_capture_sensors_.count(sensor_id) != 0;
+        }))
+      {
+        return rclcpp_action::GoalResponse::REJECT;
+      }
+      active_capture_groups_[goal->group_id] = member_ids;
+      active_capture_sensors_.insert(member_ids.begin(), member_ids.end());
     }
     return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
   }
@@ -371,9 +389,22 @@ private:
   {
     struct ActiveGuard
     {
-      std::atomic<bool> & value;
-      ~ActiveGuard() {value.store(false);}
-    } guard{active_capture_};
+      std::mutex & mutex;
+      std::map<std::string, std::vector<std::string>> & groups;
+      std::set<std::string> & sensors;
+      std::string group_id;
+
+      ~ActiveGuard()
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto group = groups.find(group_id);
+        if (group == groups.end()) {return;}
+        for (const auto & sensor_id : group->second) {sensors.erase(sensor_id);}
+        groups.erase(group);
+      }
+    } guard{
+      active_captures_mutex_, active_capture_groups_, active_capture_sensors_,
+      handle->get_goal()->group_id};
 
     auto result = std::make_shared<RecordCapture::Result>();
     CaptureRecord record;
@@ -381,6 +412,15 @@ private:
     record.started_at = utc_now();
     std::filesystem::path staging;
     try {
+      std::vector<std::string> reserved_member_ids;
+      {
+        std::lock_guard<std::mutex> lock(active_captures_mutex_);
+        const auto reservation = active_capture_groups_.find(record.group_id);
+        if (reservation == active_capture_groups_.end()) {
+          throw std::runtime_error("capture reservation is missing");
+        }
+        reserved_member_ids = reservation->second;
+      }
       vixel_interfaces::msg::SyncGroup group;
       std::map<std::string, vixel_interfaces::msg::Sensor> sensor_snapshot;
       {
@@ -391,6 +431,9 @@ private:
         }
         group = group_iterator->second;
         sensor_snapshot = sensors_;
+      }
+      if (group.member_ids != reserved_member_ids) {
+        throw std::runtime_error("synchronization group changed while capture was starting");
       }
       if (group.operating_mode != "capture") {
         throw std::runtime_error("set synchronization group to capture mode first");
@@ -810,8 +853,10 @@ private:
   }
 
   RecorderConfig config_;
-  std::atomic<bool> active_capture_{false};
   std::atomic<std::uint64_t> capture_sequence_{0};
+  std::mutex active_captures_mutex_;
+  std::map<std::string, std::vector<std::string>> active_capture_groups_;
+  std::set<std::string> active_capture_sensors_;
   std::mutex state_mutex_;
   std::map<std::string, vixel_interfaces::msg::Sensor> sensors_;
   std::map<std::string, vixel_interfaces::msg::SyncGroup> groups_;
