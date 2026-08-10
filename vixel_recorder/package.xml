@@ -8,7 +8,6 @@
   <license>MIT</license>
   <url type="repository">https://github.com/sn3rt/vixel</url>
   <buildtool_depend>ament_cmake</buildtool_depend>
-  <depend>libopencv-dev</depend>
   <depend>nlohmann-json-dev</depend>
   <depend>rclcpp</depend>
   <depend>rclcpp_action</depend>

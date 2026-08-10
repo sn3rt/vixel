@@ -1,5 +1,4 @@
 #include <nlohmann/json.hpp>
-#include <opencv2/imgcodecs.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
@@ -21,6 +20,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -50,7 +50,6 @@ struct RecorderConfig
   std::filesystem::path root_directory{"/var/lib/vixel/captures"};
   std::uintmax_t minimum_free_bytes{5ULL * 1024ULL * 1024ULL * 1024ULL};
   std::chrono::milliseconds capture_timeout{10000};
-  int png_compression{3};
   std::size_t recent_limit{100};
 };
 
@@ -71,14 +70,10 @@ RecorderConfig load_config(const std::string & path)
     recording, "minimum_free_bytes", result.minimum_free_bytes);
   result.capture_timeout = std::chrono::milliseconds(
     read_or(recording, "capture_timeout_ms", static_cast<int>(result.capture_timeout.count())));
-  result.png_compression = read_or(recording, "png_compression", result.png_compression);
   result.recent_limit = read_or(recording, "recent_limit", result.recent_limit);
   if (result.root_directory.empty()) {throw std::runtime_error("recording root is empty");}
   if (result.capture_timeout < 1s || result.capture_timeout > 60s) {
     throw std::runtime_error("recording capture timeout must be between 1 and 60 seconds");
-  }
-  if (result.png_compression < 0 || result.png_compression > 9) {
-    throw std::runtime_error("recording PNG compression must be between 0 and 9");
   }
   return result;
 }
@@ -124,6 +119,29 @@ bool same_stamp(
   const builtin_interfaces::msg::Time & left, const builtin_interfaces::msg::Time & right)
 {
   return left.sec == right.sec && left.nanosec == right.nanosec;
+}
+
+std::pair<std::uint32_t, std::uint32_t> png_dimensions(
+  const std::vector<std::uint8_t> & data)
+{
+  constexpr std::uint8_t signature[] = {137, 80, 78, 71, 13, 10, 26, 10};
+  if (data.size() < 24 || !std::equal(std::begin(signature), std::end(signature), data.begin()) ||
+    std::string(data.begin() + 12, data.begin() + 16) != "IHDR")
+  {
+    throw std::runtime_error("capture transport contains an invalid PNG header");
+  }
+  const auto read_u32 = [&data](std::size_t offset) {
+      return (static_cast<std::uint32_t>(data[offset]) << 24U) |
+             (static_cast<std::uint32_t>(data[offset + 1]) << 16U) |
+             (static_cast<std::uint32_t>(data[offset + 2]) << 8U) |
+             static_cast<std::uint32_t>(data[offset + 3]);
+    };
+  const auto width = read_u32(16);
+  const auto height = read_u32(20);
+  if (width == 0 || height == 0) {
+    throw std::runtime_error("capture transport contains invalid PNG dimensions");
+  }
+  return {width, height};
 }
 
 nlohmann::json stamp_json(const builtin_interfaces::msg::Time & stamp)
@@ -394,13 +412,18 @@ private:
       std::set<std::string> & sensors;
       std::string group_id;
 
-      ~ActiveGuard()
+      void release()
       {
         std::lock_guard<std::mutex> lock(mutex);
         const auto group = groups.find(group_id);
         if (group == groups.end()) {return;}
         for (const auto & sensor_id : group->second) {sensors.erase(sensor_id);}
         groups.erase(group);
+      }
+
+      ~ActiveGuard()
+      {
+        release();
       }
     } guard{
       active_captures_mutex_, active_capture_groups_, active_capture_sensors_,
@@ -605,6 +628,11 @@ private:
         throw std::runtime_error("timed out waiting for one or more captured images");
       }
 
+      // The cameras are no longer needed once every lossless frame is held in
+      // this execution thread. Allow the next capture to acquire them while
+      // this capture is written to disk.
+      guard.release();
+
       const auto date = record.started_at.substr(0, 10);
       const auto parent = config_.root_directory / date.substr(0, 4) / date.substr(5, 2) /
         date.substr(8, 2);
@@ -618,7 +646,7 @@ private:
         throw std::runtime_error("capture ID already exists on disk");
       }
       std::filesystem::create_directory(staging);
-      feedback(handle, "writing", "Encoding full-resolution PNG images", 70);
+      feedback(handle, "writing", "Writing full-resolution PNG images", 70);
       nlohmann::json sensor_manifest = nlohmann::json::object();
       for (const auto & sensor_id : record.participating_sensor_ids) {
         const auto image = captured.at(sensor_id);
@@ -626,25 +654,20 @@ private:
           throw std::runtime_error(
                   "capture transport for " + sensor_id + " is not lossless PNG");
         }
-        const cv::Mat encoded(
-          1, static_cast<int>(image->data.size()), CV_8UC1,
-          const_cast<std::uint8_t *>(image->data.data()));
-        const auto decoded = cv::imdecode(encoded, cv::IMREAD_COLOR);
-        if (decoded.empty()) {
-          throw std::runtime_error("failed to decode full-resolution PNG for " + sensor_id);
-        }
+        const auto dimensions = png_dimensions(image->data);
         const auto filename = sensor_id + ".png";
         const auto path = staging / filename;
-        if (!cv::imwrite(
-            path.string(), decoded,
-            {cv::IMWRITE_PNG_COMPRESSION, config_.png_compression}))
-        {
-          throw std::runtime_error("failed to encode PNG for " + sensor_id);
-        }
+        // Capture transport is already a lossless PNG. Re-encoding it here is
+        // both redundant and expensive for full-resolution frames.
+        std::ofstream output(path, std::ios::binary);
+        output.write(
+          reinterpret_cast<const char *>(image->data.data()),
+          static_cast<std::streamsize>(image->data.size()));
+        if (!output) {throw std::runtime_error("failed to write PNG for " + sensor_id);}
         record.saved_sensor_ids.push_back(sensor_id);
         const auto sensor = sensor_snapshot.find(sensor_id);
         nlohmann::json metadata{
-          {"file", filename}, {"width", decoded.cols}, {"height", decoded.rows},
+          {"file", filename}, {"width", dimensions.first}, {"height", dimensions.second},
           {"encoding", "bgr8"}, {"transport_format", image->format},
           {"frame_id", image->header.frame_id},
           {"stamp", stamp_json(image->header.stamp)}

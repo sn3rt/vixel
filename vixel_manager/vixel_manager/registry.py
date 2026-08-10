@@ -200,7 +200,6 @@ def validate_machine(data: dict[str, Any]) -> dict[str, Any]:
     recording.setdefault("root_directory", "/var/lib/vixel/captures")
     recording.setdefault("minimum_free_bytes", 5 * 1024 * 1024 * 1024)
     recording.setdefault("capture_timeout_ms", 10000)
-    recording.setdefault("png_compression", 3)
     recording.setdefault("recent_limit", 100)
     if not str(recording["root_directory"]).strip():
         raise RegistryError("recording.root_directory must not be empty")
@@ -208,8 +207,6 @@ def validate_machine(data: dict[str, Any]) -> dict[str, Any]:
         raise RegistryError("recording.minimum_free_bytes must not be negative")
     if not 1000 <= int(recording["capture_timeout_ms"]) <= 60000:
         raise RegistryError("recording.capture_timeout_ms must be between 1000 and 60000")
-    if not 0 <= int(recording["png_compression"]) <= 9:
-        raise RegistryError("recording.png_compression must be between 0 and 9")
     if not 1 <= int(recording["recent_limit"]) <= 1000:
         raise RegistryError("recording.recent_limit must be between 1 and 1000")
     defaults.setdefault("preview_rate_hz", 2.0)

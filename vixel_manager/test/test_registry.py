@@ -212,8 +212,8 @@ def test_recording_configuration_gets_safe_defaults():
 
 def test_invalid_recording_configuration_is_rejected():
     broken = yaml.safe_load(yaml.safe_dump(MACHINE))
-    broken["recording"] = {"png_compression": 12}
-    with pytest.raises(RegistryError, match="png_compression"):
+    broken["recording"] = {"recent_limit": 0}
+    with pytest.raises(RegistryError, match="recent_limit"):
         validate_machine(broken)
 
 

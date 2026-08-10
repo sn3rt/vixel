@@ -70,7 +70,6 @@ recording:
   root_directory: /var/lib/vixel/captures
   minimum_free_bytes: 5368709120
   capture_timeout_ms: 10000
-  png_compression: 3
   recent_limit: 100
 
 defaults:
