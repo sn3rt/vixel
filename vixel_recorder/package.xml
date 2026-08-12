@@ -14,5 +14,6 @@
   <depend>sensor_msgs</depend>
   <depend>vixel_interfaces</depend>
   <depend>yaml_cpp_vendor</depend>
+  <test_depend>ament_cmake_gtest</test_depend>
   <export><build_type>ament_cmake</build_type></export>
 </package>

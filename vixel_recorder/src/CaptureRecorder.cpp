@@ -1,3 +1,5 @@
+#include "vixel_recorder/RecorderConfig.hpp"
+
 #include <nlohmann/json.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
@@ -17,7 +19,6 @@
 #include <vixel_interfaces/srv/get_capture_operation.hpp>
 #include <vixel_interfaces/srv/start_capture_sequence.hpp>
 #include <vixel_interfaces/srv/submit_capture_batch.hpp>
-#include <yaml-cpp/yaml.h>
 
 #include <algorithm>
 #include <atomic>
@@ -65,57 +66,6 @@ struct OperationState
   std::map<std::uint32_t, std::size_t> cycle_results;
   std::map<std::uint32_t, std::size_t> cycle_failures;
 };
-
-struct RecorderConfig
-{
-  std::filesystem::path root_directory{"/var/lib/vixel/captures"};
-  std::uintmax_t minimum_free_bytes{5ULL * 1024ULL * 1024ULL * 1024ULL};
-  std::chrono::milliseconds capture_timeout{10000};
-  std::size_t recent_limit{100};
-  std::size_t max_inflight_captures{32};
-  bool gps_enabled{false};
-  std::string gps_topic{"/fix"};
-  std::chrono::milliseconds gps_max_age{2000};
-};
-
-template<typename T>
-T read_or(const YAML::Node & node, const char * key, T fallback)
-{
-  return node && node[key] ? node[key].as<T>() : fallback;
-}
-
-RecorderConfig load_config(const std::string & path)
-{
-  RecorderConfig result;
-  const auto root = YAML::LoadFile(path);
-  const auto recording = root["recording"];
-  result.root_directory = read_or(
-    recording, "root_directory", result.root_directory.string());
-  result.minimum_free_bytes = read_or(
-    recording, "minimum_free_bytes", result.minimum_free_bytes);
-  result.capture_timeout = std::chrono::milliseconds(
-    read_or(recording, "capture_timeout_ms", static_cast<int>(result.capture_timeout.count())));
-  result.recent_limit = read_or(recording, "recent_limit", result.recent_limit);
-  result.max_inflight_captures = read_or(
-    recording, "max_inflight_captures", result.max_inflight_captures);
-  YAML::Node gps;
-  if (recording && recording.IsMap()) {gps = recording["gps"];}
-  result.gps_enabled = read_or(gps, "enabled", result.gps_enabled);
-  result.gps_topic = read_or(gps, "topic", result.gps_topic);
-  result.gps_max_age = std::chrono::milliseconds(
-    read_or(gps, "max_age_ms", static_cast<int>(result.gps_max_age.count())));
-  if (result.root_directory.empty()) {throw std::runtime_error("recording root is empty");}
-  if (result.capture_timeout < 1s || result.capture_timeout > 60s) {
-    throw std::runtime_error("recording capture timeout must be between 1 and 60 seconds");
-  }
-  if (result.max_inflight_captures == 0 || result.max_inflight_captures > 256) {
-    throw std::runtime_error("recording max_inflight_captures must be between 1 and 256");
-  }
-  if (result.gps_enabled && (result.gps_topic.empty() || result.gps_max_age.count() < 0)) {
-    throw std::runtime_error("recording GPS topic/max_age_ms is invalid");
-  }
-  return result;
-}
 
 std::string utc_now()
 {
@@ -314,7 +264,7 @@ public:
   {
     const auto machine_file = declare_parameter<std::string>(
       "machine_file", "/etc/vixel/machine.yaml");
-    config_ = load_config(machine_file);
+    config_ = load_recorder_config(machine_file);
     std::filesystem::create_directories(config_.root_directory);
     scan_records();
 
