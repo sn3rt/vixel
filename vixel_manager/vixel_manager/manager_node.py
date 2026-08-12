@@ -1412,7 +1412,7 @@ class InventoryManager(Node):
             response.message = str(error)
         return response
 
-    def _request_group_capture(
+    async def _request_group_capture(
         self, group_id: str, request_id: str, *, trigger_only: bool,
         has_requested_time: bool = False, requested_time=None,
     ):
@@ -1435,11 +1435,17 @@ class InventoryManager(Node):
         provider_request.has_requested_time = has_requested_time
         if has_requested_time and requested_time is not None:
             provider_request.requested_time = requested_time
-        return self._wait_for_future(client.call_async(provider_request), timeout=30.0)
-
-    def _capture_group(self, request, response):
         try:
-            provider_response = self._request_group_capture(
+            # Await the provider response instead of blocking an executor thread.
+            # At 2 Hz, blocking here exhausted all four manager threads before
+            # the response callbacks could run, deadlocking the service proxy.
+            return await client.call_async(provider_request)
+        except Exception as error:
+            raise RegistryError(str(error)) from error
+
+    async def _capture_group(self, request, response):
+        try:
+            provider_response = await self._request_group_capture(
                 request.group_id,
                 request.request_id,
                 trigger_only=request.trigger_only,
@@ -1470,7 +1476,7 @@ class InventoryManager(Node):
             return GoalResponse.REJECT
         return GoalResponse.ACCEPT
 
-    def _trigger_group(self, goal_handle):
+    async def _trigger_group(self, goal_handle):
         result = TriggerGroup.Result()
         feedback = TriggerGroup.Feedback()
         feedback.stage = "arming"
@@ -1478,7 +1484,7 @@ class InventoryManager(Node):
         feedback.progress_percent = 10
         goal_handle.publish_feedback(feedback)
         try:
-            response = self._request_group_capture(
+            response = await self._request_group_capture(
                 goal_handle.request.group_id,
                 goal_handle.request.request_id,
                 trigger_only=True,
@@ -1506,18 +1512,6 @@ class InventoryManager(Node):
             result.message = str(error)
             goal_handle.abort()
         return result
-
-    @staticmethod
-    def _wait_for_future(future, timeout: float):
-        event = threading.Event()
-        future.add_done_callback(lambda _: event.set())
-        if not event.wait(timeout):
-            raise TimeoutError("provider request timed out")
-        exception = future.exception()
-        if exception:
-            raise RegistryError(str(exception))
-        return future.result()
-
 
 def main(args=None) -> None:
     rclpy.init(args=args)

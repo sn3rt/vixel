@@ -205,12 +205,13 @@ def monitor_save_sequence(
         progress = (
             operation.get("scheduled_cycles", 0), operation.get("completed_cycles", 0),
             operation.get("failed_cycles", 0), operation.get("pending_saves", 0),
-            operation.get("status", ""),
+            operation.get("status", ""), operation.get("message", ""),
         )
         if progress != last_progress:
+            detail = f" message={progress[5]}" if progress[5] else ""
             print(
                 f"sequence {operation_id}: status={progress[4]} scheduled={progress[0]} "
-                f"saved={progress[1]} failed={progress[2]} pending={progress[3]}"
+                f"saved={progress[1]} failed={progress[2]} pending={progress[3]}{detail}"
             )
             last_progress = progress
         if operation.get("status") in {"complete", "failed", "cancelled"}:

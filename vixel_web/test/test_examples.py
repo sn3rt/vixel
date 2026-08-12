@@ -282,6 +282,24 @@ def test_periodic_example_sets_capture_mode_and_waits_until_groups_are_ready(mon
     assert len([call for call in calls if call[1] == "/api/v1/groups"]) == 3
 
 
+def test_periodic_monitor_prints_terminal_failure_message(monkeypatch, capsys):
+    example = load_example("http_trigger_groups_periodic")
+    monkeypatch.setattr(example, "api_request", lambda *_args, **_kwargs: {
+        "operation": {
+            "status": "failed", "scheduled_cycles": 2, "completed_cycles": 0,
+            "failed_cycles": 2, "pending_saves": 0,
+            "message": "provider request failed",
+        }
+    })
+
+    operation = example.monitor_save_sequence(
+        "http://127.0.0.1:8080", "operation_1", 5.0
+    )
+
+    assert operation["status"] == "failed"
+    assert "message=provider request failed" in capsys.readouterr().out
+
+
 def test_examples_are_linked_from_documentation():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     operations = (ROOT / "docs" / "operations.md").read_text(encoding="utf-8")
