@@ -98,7 +98,8 @@ RecorderConfig load_config(const std::string & path)
   result.recent_limit = read_or(recording, "recent_limit", result.recent_limit);
   result.max_inflight_captures = read_or(
     recording, "max_inflight_captures", result.max_inflight_captures);
-  const auto gps = recording["gps"];
+  YAML::Node gps;
+  if (recording && recording.IsMap()) {gps = recording["gps"];}
   result.gps_enabled = read_or(gps, "enabled", result.gps_enabled);
   result.gps_topic = read_or(gps, "topic", result.gps_topic);
   result.gps_max_age = std::chrono::milliseconds(

@@ -68,6 +68,7 @@ def generate_launch_description():
             output="screen",
             emulate_tty=True,
             parameters=[{"machine_file": machine_file}],
+            on_exit=Shutdown(reason="Vixel capture recorder exited"),
         ),
         Node(
             package="vixel_web",

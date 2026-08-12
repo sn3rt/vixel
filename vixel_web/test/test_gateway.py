@@ -3,9 +3,12 @@ import threading
 from http.server import ThreadingHTTPServer
 from types import SimpleNamespace
 
+import pytest
+
 from vixel_web.gateway import (
     capture_operation_to_dict,
     capture_record_to_dict,
+    GatewayNode,
     group_to_dict,
     Handler,
     VixelHTTPServer,
@@ -13,6 +16,17 @@ from vixel_web.gateway import (
     is_routine_snapshot_request,
     known_sensor_to_dict,
 )
+
+
+def test_unavailable_ros_service_error_names_the_service():
+    node = GatewayNode.__new__(GatewayNode)
+    client = SimpleNamespace(
+        srv_name="/vixel/start_capture_sequence",
+        wait_for_service=lambda timeout_sec: False,
+    )
+
+    with pytest.raises(RuntimeError, match="/vixel/start_capture_sequence"):
+        node.call_service(client, object())
 
 
 def test_group_ptp_locking_members_are_exposed_as_json():

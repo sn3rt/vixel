@@ -571,7 +571,9 @@ class GatewayNode(Node):
 
     def call_service(self, client, request, timeout=10.0):
         if not client.wait_for_service(timeout_sec=2.0):
-            raise RuntimeError("Vixel ROS service is unavailable")
+            service_name = str(getattr(client, "srv_name", "")).strip()
+            detail = f" {service_name}" if service_name else ""
+            raise RuntimeError(f"Vixel ROS service{detail} is unavailable")
         return self.wait_future(client.call_async(request), timeout)
 
     def enroll(self, sensor_id: str, body: dict[str, Any], operation_id: str = ""):
