@@ -968,16 +968,26 @@ public:
     return true;
   }
 
-  bool metering_due(const std::chrono::steady_clock::time_point tick)
+  bool metering_due(const std::chrono::steady_clock::time_point tick) const
   {
     if (assignment_.operating_mode != "capture" || metering_rate_hz_ <= 0.0 ||
-      tick < next_metering_ || pipeline_depth_.load() != 0)
+      tick < next_metering_)
     {
       return false;
     }
+    return true;
+  }
+
+  bool pipeline_idle() const
+  {
+    return pipeline_depth_.load() == 0;
+  }
+
+  void mark_metering_scheduled(const std::chrono::steady_clock::time_point tick)
+  {
+    if (metering_rate_hz_ <= 0.0) {return;}
     next_metering_ = tick + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
       std::chrono::duration<double>(1.0 / metering_rate_hz_));
-    return true;
   }
 
   std::shared_ptr<FrameCompletion> request_frame(
@@ -2205,8 +2215,93 @@ private:
     for (auto & item : sessions_) {
       if (item.second->preview_due(tick)) {
         item.second->request_frame(stamp);
-      } else if (item.second->metering_due(tick)) {
-        item.second->request_frame(stamp, "", false, tick, true, true);
+      }
+    }
+
+    // Capture-mode cameras stay armed on Action0.  Switching them temporarily
+    // to Software for metering is unreliable on cameras that lock transport
+    // features after AcquisitionStart and produced incomplete buffers on the
+    // Triton cameras.  Instead, meter a complete synchronization group with the
+    // same scheduled action mechanism used by real captures, then discard those
+    // frames before conversion or encoding.
+    std::map<std::string, std::vector<CameraSession *>> metering_groups;
+    std::map<std::string, std::size_t> expected_group_sizes;
+    for (const auto & item : assignments_) {
+      const auto & assignment = item.second;
+      if (!assignment.enabled || assignment.operating_mode != "capture" ||
+        assignment.sync_group.empty())
+      {
+        continue;
+      }
+      ++expected_group_sizes[assignment.sync_group];
+      const auto session = sessions_.find(item.first);
+      if (session != sessions_.end()) {
+        metering_groups[assignment.sync_group].push_back(session->second.get());
+      }
+    }
+    for (auto & group : metering_groups) {
+      auto & members = group.second;
+      if (members.size() != expected_group_sizes[group.first] ||
+        !std::all_of(
+          members.begin(), members.end(),
+          [](const auto * session) {return session->pipeline_idle();}) ||
+        !std::any_of(
+          members.begin(), members.end(),
+          [&tick](const auto * session) {return session->metering_due(tick);}))
+      {
+        continue;
+      }
+
+      bool triggerable = true;
+      std::uint64_t action_time = 0;
+      std::map<std::string, NetworkConfig> action_networks;
+      for (auto * session : members) {
+        if (session->ptp_action()) {
+          if (!session->ptp_locked()) {
+            triggerable = false;
+            break;
+          }
+          action_time = std::max(action_time, session->ptp_time_ns());
+          action_networks[session->network().id] = session->network();
+        } else if (!session->software_trigger()) {
+          triggerable = false;
+          break;
+        }
+      }
+      if (!triggerable) {continue;}
+
+      const auto lead = action_networks.empty() ? 0ms :
+        std::chrono::milliseconds(config_.ptp_action_lead_time_ms);
+      action_time += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(lead).count());
+      const auto release_at = tick + lead;
+      const auto metering_stamp = now() + rclcpp::Duration::from_nanoseconds(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(lead).count());
+      std::set<std::string> failed_networks;
+      for (const auto & network : action_networks) {
+        try {
+          gvcp_scheduled_action(
+            network.second, config_.action_device_key,
+            action_group_key(group.first), action_time);
+        } catch (const std::exception & error) {
+          failed_networks.insert(network.first);
+          RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), 5000,
+            "Metering action failed for group %s on %s: %s",
+            group.first.c_str(), network.second.interface.c_str(), error.what());
+        }
+      }
+      for (auto * session : members) {
+        session->mark_metering_scheduled(tick);
+        if (session->ptp_action() &&
+          failed_networks.count(session->network().id) != 0)
+        {
+          continue;
+        }
+        const auto session_release = session->software_trigger() ? release_at :
+          std::chrono::steady_clock::time_point{};
+        session->request_frame(
+          metering_stamp, "", false, session_release, false, true);
       }
     }
   }

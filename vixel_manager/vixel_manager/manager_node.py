@@ -64,6 +64,20 @@ STATE_QOS = QoSProfile(
 )
 
 
+def _provider_group_is_current(
+    provider_message: SyncGroup | None, members: list[str], requested_mode: str
+) -> bool:
+    return bool(
+        provider_message
+        and provider_message.operating_mode == requested_mode
+        and set(provider_message.member_ids) == set(members)
+    )
+
+
+def _runtime_sensor_is_ready(sensor: Sensor | None, requested_mode: str) -> bool:
+    return bool(sensor and sensor.online and sensor.operating_mode == requested_mode)
+
+
 def _pose_to_dict(pose: Pose, parent_frame: str) -> dict[str, Any]:
     return {
         "parent_frame": parent_frame,
@@ -667,14 +681,15 @@ class InventoryManager(Node):
 
     def _sync_group_message(self, group_id: str, record: dict[str, Any]) -> SyncGroup:
         provider_message = self.provider_groups.get(group_id)
-        if provider_message:
-            result = provider_message
-            result.missing_policy = record["missing_policy"]
-            result.trigger_source = "Action0"
-            result.preview_rate_hz = float(record["preview_rate_hz"])
-            result.preferred_master_id = ""
-            result.operating_mode = self.group_modes.get(group_id, self.default_group_mode)
-            return result
+        requested_mode = self.group_modes.get(group_id, self.default_group_mode)
+        # A provider status from the previous operating mode can remain latched
+        # while its camera sessions are being restarted.  Do not relabel that
+        # stale status with the new mode: doing so briefly made a capture button
+        # available before any of the new capture sessions existed.
+        if _provider_group_is_current(
+            provider_message, list(record["members"]), requested_mode
+        ):
+            return provider_message
         result = SyncGroup()
         result.stamp = self.get_clock().now().to_msg()
         result.group_id = group_id
@@ -682,12 +697,12 @@ class InventoryManager(Node):
         result.member_ids = list(record["members"])
         result.missing_policy = record["missing_policy"]
         result.trigger_source = "Action0"
-        result.operating_mode = self.group_modes.get(group_id, self.default_group_mode)
+        result.operating_mode = requested_mode
         result.preview_rate_hz = float(record["preview_rate_hz"])
         result.preferred_master_id = ""
         result.online_member_ids = [
             member for member in result.member_ids
-            if member in self.runtime and self.runtime[member].online
+            if _runtime_sensor_is_ready(self.runtime.get(member), requested_mode)
         ]
         result.missing_member_ids = [
             member for member in result.member_ids if member not in result.online_member_ids
