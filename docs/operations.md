@@ -129,6 +129,10 @@ python3 examples/http_trigger_groups_periodic.py \
   front back --interval 0.5 --mode save --count 10
 ```
 
+This helper requests capture mode for both groups and waits for the cameras and
+PTP synchronization to report ready before it submits the sequence. Use
+`--ready-timeout` to change the default 60-second startup deadline.
+
 Each cycle creates a separate capture directory and manifest per group. The
 example requests one shared timestamp for every included group. The requested
 500 ms cadence is based on exposure timestamps; completed files may appear

@@ -108,6 +108,73 @@ def api_request(
     return result
 
 
+def set_group_capture_mode(
+    base_url: str, group_id: str, timeout: float,
+) -> dict[str, Any]:
+    return api_request(
+        base_url, "/api/v1/mode", timeout,
+        {"target_kind": "group", "target_id": group_id, "mode": "capture"},
+    )
+
+
+def group_readiness(group: dict[str, Any] | None) -> str:
+    if group is None:
+        return "status unavailable"
+    mode = str(group.get("operating_mode", "unknown"))
+    if mode == "capture" and bool(group.get("ready", False)):
+        return "ready"
+    details = [f"mode={mode}"]
+    members = list(group.get("member_ids", []))
+    online = list(group.get("online_member_ids", []))
+    if members:
+        details.append(f"online={len(online)}/{len(members)}")
+    missing = list(group.get("missing_member_ids", []))
+    if missing:
+        details.append(f"missing={','.join(map(str, missing))}")
+    locking = list(group.get("locking_member_ids", []))
+    if locking:
+        details.append(f"PTP-locking={','.join(map(str, locking))}")
+    if group.get("last_error"):
+        details.append(f"notice={group['last_error']}")
+    return " ".join(details)
+
+
+def prepare_capture_groups(
+    base_url: str, groups: list[str], timeout: float, ready_timeout: float,
+) -> None:
+    for group_id in groups:
+        set_group_capture_mode(base_url, group_id, timeout)
+    print(f"capture mode requested for: {','.join(groups)}")
+
+    deadline = time.monotonic() + ready_timeout
+    last_status = ""
+    consecutive_ready_polls = 0
+    while True:
+        result = api_request(base_url, "/api/v1/groups", timeout)
+        records = {
+            str(group.get("group_id", "")): group
+            for group in result.get("groups", [])
+            if isinstance(group, dict)
+        }
+        states = {group_id: group_readiness(records.get(group_id)) for group_id in groups}
+        all_ready = all(state == "ready" for state in states.values())
+        consecutive_ready_polls = consecutive_ready_polls + 1 if all_ready else 0
+        status = "; ".join(f"{group_id}={states[group_id]}" for group_id in groups)
+        if status != last_status:
+            print(f"waiting for capture readiness: {status}")
+            last_status = status
+        # Require two observations so the recorder has time to receive the same
+        # transient-local group state before the first operation is submitted.
+        if consecutive_ready_polls >= 2:
+            print(f"capture groups ready: {','.join(groups)}")
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"groups did not become capture-ready within {ready_timeout:.1f} s: {status}"
+            )
+        time.sleep(0.25)
+
+
 def start_save_sequence(
     base_url: str, groups: list[str], interval: float, count: int,
     request_prefix: str, timeout: float,
@@ -174,6 +241,10 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--base-url", default="http://127.0.0.1:8080")
     value.add_argument("--timeout", type=float, default=35.0)
     value.add_argument(
+        "--ready-timeout", type=float, default=60.0,
+        help="Seconds to wait for cameras and PTP synchronization after requesting capture mode",
+    )
+    value.add_argument(
         "--request-prefix",
         default="",
         help="Capture ID prefix; default includes the current UTC time",
@@ -183,14 +254,29 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
-    if args.interval <= 0 or args.count < 0 or len(set(args.group_ids)) != len(args.group_ids):
-        print("interval must be positive, count non-negative, and groups unique", file=sys.stderr)
+    if (
+        args.interval <= 0 or args.count < 0 or args.ready_timeout <= 0
+        or len(set(args.group_ids)) != len(args.group_ids)
+    ):
+        print(
+            "interval and ready-timeout must be positive, count non-negative, "
+            "and groups unique", file=sys.stderr,
+        )
         return 2
     sequence = 0
     next_deadline = time.monotonic()
     request_prefix = args.request_prefix or time.strftime(
         "periodic_%Y%m%dT%H%M%SZ", time.gmtime()
     )
+    try:
+        prepare_capture_groups(
+            args.base_url, args.group_ids, args.timeout, args.ready_timeout
+        )
+    except KeyboardInterrupt:
+        return 0
+    except (RuntimeError, ValueError, KeyError) as error:
+        print(f"Could not prepare capture groups: {error}", file=sys.stderr)
+        return 1
     if args.mode == "save":
         operation_id = ""
         try:

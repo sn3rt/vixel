@@ -131,6 +131,7 @@ def test_example_parsers_have_runnable_defaults():
     assert periodic.interval == 2.0
     assert periodic.count == 0
     assert periodic.mode == "publish"
+    assert periodic.ready_timeout == 60.0
     assert ros_request.mode == "publish"
     assert ros_request.timeout == 35.0
     assert ros.output_dir == Path("vixel-triggered-images")
@@ -227,6 +228,58 @@ def test_periodic_sequence_uses_server_managed_cadence(monkeypatch):
     assert captured["path"] == "/api/v1/capture-operations/sequence"
     assert captured["body"]["interval_ms"] == 500
     assert captured["body"]["synchronize_groups"] is True
+
+
+def test_periodic_example_sets_capture_mode_and_waits_until_groups_are_ready(monkeypatch):
+    example = load_example("http_trigger_groups_periodic")
+    calls = []
+    group_snapshots = iter([
+        {
+            "groups": [
+                {
+                    "group_id": "front", "operating_mode": "capture", "ready": False,
+                    "member_ids": ["front_left", "front_right"],
+                    "online_member_ids": ["front_left"],
+                    "missing_member_ids": ["front_right"],
+                },
+                {
+                    "group_id": "back", "operating_mode": "capture", "ready": False,
+                    "member_ids": ["back_left", "back_right"],
+                    "online_member_ids": [],
+                },
+            ]
+        },
+        {
+            "groups": [
+                {"group_id": "front", "operating_mode": "capture", "ready": True},
+                {"group_id": "back", "operating_mode": "capture", "ready": True},
+            ]
+        },
+        {
+            "groups": [
+                {"group_id": "front", "operating_mode": "capture", "ready": True},
+                {"group_id": "back", "operating_mode": "capture", "ready": True},
+            ]
+        },
+    ])
+
+    def request(base_url, path, timeout, body=None):
+        calls.append((base_url, path, timeout, body))
+        if path == "/api/v1/groups":
+            return next(group_snapshots)
+        return {"success": True}
+
+    monkeypatch.setattr(example, "api_request", request)
+    monkeypatch.setattr(example.time, "sleep", lambda _seconds: None)
+
+    example.prepare_capture_groups(
+        "http://127.0.0.1:8080", ["front", "back"], 5.0, 10.0
+    )
+
+    mode_calls = [call for call in calls if call[1] == "/api/v1/mode"]
+    assert [call[3]["target_id"] for call in mode_calls] == ["front", "back"]
+    assert all(call[3]["mode"] == "capture" for call in mode_calls)
+    assert len([call for call in calls if call[1] == "/api/v1/groups"]) == 3
 
 
 def test_examples_are_linked_from_documentation():

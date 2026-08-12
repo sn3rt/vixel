@@ -77,6 +77,10 @@ python3 examples/http_trigger_groups_periodic.py \
   front back --interval 2 --mode save
 ```
 
+The periodic helper first requests capture mode for every named group and waits
+until all cameras are online, armed, and synchronization-ready. The wait defaults
+to 60 seconds and can be changed with `--ready-timeout`.
+
 Save mode submits one server-managed sequence and polls its operation status.
 Use `--interval 0.5 --count 10` for ten 2 Hz cycles. All listed groups share
 each cycle's requested PTP timestamp, while each group keeps its own directory
