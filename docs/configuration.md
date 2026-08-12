@@ -120,7 +120,8 @@ readable upper-limit node; because that node is not standardized by SFNC,
 Vixel probes known aliases and accepts `exposure_auto_upper_feature` and
 `exposure_auto_limit_auto_feature` overrides. If automatic exposure cannot be
 bounded, preparation is rejected before cycle one instead of risking skipped
-or incorrectly exposed frames.
+or incorrectly exposed frames. Limit-auto controls are handled as either
+GenICam Boolean nodes or enumerations such as `Off`/`Disabled`/`Manual`.
 
 `trigger_overlap` is capability-driven and optional. If no explicit override
 is present and a sequence requests a cadence, Vixel prefers `PreviousFrame`

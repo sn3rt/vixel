@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <optional>
@@ -18,6 +19,15 @@ struct CaptureCadence
   std::uint32_t action_queue_size{1};
   std::uint32_t safety_margin_ms{10};
 };
+
+inline bool disabled_feature_value(std::string value)
+{
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char character) {
+    return static_cast<char>(std::tolower(character));
+  });
+  return value == "off" || value == "false" || value == "disabled" ||
+         value == "manual" || value == "no";
+}
 
 inline std::uint32_t minimum_capture_interval_ms(const CaptureCadence & cadence)
 {

@@ -1148,6 +1148,7 @@ public:
     add_enum_feature(result, "TriggerOverlap");
     add_boolean_feature(result, "TriggerArmed");
     add_boolean_feature(result, "ExposureAutoLimitAuto");
+    add_enum_feature(result, "ExposureAutoLimitAuto");
     add_integer_feature(result, "ActionQueueSize", "commands");
     add_float_feature(result, "ExposureAutoUpperLimit", "us");
     add_float_feature(result, "AutoExposureTimeUpperLimit", "us");
@@ -1294,6 +1295,86 @@ private:
     return first_available_feature(candidates);
   }
 
+  std::optional<bool> feature_is_disabled(const std::string & name)
+  {
+    if (name.empty() || !feature_readable(camera_, name.c_str())) {
+      return std::nullopt;
+    }
+    GError * error = nullptr;
+    const auto boolean_value = arv_camera_get_boolean(camera_, name.c_str(), &error);
+    if (error == nullptr) {return !boolean_value;}
+    g_error_free(error);
+    error = nullptr;
+    const auto enum_value = value_or_empty(
+      arv_camera_get_string(camera_, name.c_str(), &error));
+    if (error == nullptr) {return disabled_feature_value(enum_value);}
+    g_error_free(error);
+    return std::nullopt;
+  }
+
+  bool disable_auto_limit_feature(const std::string & name, std::string & detail)
+  {
+    if (name.empty()) {return true;}
+    const auto current = feature_is_disabled(name);
+    if (current && *current) {return true;}
+    if (!feature_writable(camera_, name.c_str())) {
+      detail = name + " is not writable and is not disabled";
+      return false;
+    }
+
+    GError * error = nullptr;
+    arv_camera_set_boolean(camera_, name.c_str(), false, &error);
+    if (error == nullptr) {
+      const auto applied = feature_is_disabled(name);
+      if (!applied || *applied) {return true;}
+      detail = name + " Boolean readback is still enabled";
+      return false;
+    }
+    const auto boolean_error = std::string(error->message);
+    g_error_free(error);
+    error = nullptr;
+
+    guint count = 0;
+    const auto values = arv_camera_dup_available_enumerations_as_strings(
+      camera_, name.c_str(), &count, &error);
+    std::vector<std::string> available;
+    if (error == nullptr) {
+      for (guint index = 0; values != nullptr && index < count; ++index) {
+        available.push_back(value_or_empty(values[index]));
+      }
+    } else {
+      const auto enum_error = std::string(error->message);
+      g_error_free(error);
+      g_free(values);
+      detail = name + " cannot be disabled as Boolean (" + boolean_error +
+        ") or enumeration (" + enum_error + ")";
+      return false;
+    }
+    g_free(values);
+
+    const auto selected = std::find_if(
+      available.begin(), available.end(), [](const auto & value) {
+        return disabled_feature_value(value);
+      });
+    if (selected == available.end()) {
+      detail = name + " cannot be disabled as Boolean (" + boolean_error +
+        ") and advertises no Off/Disabled/Manual enumeration";
+      return false;
+    }
+    arv_camera_set_string(camera_, name.c_str(), selected->c_str(), &error);
+    if (error != nullptr) {
+      detail = name + " rejected " + *selected + ": " + error->message;
+      g_error_free(error);
+      return false;
+    }
+    const auto applied = feature_is_disabled(name);
+    if (applied && !*applied) {
+      detail = name + " readback is still enabled after setting " + *selected;
+      return false;
+    }
+    return true;
+  }
+
   void read_trigger_overlap(const std::string & feature)
   {
     if (feature.empty()) {
@@ -1408,15 +1489,10 @@ private:
               "or configure exposure_auto_upper_feature";
             return false;
           }
-          if (!auto_limit_feature.empty() &&
-            feature_writable(camera_, auto_limit_feature.c_str()))
-          {
-            GError * limit_error = nullptr;
-            arv_camera_set_boolean(camera_, auto_limit_feature.c_str(), false, &limit_error);
-            if (limit_error != nullptr) {
-              cadence_limit_reason_ = auto_limit_feature + " rejected false: " +
-                limit_error->message;
-              g_error_free(limit_error);
+          if (!auto_limit_feature.empty()) {
+            std::string detail;
+            if (!disable_auto_limit_feature(auto_limit_feature, detail)) {
+              cadence_limit_reason_ = detail;
               return false;
             }
           }
@@ -1655,7 +1731,15 @@ private:
           const bool available = arv_camera_is_feature_available(
             camera_, candidate, &feature_error);
           if (feature_error != nullptr) {g_error_free(feature_error); continue;}
-          if (!available || !feature_writable(camera_, candidate)) {continue;}
+          if (!available) {continue;}
+          if (!value) {
+            std::string detail;
+            if (!disable_auto_limit_feature(candidate, detail)) {
+              throw std::runtime_error("setting " + std::string(candidate) + ": " + detail);
+            }
+            return;
+          }
+          if (!feature_writable(camera_, candidate)) {continue;}
           arv_camera_set_boolean(camera_, candidate, value, &feature_error);
           throw_on_error(feature_error, std::string("setting ") + candidate);
           return;

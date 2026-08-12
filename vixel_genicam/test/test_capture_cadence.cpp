@@ -2,6 +2,15 @@
 
 #include <gtest/gtest.h>
 
+TEST(CaptureCadence, RecognizesPortableDisabledEnumerationValues)
+{
+  EXPECT_TRUE(vixel_genicam::disabled_feature_value("Off"));
+  EXPECT_TRUE(vixel_genicam::disabled_feature_value("DISABLED"));
+  EXPECT_TRUE(vixel_genicam::disabled_feature_value("Manual"));
+  EXPECT_FALSE(vixel_genicam::disabled_feature_value("Continuous"));
+  EXPECT_FALSE(vixel_genicam::disabled_feature_value("Once"));
+}
+
 TEST(CaptureCadence, OverlapUsesTheSlowerExposureOrFramePeriod)
 {
   const vixel_genicam::CaptureCadence cadence{
