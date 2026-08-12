@@ -67,6 +67,7 @@ namespace
 using Assignment = vixel_interfaces::msg::ProviderAssignment;
 using Sensor = vixel_interfaces::msg::Sensor;
 using SyncGroup = vixel_interfaces::msg::SyncGroup;
+using ProviderCapture = vixel_interfaces::srv::ProviderCapture;
 
 struct DeviceRecord
 {
@@ -1926,10 +1927,11 @@ public:
         std::placeholders::_2));
     capture_callback_group_ = create_callback_group(
       rclcpp::CallbackGroupType::Reentrant);
-    capture_service_ = create_service<vixel_interfaces::srv::ProviderCapture>(
+    capture_service_ = create_service<ProviderCapture>(
       "capture", std::bind(
-        &GenicamProvider::capture_callback, this, std::placeholders::_1,
-        std::placeholders::_2), rclcpp::ServicesQoS(), capture_callback_group_);
+        &GenicamProvider::defer_capture_callback, this, std::placeholders::_1,
+        std::placeholders::_2, std::placeholders::_3),
+      rclcpp::ServicesQoS(), capture_callback_group_);
     feature_service_ = create_service<vixel_interfaces::srv::GetCameraFeatures>(
       "features", std::bind(
         &GenicamProvider::features_callback, this, std::placeholders::_1,
@@ -1960,6 +1962,42 @@ public:
   }
 
 private:
+  void defer_capture_callback(
+    const std::shared_ptr<rclcpp::Service<ProviderCapture>> service,
+    const std::shared_ptr<rmw_request_id_t> request_header,
+    const std::shared_ptr<ProviderCapture::Request> request)
+  {
+    // A capture waits for its future action time and camera completion. Doing
+    // that on an executor thread starves later requests at short intervals and
+    // lets newer cycles overtake older ones. Defer the response and perform the
+    // bounded wait outside the ROS executor.
+    auto self = std::static_pointer_cast<GenicamProvider>(shared_from_this());
+    std::thread([self, service, request_header, request]() {
+        auto response = std::make_shared<ProviderCapture::Response>();
+        try {
+          self->capture_callback(request, response);
+        } catch (const std::exception & error) {
+          response->success = false;
+          response->message = error.what();
+          RCLCPP_ERROR(
+            self->get_logger(), "Unhandled provider capture failure: %s", error.what());
+        } catch (...) {
+          response->success = false;
+          response->message = "unknown provider capture failure";
+          RCLCPP_ERROR(self->get_logger(), "Unknown provider capture failure");
+        }
+        try {
+          service->send_response(*request_header, *response);
+        } catch (const std::exception & error) {
+          if (rclcpp::ok(self->get_node_base_interface()->get_context())) {
+            RCLCPP_WARN(
+              self->get_logger(), "Unable to send provider capture response: %s",
+              error.what());
+          }
+        }
+      }).detach();
+  }
+
   bool vendor_allowed(const std::string & vendor) const
   {
     if (config_.vendor_allowlist.empty()) {return true;}
@@ -2726,7 +2764,7 @@ private:
   rclcpp::Publisher<vixel_interfaces::msg::SyncGroupArray>::SharedPtr group_publisher_;
   rclcpp::Subscription<vixel_interfaces::msg::ProviderAssignmentArray>::SharedPtr assignment_subscription_;
   rclcpp::Service<vixel_interfaces::srv::ProvisionSensor>::SharedPtr provision_service_;
-  rclcpp::Service<vixel_interfaces::srv::ProviderCapture>::SharedPtr capture_service_;
+  rclcpp::Service<ProviderCapture>::SharedPtr capture_service_;
   rclcpp::CallbackGroup::SharedPtr capture_callback_group_;
   rclcpp::Service<vixel_interfaces::srv::GetCameraFeatures>::SharedPtr feature_service_;
   rclcpp::TimerBase::SharedPtr startup_timer_;

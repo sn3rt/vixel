@@ -346,7 +346,7 @@ public:
     }
     capture_client_ = create_client<CaptureGroup>("/vixel/capture_group");
     capture_callback_group_ = create_callback_group(
-      rclcpp::CallbackGroupType::Reentrant, false);
+      rclcpp::CallbackGroupType::Reentrant);
     records_publisher_ = create_publisher<vixel_interfaces::msg::CaptureRecordArray>(
       "/vixel/capture_records", state_qos);
     action_server_ = rclcpp_action::create_server<RecordCapture>(
