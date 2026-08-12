@@ -42,6 +42,7 @@ struct GenicamConfig
   int ptp_action_lead_time_ms{100};
   int encode_queue_depth{8};
   int capture_png_compression{1};
+  int cadence_safety_margin_ms{10};
   std::int64_t ptp_tolerance_ns{100000};
   std::uint32_t action_device_key{1};
   int preview_width{960};

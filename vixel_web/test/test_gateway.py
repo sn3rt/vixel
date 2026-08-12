@@ -45,6 +45,13 @@ def test_group_ptp_locking_members_are_exposed_as_json():
         locking_member_ids=["camera_b"],
         unsynchronized_member_ids=[],
         max_ptp_offset_ns=1200,
+        requested_capture_interval_ms=200,
+        cadence_configured=True,
+        cadence_ready=True,
+        minimum_capture_interval_ms=192,
+        maximum_capture_rate_hz=5.208333,
+        action_queue_size=4,
+        cadence_limit_reason="camera_b: frame period requires 182 ms plus 10 ms margin",
         ready=False,
         online_member_ids=["camera_a", "camera_b"],
         missing_member_ids=[],
@@ -56,6 +63,11 @@ def test_group_ptp_locking_members_are_exposed_as_json():
     assert value["locking_member_ids"] == ["camera_b"]
     assert value["ready"] is False
     assert value["synchronization_method"] == "ptp_relocking"
+    assert value["requested_capture_interval_ms"] == 200
+    assert value["cadence_configured"] is True
+    assert value["cadence_ready"] is True
+    assert value["minimum_capture_interval_ms"] == 192
+    assert value["action_queue_size"] == 4
 
 
 def test_capture_record_is_exposed_as_json():

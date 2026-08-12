@@ -1,0 +1,5 @@
+string[] group_ids
+uint32 interval_ms
+---
+bool accepted
+string message

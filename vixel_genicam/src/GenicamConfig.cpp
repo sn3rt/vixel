@@ -98,6 +98,12 @@ GenicamConfig load_genicam_config(const std::string & path)
     throw std::runtime_error(
             "providers.genicam.capture_png_compression must be between 0 and 9");
   }
+  config.cadence_safety_margin_ms = read_or(
+    provider, "cadence_safety_margin_ms", config.cadence_safety_margin_ms);
+  if (config.cadence_safety_margin_ms < 0 || config.cadence_safety_margin_ms > 100) {
+    throw std::runtime_error(
+            "providers.genicam.cadence_safety_margin_ms must be between 0 and 100");
+  }
   config.software_trigger_lead_time_ms = read_or(
     provider, "software_trigger_lead_time_ms", config.software_trigger_lead_time_ms);
   if (config.software_trigger_lead_time_ms < 1 ||

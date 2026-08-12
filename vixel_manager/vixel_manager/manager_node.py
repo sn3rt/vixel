@@ -36,6 +36,7 @@ from vixel_interfaces.srv import (
     CaptureGroup,
     DeleteSyncGroup,
     ForgetSensor,
+    PrepareCaptureGroups,
     PurgeKnownSensor,
     ProviderCapture,
     ProvisionSensor,
@@ -65,11 +66,14 @@ STATE_QOS = QoSProfile(
 
 
 def _provider_group_is_current(
-    provider_message: SyncGroup | None, members: list[str], requested_mode: str
+    provider_message: SyncGroup | None, members: list[str], requested_mode: str,
+    requested_capture_interval_ms: int = 0,
 ) -> bool:
     return bool(
         provider_message
         and provider_message.operating_mode == requested_mode
+        and int(getattr(provider_message, "requested_capture_interval_ms", 0))
+        == requested_capture_interval_ms
         and set(provider_message.member_ids) == set(members)
     )
 
@@ -173,6 +177,7 @@ class InventoryManager(Node):
         self.provider_groups: dict[str, SyncGroup] = {}
         self.sensor_modes: dict[str, str] = {}
         self.group_modes: dict[str, str] = {}
+        self.group_capture_intervals: dict[str, int] = {}
         self.provider_subscriptions = []
         self.assignment_publishers = {}
         self.provision_clients = {}
@@ -233,6 +238,12 @@ class InventoryManager(Node):
             SetOperatingMode,
             "set_operating_mode",
             self._set_mode,
+            callback_group=self.callback_group,
+        )
+        self.prepare_capture_groups_service = self.create_service(
+            PrepareCaptureGroups,
+            "prepare_capture_groups",
+            self._prepare_capture_groups,
             callback_group=self.callback_group,
         )
         self.upsert_group_service = self.create_service(
@@ -682,12 +693,13 @@ class InventoryManager(Node):
     def _sync_group_message(self, group_id: str, record: dict[str, Any]) -> SyncGroup:
         provider_message = self.provider_groups.get(group_id)
         requested_mode = self.group_modes.get(group_id, self.default_group_mode)
+        requested_interval = self.group_capture_intervals.get(group_id, 0)
         # A provider status from the previous operating mode can remain latched
         # while its camera sessions are being restarted.  Do not relabel that
         # stale status with the new mode: doing so briefly made a capture button
         # available before any of the new capture sessions existed.
         if _provider_group_is_current(
-            provider_message, list(record["members"]), requested_mode
+            provider_message, list(record["members"]), requested_mode, requested_interval
         ):
             return provider_message
         result = SyncGroup()
@@ -699,6 +711,9 @@ class InventoryManager(Node):
         result.trigger_source = "Action0"
         result.operating_mode = requested_mode
         result.preview_rate_hz = float(record["preview_rate_hz"])
+        result.requested_capture_interval_ms = requested_interval
+        result.cadence_configured = requested_interval == 0
+        result.cadence_ready = requested_interval == 0
         result.preferred_master_id = ""
         result.online_member_ids = [
             member for member in result.member_ids
@@ -707,9 +722,9 @@ class InventoryManager(Node):
         result.missing_member_ids = [
             member for member in result.member_ids if member not in result.online_member_ids
         ]
-        result.ready = result.operating_mode == "idle" or (
+        result.ready = result.cadence_ready and (result.operating_mode == "idle" or (
             not result.missing_member_ids or result.missing_policy == "degraded"
-        )
+        ))
         return result
 
     def _publish_state(self) -> None:
@@ -893,6 +908,10 @@ class InventoryManager(Node):
             )
             assignment.preview_rate_hz = float(
                 group.get("preview_rate_hz", self.registry.machine["defaults"]["preview_rate_hz"])
+            )
+            assignment.requested_capture_interval_ms = (
+                self.group_capture_intervals.get(group_id, 0)
+                if group_id and assignment.operating_mode == "capture" else 0
             )
             known = snapshot["known_sensors"].get(sensor_id, {})
             provider_config = self.registry.machine["providers"].get(runtime_provider, {})
@@ -1351,6 +1370,7 @@ class InventoryManager(Node):
                 if request.target_id not in self.registry.inventory["sync_groups"]:
                     raise RegistryError(f"unknown sync group {request.target_id}")
                 self.group_modes[request.target_id] = request.mode
+                self.group_capture_intervals[request.target_id] = 0
             elif request.target_kind == "sensor":
                 if request.target_id not in self.registry.inventory["sensors"]:
                     raise RegistryError(f"unknown sensor {request.target_id}")
@@ -1371,6 +1391,33 @@ class InventoryManager(Node):
             response.message = str(error)
         return response
 
+    def _prepare_capture_groups(self, request, response):
+        try:
+            if request.interval_ms < 100 or request.interval_ms > 86_400_000:
+                raise RegistryError("interval_ms must be between 100 and 86400000")
+            group_ids = list(request.group_ids)
+            if not group_ids:
+                raise RegistryError("at least one synchronization group is required")
+            if len(set(group_ids)) != len(group_ids):
+                raise RegistryError("group_ids contains a duplicate")
+            for group_id in group_ids:
+                if group_id not in self.registry.inventory["sync_groups"]:
+                    raise RegistryError(f"unknown sync group {group_id}")
+            with self.lock:
+                for group_id in group_ids:
+                    self.group_modes[group_id] = "capture"
+                    self.group_capture_intervals[group_id] = int(request.interval_ms)
+                self.generation += 1
+            response.accepted = True
+            response.message = (
+                f"Preparing {len(group_ids)} group(s) for {request.interval_ms} ms capture"
+            )
+            self._publish_state()
+        except RegistryError as error:
+            response.accepted = False
+            response.message = str(error)
+        return response
+
     def _upsert_group(self, request, response):
         try:
             self.registry.upsert_group(
@@ -1383,6 +1430,7 @@ class InventoryManager(Node):
                 "",
             )
             self.group_modes.setdefault(request.group_id, self.default_group_mode)
+            self.group_capture_intervals.setdefault(request.group_id, 0)
             with self.lock:
                 self.generation += 1
             response.success = True
@@ -1402,6 +1450,7 @@ class InventoryManager(Node):
                 raise RegistryError("set the group to idle before deleting it")
             self.registry.delete_group(request.group_id)
             self.group_modes.pop(request.group_id, None)
+            self.group_capture_intervals.pop(request.group_id, None)
             with self.lock:
                 self.generation += 1
             response.success = True

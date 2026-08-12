@@ -42,6 +42,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/GetCameraFeatures.srv"
   "srv/SubmitCaptureBatch.srv"
   "srv/StartCaptureSequence.srv"
+  "srv/PrepareCaptureGroups.srv"
   "srv/GetCaptureOperation.srv"
   "srv/CancelCaptureOperation.srv"
   "srv/ReloadCameraProfiles.srv"

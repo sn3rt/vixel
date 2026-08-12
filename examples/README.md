@@ -77,12 +77,14 @@ python3 examples/http_trigger_groups_periodic.py \
   front back --interval 2 --mode save
 ```
 
-The periodic helper first requests capture mode for every named group and waits
-until all cameras are online, armed, synchronization-ready, and—when automatic
-exposure or gain is enabled—have returned a clean initial metering frame. The
-wait defaults to 60 seconds and can be changed with `--ready-timeout`.
+In publish mode, the helper first requests capture mode for every named group
+and waits until the cameras are ready; `--ready-timeout` changes the default
+60-second wait. Save mode submits one server-managed sequence immediately. The
+server moves the groups to capture mode, applies an exposure ceiling derived
+from `--interval`, waits for camera/PTP/metering readiness, and only then starts
+the sequence. It reports a preparation failure without firing a trigger when a
+camera cannot support that cadence.
 
-Save mode submits one server-managed sequence and polls its operation status.
 Use `--interval 0.5 --count 10` for ten 2 Hz cycles. All listed groups share
 each cycle's requested PTP timestamp, while each group keeps its own directory
 and manifest. Camera acquisition continues on schedule while previous PNGs are

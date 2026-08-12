@@ -13,6 +13,13 @@ string[] synchronized_member_ids
 string[] locking_member_ids
 string[] unsynchronized_member_ids
 int64 max_ptp_offset_ns
+uint32 requested_capture_interval_ms
+bool cadence_configured
+bool cadence_ready
+uint32 minimum_capture_interval_ms
+float64 maximum_capture_rate_hz
+uint32 action_queue_size
+string cadence_limit_reason
 bool ready
 string[] online_member_ids
 string[] missing_member_ids

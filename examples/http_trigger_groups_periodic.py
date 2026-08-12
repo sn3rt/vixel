@@ -109,11 +109,14 @@ def api_request(
 
 
 def set_group_capture_mode(
-    base_url: str, group_id: str, timeout: float,
+    base_url: str, group_id: str, timeout: float, interval: float,
 ) -> dict[str, Any]:
     return api_request(
         base_url, "/api/v1/mode", timeout,
-        {"target_kind": "group", "target_id": group_id, "mode": "capture"},
+        {
+            "target_kind": "group", "target_id": group_id, "mode": "capture",
+            "capture_interval_ms": round(interval * 1000),
+        },
     )
 
 
@@ -141,9 +144,10 @@ def group_readiness(group: dict[str, Any] | None) -> str:
 
 def prepare_capture_groups(
     base_url: str, groups: list[str], timeout: float, ready_timeout: float,
+    interval: float,
 ) -> None:
     for group_id in groups:
-        set_group_capture_mode(base_url, group_id, timeout)
+        set_group_capture_mode(base_url, group_id, timeout, interval)
     print(f"capture mode requested for: {','.join(groups)}")
 
     deadline = time.monotonic() + ready_timeout
@@ -269,15 +273,17 @@ def main(argv: list[str] | None = None) -> int:
     request_prefix = args.request_prefix or time.strftime(
         "periodic_%Y%m%dT%H%M%SZ", time.gmtime()
     )
-    try:
-        prepare_capture_groups(
-            args.base_url, args.group_ids, args.timeout, args.ready_timeout
-        )
-    except KeyboardInterrupt:
-        return 0
-    except (RuntimeError, ValueError, KeyError) as error:
-        print(f"Could not prepare capture groups: {error}", file=sys.stderr)
-        return 1
+    if args.mode == "publish":
+        try:
+            prepare_capture_groups(
+                args.base_url, args.group_ids, args.timeout, args.ready_timeout,
+                args.interval,
+            )
+        except KeyboardInterrupt:
+            return 0
+        except (RuntimeError, ValueError, KeyError) as error:
+            print(f"Could not prepare capture groups: {error}", file=sys.stderr)
+            return 1
     if args.mode == "save":
         operation_id = ""
         try:

@@ -41,6 +41,7 @@ from vixel_interfaces.srv import (
     DeleteSyncGroup,
     ForgetSensor,
     GetCaptureOperation,
+    PrepareCaptureGroups,
     PurgeKnownSensor,
     SetOperatingMode,
     SetPortMode,
@@ -198,6 +199,19 @@ def group_to_dict(group) -> dict[str, Any]:
         "locking_member_ids": list(group.locking_member_ids),
         "unsynchronized_member_ids": list(group.unsynchronized_member_ids),
         "max_ptp_offset_ns": int(group.max_ptp_offset_ns),
+        "requested_capture_interval_ms": int(
+            getattr(group, "requested_capture_interval_ms", 0)
+        ),
+        "cadence_configured": bool(getattr(group, "cadence_configured", False)),
+        "cadence_ready": bool(getattr(group, "cadence_ready", False)),
+        "minimum_capture_interval_ms": int(
+            getattr(group, "minimum_capture_interval_ms", 0)
+        ),
+        "maximum_capture_rate_hz": float(
+            getattr(group, "maximum_capture_rate_hz", 0.0)
+        ),
+        "action_queue_size": int(getattr(group, "action_queue_size", 0)),
+        "cadence_limit_reason": getattr(group, "cadence_limit_reason", ""),
         "ready": group.ready,
         "online_member_ids": list(group.online_member_ids),
         "missing_member_ids": list(group.missing_member_ids),
@@ -368,6 +382,10 @@ class GatewayNode(Node):
         )
         self.mode_client = self.create_client(
             SetOperatingMode, "/vixel/set_operating_mode", callback_group=self.callback_group
+        )
+        self.prepare_capture_groups_client = self.create_client(
+            PrepareCaptureGroups, "/vixel/prepare_capture_groups",
+            callback_group=self.callback_group
         )
         self.port_mode_client = self.create_client(
             SetPortMode, "/vixel/set_port_mode", callback_group=self.callback_group
@@ -1129,12 +1147,24 @@ class Handler(BaseHTTPRequestHandler):
             ):
                 self._json(HTTPStatus.OK, node.purge_known_sensor(parts[3]))
             elif method == "POST" and parsed.path == "/api/v1/mode":
-                request = SetOperatingMode.Request()
-                request.target_kind = str(body.get("target_kind", ""))
-                request.target_id = str(body.get("target_id", ""))
-                request.mode = str(body.get("mode", ""))
-                response = node.call_service(node.mode_client, request)
-                self._json(HTTPStatus.OK, {"success": response.success, "message": response.message})
+                target_kind = str(body.get("target_kind", ""))
+                target_id = str(body.get("target_id", ""))
+                mode = str(body.get("mode", ""))
+                interval_ms = int(body.get("capture_interval_ms", 0))
+                if target_kind == "group" and mode == "capture" and interval_ms > 0:
+                    request = PrepareCaptureGroups.Request()
+                    request.group_ids = [target_id]
+                    request.interval_ms = interval_ms
+                    response = node.call_service(node.prepare_capture_groups_client, request)
+                    success = response.accepted
+                else:
+                    request = SetOperatingMode.Request()
+                    request.target_kind = target_kind
+                    request.target_id = target_id
+                    request.mode = mode
+                    response = node.call_service(node.mode_client, request)
+                    success = response.success
+                self._json(HTTPStatus.OK, {"success": success, "message": response.message})
             elif method == "PUT" and len(parts) == 5 and parts[:3] == ["api", "v1", "ports"] and parts[4] == "mode":
                 self._json(HTTPStatus.OK, node.set_port_mode(parts[3], body))
             elif method == "PUT" and len(parts) == 4 and parts[:3] == ["api", "v1", "groups"]:

@@ -29,6 +29,8 @@ recording:
   root_directory: /var/lib/vixel/captures
   minimum_free_bytes: 5368709120
   capture_timeout_ms: 10000
+  sequence_prepare_timeout_ms: 60000
+  sequence_dispatch_lead_ms: 150
   recent_limit: 100
   max_inflight_captures: 32
   gps:
@@ -47,6 +49,15 @@ sequence stops scheduling new exposures at this limit and drains everything
 already accepted. GPS is optional and never delays a capture; a recent valid
 ROS 2 `sensor_msgs/NavSatFix` is copied into the manifest when enabled. ROS 1
 GPS publishers can be exposed through `ros1_bridge`.
+
+`sequence_prepare_timeout_ms` covers capture-mode configuration, camera
+restart, PTP relock, and the first clean automatic-metering frame. Sequence
+preparation fails without firing a trigger if the requested cadence cannot be
+configured before this timeout.
+
+`sequence_dispatch_lead_ms` controls how early a managed sequence sends its
+scheduled PTP actions. Vixel bounds that lead by the smallest reported camera
+action queue, assuming one entry when `ActionQueueSize` is unavailable.
 
 ## Portable camera settings
 
@@ -72,6 +83,7 @@ portable settings include:
   "height": 1536,
   "exposure_auto": "Off",
   "exposure_us": 1500.0,
+  "exposure_auto_limit_auto": false,
   "exposure_auto_upper_us": 10000.0,
   "gain_auto": "Off",
   "gain_db": 2.0,
@@ -82,6 +94,7 @@ portable settings include:
   "frame_rate_hz": 4.0,
   "packet_size": 9000,
   "packet_delay_ns": 100000,
+  "trigger_overlap": "PreviousFrame",
   "trigger_source": "FreeRun",
   "transfer_control_mode": "Basic"
 }
@@ -98,6 +111,36 @@ simultaneous full-resolution streams from overrunning a shared PCIe uplink.
 Machines with independently provisioned NIC bandwidth may lower it after
 checking the NIC drop counters under simultaneous capture.
 
+Managed sequences derive camera limits from their requested interval; no
+camera-model or rate-specific profile is needed. For example, a 200 ms
+sequence with the default 10 ms safety margin caps exposure at no more than
+190 ms, with a smaller ceiling when exposure and sensor readout cannot overlap.
+Manual `ExposureTime` is clamped to that ceiling. Automatic exposure uses a
+readable upper-limit node; because that node is not standardized by SFNC,
+Vixel probes known aliases and accepts `exposure_auto_upper_feature` and
+`exposure_auto_limit_auto_feature` overrides. If automatic exposure cannot be
+bounded, preparation is rejected before cycle one instead of risking skipped
+or incorrectly exposed frames.
+
+`trigger_overlap` is capability-driven and optional. If no explicit override
+is present and a sequence requests a cadence, Vixel prefers `PreviousFrame`
+and then `ReadOut` from the camera's advertised `TriggerOverlap` values.
+Unsupported cameras keep their current behavior and advertise a safe cadence
+that includes exposure plus readout. The strictest group member determines
+whether the sequence can start.
+
+`providers.genicam.cadence_safety_margin_ms` sets the reserved time subtracted
+from every sequence period; it defaults to 10 ms. This protects the trigger
+boundary from camera/transport jitter and is applied uniformly to every
+GenICam camera.
+
+Sequence negotiation does not silently lower `packet_delay_ns`: that value is
+a link-capacity policy and reducing it can overload cameras that share a NIC or
+PCIe uplink. If the camera reports that readout still cannot fit the requested
+period, preparation names that physical cadence limit. Installations with
+dedicated camera links can lower the managed-network packet delay in
+`machine.yaml` independently of camera brand.
+
 Grouped cameras automatically request `Action0` and PTP; there is no group
 trigger-source selector. Cameras without the required nodes fall back to the
 software barrier and remain part of the group, with their result marked
@@ -111,8 +154,16 @@ update camera auto-exposure/gain, so metering yields whenever a sequence is
 running. A group becomes capture-ready only after every automatic camera has
 returned one clean initial metering frame. Scheduled frames are matched to their
 PTP action timestamp; an old metering frame can never be relabelled as a later
-saved capture. The upper-limit settings keep automatic exposure from exceeding
-the motion/cadence budget.
+saved capture. Static upper-limit settings remain useful as a tighter image
+quality or motion limit; the sequence-derived limit never relaxes a configured
+`exposure_auto_upper_us` ceiling.
+
+The live feature service reports cadence-related nodes when available:
+`TriggerOverlap`, `TriggerArmed`, `ActionQueueSize`,
+`ExposureAutoUpperLimit` (or its known alias), and the synthetic nanosecond
+`PacketDelayNs` readback. Synchronization-group status reports the calculated
+minimum interval, maximum reliable rate, limiting camera/reason, and smallest
+action queue.
 
 `providers.genicam.software_trigger_lead_time_ms` controls the short interval
 between arming all group workers and releasing their software triggers. It

@@ -131,9 +131,12 @@ python3 examples/http_trigger_groups_periodic.py \
   front back --interval 0.5 --mode save --count 10
 ```
 
-This helper requests capture mode for both groups and waits for the cameras and
-PTP synchronization to report ready before it submits the sequence. Use
-`--ready-timeout` to change the default 60-second startup deadline.
+The server accepts the request in a `preparing` state, atomically reserves both
+groups, requests capture mode with the 500 ms interval, and waits for camera,
+cadence, PTP, and automatic-metering readiness. Only then does it schedule the
+first cycle. A camera that cannot bound automatic exposure or cannot meet the
+interval fails preparation before any trigger is fired. The preparation
+deadline is configured with `recording.sequence_prepare_timeout_ms`.
 
 Each cycle creates a separate capture directory and manifest per group. The
 example requests one shared timestamp for every included group. The requested
@@ -190,8 +193,10 @@ exposes the same operation at `POST /api/v1/groups/<group_id>/trigger`; saved
 capture remains at `POST /api/v1/groups/<group_id>/capture`.
 
 Asynchronous recording uses `/vixel/submit_capture_batch` and
-`/vixel/start_capture_sequence`; operation status and cancellation use
-`/vixel/get_capture_operation` and `/vixel/cancel_capture_operation`. Caller
+`/vixel/start_capture_sequence`; the recorder coordinates sequence setup with
+the internal `/vixel/prepare_capture_groups` service. Operation status and
+cancellation use `/vixel/get_capture_operation` and
+`/vixel/cancel_capture_operation`. Caller
 metadata is stored as a JSON object in every resulting manifest. Optional GPS
 metadata is sampled without waiting for a fix.
 

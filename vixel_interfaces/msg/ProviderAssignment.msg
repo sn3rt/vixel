@@ -15,4 +15,5 @@ string group_trigger_source
 string preferred_master_id
 string operating_mode
 float64 preview_rate_hz
+uint32 requested_capture_interval_ms
 string provider_settings_json

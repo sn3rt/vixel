@@ -49,6 +49,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_genicam_config genicam_config yaml-cpp)
   ament_add_gtest(test_frame_timestamp test/test_frame_timestamp.cpp)
   target_include_directories(test_frame_timestamp PRIVATE include)
+  ament_add_gtest(test_capture_cadence test/test_capture_cadence.cpp)
+  target_include_directories(test_capture_cadence PRIVATE include)
 endif()
 
 ament_package()

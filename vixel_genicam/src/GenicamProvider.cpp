@@ -1,3 +1,4 @@
+#include "vixel_genicam/CaptureCadence.hpp"
 #include "vixel_genicam/GenicamConfig.hpp"
 #include "vixel_genicam/FrameTimestamp.hpp"
 
@@ -247,6 +248,13 @@ bool feature_writable(ArvCamera * camera, const char * feature)
   const auto access = arv_device_get_feature_access_mode(
     arv_camera_get_device(camera), feature);
   return access == ARV_GC_ACCESS_MODE_WO || access == ARV_GC_ACCESS_MODE_RW;
+}
+
+bool feature_readable(ArvCamera * camera, const char * feature)
+{
+  const auto access = arv_device_get_feature_access_mode(
+    arv_camera_get_device(camera), feature);
+  return access == ARV_GC_ACCESS_MODE_RO || access == ARV_GC_ACCESS_MODE_RW;
 }
 
 std::string error_text(GError * error, const std::string & context)
@@ -896,6 +904,18 @@ public:
     throw_on_error(error, "opening GenICam camera " + record_.serial);
     if (camera_ == nullptr) {throw std::runtime_error("Aravis returned no camera");}
     apply_configuration();
+    RCLCPP_INFO(
+      node_->get_logger(),
+      "%s capture cadence: requested=%u ms maximum_rate=%.6f Hz "
+      "exposure_budget=%.3f ms overlap=%s minimum_interval=%u ms "
+      "ready=%s action_queue=%u packet_delay=%lld ns",
+      assignment_.sensor_id.c_str(), cadence_.requested_interval_ms,
+      cadence_.maximum_frame_rate_hz,
+      cadence_.exposure_budget_us / 1000.0,
+      trigger_overlap_value_.empty() ? "unavailable" : trigger_overlap_value_.c_str(),
+      minimum_capture_interval_ms_, cadence_ready_ ? "true" : "false",
+      cadence_.action_queue_size,
+      static_cast<long long>(packet_delay_ns_));
 
     error = nullptr;
     stream_ = arv_camera_create_stream(camera_, nullptr, nullptr, &error);
@@ -1022,6 +1042,14 @@ public:
   bool capture_primed() const {return capture_primed_.load();}
   bool software_trigger() const {return software_trigger_;}
   bool ptp_action() const {return ptp_action_;}
+  std::uint32_t minimum_capture_interval_ms() const
+  {
+    return minimum_capture_interval_ms_;
+  }
+  std::uint32_t action_queue_size() const {return cadence_.action_queue_size;}
+  bool cadence_configured() const {return cadence_configured_;}
+  bool cadence_ready() const {return cadence_ready_;}
+  const std::string & cadence_limit_reason() const {return cadence_limit_reason_;}
   const NetworkConfig & network() const {return network_;}
   std::int64_t ptp_offset_ns()
   {
@@ -1117,6 +1145,13 @@ public:
     add_enum_feature(result, "PixelFormat");
     add_enum_feature(result, "ExposureAuto");
     add_enum_feature(result, "GainAuto");
+    add_enum_feature(result, "TriggerOverlap");
+    add_boolean_feature(result, "TriggerArmed");
+    add_boolean_feature(result, "ExposureAutoLimitAuto");
+    add_integer_feature(result, "ActionQueueSize", "commands");
+    add_float_feature(result, "ExposureAutoUpperLimit", "us");
+    add_float_feature(result, "AutoExposureTimeUpperLimit", "us");
+    add_packet_delay_feature(result);
     return result;
   }
 
@@ -1204,6 +1239,355 @@ private:
     return {};
   }
 
+  std::optional<double> read_numeric_feature(
+    std::initializer_list<const char *> candidates)
+  {
+    const auto name = first_available_feature(candidates);
+    return read_numeric_feature(name);
+  }
+
+  std::optional<double> read_numeric_feature(const std::string & name)
+  {
+    if (name.empty() || !feature_readable(camera_, name.c_str())) {return std::nullopt;}
+    GError * error = nullptr;
+    const auto floating = arv_camera_get_float(camera_, name.c_str(), &error);
+    if (error == nullptr) {return floating;}
+    g_error_free(error);
+    error = nullptr;
+    const auto integer = arv_camera_get_integer(camera_, name.c_str(), &error);
+    if (error == nullptr) {return static_cast<double>(integer);}
+    g_error_free(error);
+    return std::nullopt;
+  }
+
+  bool write_numeric_feature(const std::string & name, double value, std::string & detail)
+  {
+    if (name.empty() || !feature_writable(camera_, name.c_str())) {
+      detail = name.empty() ? "feature is unavailable" : name + " is not writable";
+      return false;
+    }
+    GError * error = nullptr;
+    arv_camera_set_float(camera_, name.c_str(), value, &error);
+    if (error == nullptr) {return true;}
+    g_error_free(error);
+    error = nullptr;
+    arv_camera_set_integer(
+      camera_, name.c_str(), static_cast<std::int64_t>(std::llround(value)), &error);
+    if (error == nullptr) {return true;}
+    detail = name + " rejected the calculated limit: " + error->message;
+    g_error_free(error);
+    return false;
+  }
+
+  std::string configured_feature(
+    const YAML::Node & settings, const char * setting_name,
+    std::initializer_list<const char *> candidates)
+  {
+    if (settings && settings[setting_name]) {
+      const auto requested = settings[setting_name].as<std::string>();
+      GError * error = nullptr;
+      const bool available = arv_camera_is_feature_available(
+        camera_, requested.c_str(), &error);
+      if (error != nullptr) {g_error_free(error);}
+      return available ? requested : std::string{};
+    }
+    return first_available_feature(candidates);
+  }
+
+  void read_trigger_overlap(const std::string & feature)
+  {
+    if (feature.empty()) {
+      trigger_overlap_value_.clear();
+      cadence_.trigger_overlap = false;
+      return;
+    }
+    GError * error = nullptr;
+    trigger_overlap_value_ = value_or_empty(
+      arv_camera_get_string(camera_, feature.c_str(), &error));
+    if (error != nullptr) {
+      g_error_free(error);
+      trigger_overlap_value_.clear();
+    }
+    const auto normalized = lower(trigger_overlap_value_);
+    cadence_.trigger_overlap = !normalized.empty() && normalized != "off" &&
+      normalized != "none";
+  }
+
+  void configure_trigger_overlap(const YAML::Node & settings)
+  {
+    const auto feature = first_available_feature({"TriggerOverlap"});
+    if (feature.empty()) {
+      trigger_overlap_value_.clear();
+      cadence_.trigger_overlap = false;
+      if ((settings && settings["trigger_overlap"]) ||
+        assignment_.requested_capture_interval_ms != 0)
+      {
+        RCLCPP_WARN(
+          node_->get_logger(),
+          "%s does not expose TriggerOverlap; high-rate cadence will include full readout",
+          assignment_.sensor_id.c_str());
+      }
+      return;
+    }
+    GError * error = nullptr;
+    guint count = 0;
+    const auto values = arv_camera_dup_available_enumerations_as_strings(
+      camera_, feature.c_str(), &count, &error);
+    std::vector<std::string> available;
+    if (error == nullptr) {
+      for (guint index = 0; values != nullptr && index < count; ++index) {
+        available.push_back(value_or_empty(values[index]));
+      }
+    } else {
+      g_error_free(error);
+      error = nullptr;
+    }
+    g_free(values);
+
+    std::string requested;
+    if (settings && settings["trigger_overlap"]) {
+      requested = settings["trigger_overlap"].as<std::string>();
+    } else if (assignment_.requested_capture_interval_ms != 0) {
+      for (const auto & preferred : {std::string("PreviousFrame"), std::string("ReadOut")}) {
+        const auto found = std::find_if(
+          available.begin(), available.end(), [&preferred](const auto & candidate) {
+            return lower(candidate) == lower(preferred);
+          });
+        if (found != available.end()) {requested = *found; break;}
+      }
+    }
+    if (!requested.empty()) {
+      const auto found = std::find_if(
+        available.begin(), available.end(), [&requested](const auto & candidate) {
+          return lower(candidate) == lower(requested);
+        });
+      const auto selected = found == available.end() ? std::string{} : *found;
+      if (selected.empty() || !feature_writable(camera_, feature.c_str())) {
+        RCLCPP_WARN(
+          node_->get_logger(), "%s cannot apply TriggerOverlap=%s; keeping camera value",
+          assignment_.sensor_id.c_str(), requested.c_str());
+      } else {
+        arv_camera_set_string(camera_, feature.c_str(), selected.c_str(), &error);
+        if (error != nullptr) {
+          RCLCPP_WARN(
+            node_->get_logger(), "%s rejected TriggerOverlap=%s: %s",
+            assignment_.sensor_id.c_str(), selected.c_str(), error->message);
+          g_error_free(error);
+          error = nullptr;
+        }
+      }
+    }
+    read_trigger_overlap(feature);
+  }
+
+  void configure_capture_cadence(const YAML::Node & settings)
+  {
+    cadence_.requested_interval_ms = assignment_.requested_capture_interval_ms;
+    cadence_.safety_margin_ms = static_cast<std::uint32_t>(config_.cadence_safety_margin_ms);
+    cadence_configured_ = true;
+    cadence_ready_ = cadence_.requested_interval_ms == 0;
+    cadence_limit_reason_.clear();
+
+    GError * error = nullptr;
+    const auto requested_period_us =
+      static_cast<double>(cadence_.requested_interval_ms) * 1000.0;
+    const auto margin_us = static_cast<double>(cadence_.safety_margin_ms) * 1000.0;
+    const auto preliminary_limit_us = requested_period_us - margin_us;
+    const auto automatic = exposure_auto_enabled_;
+    const auto auto_upper_feature = configured_feature(
+      settings, "exposure_auto_upper_feature",
+      {"ExposureAutoUpperLimit", "AutoExposureTimeUpperLimit"});
+    const auto auto_limit_feature = configured_feature(
+      settings, "exposure_auto_limit_auto_feature", {"ExposureAutoLimitAuto"});
+
+    auto apply_exposure_limit = [&](double limit_us) -> bool {
+        if (automatic) {
+          if (auto_upper_feature.empty()) {
+            cadence_limit_reason_ =
+              "automatic exposure has no readable upper-limit feature; use manual exposure "
+              "or configure exposure_auto_upper_feature";
+            return false;
+          }
+          if (!auto_limit_feature.empty() &&
+            feature_writable(camera_, auto_limit_feature.c_str()))
+          {
+            GError * limit_error = nullptr;
+            arv_camera_set_boolean(camera_, auto_limit_feature.c_str(), false, &limit_error);
+            if (limit_error != nullptr) {
+              cadence_limit_reason_ = auto_limit_feature + " rejected false: " +
+                limit_error->message;
+              g_error_free(limit_error);
+              return false;
+            }
+          }
+          double desired = limit_us;
+          if (settings && settings["exposure_auto_upper_us"]) {
+            desired = std::min(desired, settings["exposure_auto_upper_us"].as<double>());
+          }
+          std::string detail;
+          if (feature_writable(camera_, auto_upper_feature.c_str())) {
+            if (!write_numeric_feature(auto_upper_feature, desired, detail)) {
+              cadence_limit_reason_ = detail;
+              return false;
+            }
+          } else {
+            const auto current = read_numeric_feature(auto_upper_feature);
+            if (!current || *current > desired) {
+              cadence_limit_reason_ = auto_upper_feature +
+                " is not writable and its current value exceeds the calculated budget";
+              return false;
+            }
+          }
+          const auto applied = read_numeric_feature(auto_upper_feature);
+          if (!applied) {
+            cadence_limit_reason_ = auto_upper_feature + " cannot be read back";
+            return false;
+          }
+          cadence_.exposure_budget_us = *applied;
+          if (*applied > desired + 1.0) {
+            cadence_limit_reason_ = auto_upper_feature + " readback exceeds calculated budget";
+            return false;
+          }
+          return true;
+        }
+
+        const auto current = arv_camera_get_exposure_time(camera_, &error);
+        if (error != nullptr) {
+          cadence_limit_reason_ = "ExposureTime cannot be read: " +
+            std::string(error->message);
+          g_error_free(error);
+          error = nullptr;
+          return false;
+        }
+        const auto desired = std::min(current, limit_us);
+        if (desired < current) {
+          arv_camera_set_exposure_time(camera_, desired, &error);
+          if (error != nullptr) {
+            cadence_limit_reason_ = "ExposureTime cannot be clamped: " +
+              std::string(error->message);
+            g_error_free(error);
+            error = nullptr;
+            return false;
+          }
+          RCLCPP_INFO(
+            node_->get_logger(), "%s clamped manual exposure from %.3f to %.3f ms "
+            "for %u ms capture",
+            assignment_.sensor_id.c_str(), current / 1000.0, desired / 1000.0,
+            cadence_.requested_interval_ms);
+        }
+        cadence_.exposure_budget_us = arv_camera_get_exposure_time(camera_, &error);
+        if (error != nullptr) {
+          cadence_limit_reason_ = "ExposureTime readback failed: " +
+            std::string(error->message);
+          g_error_free(error);
+          error = nullptr;
+          return false;
+        }
+        return true;
+      };
+
+    if (cadence_.requested_interval_ms != 0 && preliminary_limit_us <= 0.0) {
+      cadence_limit_reason_ = "requested interval is not larger than the cadence safety margin";
+    } else if (cadence_.requested_interval_ms != 0 &&
+      !apply_exposure_limit(preliminary_limit_us))
+    {
+      // The reason was set by apply_exposure_limit. Keep the camera online so
+      // the group can report an actionable preparation failure.
+    }
+
+    double minimum_rate = 0.0;
+    double maximum_rate = 0.0;
+    arv_camera_get_frame_rate_bounds(camera_, &minimum_rate, &maximum_rate, &error);
+    if (error != nullptr) {
+      g_error_free(error);
+      error = nullptr;
+      maximum_rate = 0.0;
+    }
+    cadence_.maximum_frame_rate_hz = maximum_rate;
+
+    if (cadence_.requested_interval_ms == 0) {
+      if (automatic) {
+        const auto upper = read_numeric_feature(auto_upper_feature);
+        if (upper) {cadence_.exposure_budget_us = *upper;} else {
+          double minimum = 0.0;
+          double maximum = 0.0;
+          arv_camera_get_exposure_time_bounds(camera_, &minimum, &maximum, &error);
+          if (error == nullptr) {cadence_.exposure_budget_us = maximum;} else {
+            g_error_free(error);
+            error = nullptr;
+          }
+        }
+      } else {
+        cadence_.exposure_budget_us = arv_camera_get_exposure_time(camera_, &error);
+        if (error != nullptr) {
+          g_error_free(error);
+          error = nullptr;
+          cadence_.exposure_budget_us = 0.0;
+        }
+      }
+    } else if (cadence_limit_reason_.empty()) {
+      const auto final_limit = capture_exposure_limit_us(cadence_);
+      if (!final_limit) {
+        cadence_limit_reason_ =
+          "camera maximum frame/readout rate cannot satisfy the requested interval";
+      } else if (!apply_exposure_limit(*final_limit)) {
+        // The reason was set by apply_exposure_limit.
+      }
+    }
+
+    if (cadence_.exposure_budget_us <= 0.0) {
+      if (automatic) {
+        double minimum = 0.0;
+        double maximum = 0.0;
+        arv_camera_get_exposure_time_bounds(camera_, &minimum, &maximum, &error);
+        if (error == nullptr) {cadence_.exposure_budget_us = maximum;} else {
+          g_error_free(error);
+          error = nullptr;
+        }
+      } else {
+        cadence_.exposure_budget_us = arv_camera_get_exposure_time(camera_, &error);
+        if (error != nullptr) {
+          g_error_free(error);
+          error = nullptr;
+          cadence_.exposure_budget_us = 0.0;
+        }
+      }
+    }
+
+    const auto action_queue = first_available_feature({"ActionQueueSize"});
+    cadence_.action_queue_size = 1;
+    if (!action_queue.empty() && feature_readable(camera_, action_queue.c_str())) {
+      const auto value = arv_camera_get_integer(camera_, action_queue.c_str(), &error);
+      if (error == nullptr && value > 0) {
+        cadence_.action_queue_size = static_cast<std::uint32_t>(
+          std::min<std::int64_t>(value, std::numeric_limits<std::uint32_t>::max()));
+      } else if (error != nullptr) {
+        g_error_free(error);
+        error = nullptr;
+      }
+    }
+    if (arv_camera_is_gv_device(camera_)) {
+      packet_delay_ns_ = arv_camera_gv_get_packet_delay(camera_, &error);
+      if (error != nullptr) {
+        g_error_free(error);
+        error = nullptr;
+        packet_delay_ns_ = network_.packet_delay;
+      }
+    }
+    minimum_capture_interval_ms_ = vixel_genicam::minimum_capture_interval_ms(cadence_);
+    if (cadence_limit_reason_.empty()) {
+      cadence_limit_reason_ = capture_cadence_reason(cadence_);
+      cadence_ready_ = cadence_.requested_interval_ms == 0 ||
+        (minimum_capture_interval_ms_ != 0 &&
+        minimum_capture_interval_ms_ <= cadence_.requested_interval_ms);
+      if (!cadence_ready_) {
+        cadence_limit_reason_ = "requested " +
+          std::to_string(cadence_.requested_interval_ms) + " ms, but " +
+          cadence_limit_reason_;
+      }
+    }
+  }
+
   void apply_configuration()
   {
     YAML::Node settings;
@@ -1261,6 +1645,25 @@ private:
       throw_on_error(error, "setting gain");
     }
 
+    const auto set_optional_boolean = [this, &settings](
+      const char * setting_name, std::initializer_list<const char *> candidates)
+      {
+        if (!settings || !settings[setting_name]) {return;}
+        const auto value = settings[setting_name].as<bool>();
+        for (const auto * candidate : candidates) {
+          GError * feature_error = nullptr;
+          const bool available = arv_camera_is_feature_available(
+            camera_, candidate, &feature_error);
+          if (feature_error != nullptr) {g_error_free(feature_error); continue;}
+          if (!available || !feature_writable(camera_, candidate)) {continue;}
+          arv_camera_set_boolean(camera_, candidate, value, &feature_error);
+          throw_on_error(feature_error, std::string("setting ") + candidate);
+          return;
+        }
+        RCLCPP_WARN(
+          node_->get_logger(), "%s has no supported node for portable setting %s",
+          assignment_.sensor_id.c_str(), setting_name);
+      };
     const auto set_optional_float = [this, &settings](
       const char * setting_name, std::initializer_list<const char *> candidates)
       {
@@ -1286,6 +1689,8 @@ private:
           node_->get_logger(), "%s has no supported node for portable setting %s",
           assignment_.sensor_id.c_str(), setting_name);
       };
+    set_optional_boolean(
+      "exposure_auto_limit_auto", {"ExposureAutoLimitAuto"});
     set_optional_float(
       "exposure_auto_upper_us",
       {"ExposureAutoUpperLimit", "AutoExposureTimeUpperLimit"});
@@ -1299,21 +1704,15 @@ private:
       0, 9);
     const bool automatic = auto_mode(exposure_auto) != ARV_AUTO_OFF ||
       auto_mode(gain_auto) != ARV_AUTO_OFF;
+    exposure_auto_enabled_ = auto_mode(exposure_auto) != ARV_AUTO_OFF;
     metering_rate_hz_ = automatic ? std::clamp(
       setting(settings, "metering_rate_hz", 2.0), 0.0, 10.0) : 0.0;
     capture_primed_.store(
       assignment_.operating_mode != "capture" || metering_rate_hz_ <= 0.0);
 
-    double frame_rate = setting(settings, "frame_rate_hz", config_.imaging.frame_rate_hz);
-    if (assignment_.operating_mode == "preview" && !settings["frame_rate_hz"]) {
-      frame_rate = std::clamp(assignment_.preview_rate_hz, 0.1, 10.0);
-    }
-    error = nullptr;
-    if (arv_camera_is_frame_rate_available(camera_, &error) && error == nullptr) {
-      arv_camera_set_frame_rate(camera_, frame_rate, &error);
-      throw_on_error(error, "setting frame rate");
-    } else if (error != nullptr) {g_error_free(error); error = nullptr;}
-
+    // Link pacing constrains the camera's frame-rate bounds. Apply transport
+    // first so the following frame-rate write and readback reflect the actual
+    // configured link instead of stale bounds from the previous application.
     if (arv_camera_is_gv_device(camera_)) {
       const auto packet_size = setting(
         settings, "packet_size", static_cast<int>(network_.packet_size));
@@ -1323,6 +1722,23 @@ private:
       throw_on_error(error, "setting GigE packet size");
       arv_camera_gv_set_packet_delay(camera_, packet_delay, &error);
       throw_on_error(error, "setting GigE packet delay");
+    }
+
+    // AcquisitionFrameRate is a free-running control in SFNC. A requested
+    // capture interval is negotiated separately from exposure and readout
+    // capabilities after triggered acquisition has been configured.
+    if (assignment_.operating_mode != "capture" ||
+      assignment_.requested_capture_interval_ms == 0)
+    {
+      double frame_rate = setting(settings, "frame_rate_hz", config_.imaging.frame_rate_hz);
+      if (assignment_.operating_mode == "preview" && !settings["frame_rate_hz"]) {
+        frame_rate = std::clamp(assignment_.preview_rate_hz, 0.1, 10.0);
+      }
+      error = nullptr;
+      if (arv_camera_is_frame_rate_available(camera_, &error) && error == nullptr) {
+        arv_camera_set_frame_rate(camera_, frame_rate, &error);
+        throw_on_error(error, "setting frame rate");
+      } else if (error != nullptr) {g_error_free(error); error = nullptr;}
     }
 
     error = nullptr;
@@ -1502,6 +1918,7 @@ private:
               "unsupported trigger_source " + trigger_source +
               "; use FreeRun, Software, or Action0");
     }
+    configure_trigger_overlap(settings);
 
     const auto feature_values = settings["features"];
     if (feature_values && feature_values.IsMap()) {
@@ -1528,6 +1945,10 @@ private:
       }
     }
     configure_transfer_control(settings);
+    // Arbitrary feature overrides may have changed one of the cadence inputs,
+    // so derive limits only after every setting has been applied.
+    read_trigger_overlap(first_available_feature({"TriggerOverlap"}));
+    configure_capture_cadence(settings);
     applied_settings_ = assignment_.provider_settings_json.empty() ? "{}" :
       assignment_.provider_settings_json;
   }
@@ -1886,8 +2307,9 @@ private:
     vixel_interfaces::msg::CameraFeature feature;
     feature.name = name;
     feature.value_type = "float";
-    feature.readable = true;
-    feature.writable = true;
+    feature.readable = feature_readable(camera_, name.c_str());
+    feature.writable = feature_writable(camera_, name.c_str());
+    if (!feature.readable) {return;}
     feature.unit = unit;
     const auto value = arv_camera_get_float(camera_, name.c_str(), &error);
     if (error != nullptr) {g_error_free(error); return;}
@@ -1911,8 +2333,9 @@ private:
     vixel_interfaces::msg::CameraFeature feature;
     feature.name = name;
     feature.value_type = "enum";
-    feature.readable = true;
-    feature.writable = true;
+    feature.readable = feature_readable(camera_, name.c_str());
+    feature.writable = feature_writable(camera_, name.c_str());
+    if (!feature.readable) {return;}
     const auto value = arv_camera_get_string(camera_, name.c_str(), &error);
     if (error != nullptr) {g_error_free(error); return;}
     feature.current_value_json = "\"" + json_escape(value_or_empty(value)) + "\"";
@@ -1925,6 +2348,71 @@ private:
       }
       g_free(values);
     } else if (error != nullptr) {g_error_free(error);}
+    output.push_back(feature);
+  }
+
+  void add_integer_feature(
+    std::vector<vixel_interfaces::msg::CameraFeature> & output,
+    const std::string & name, const std::string & unit)
+  {
+    GError * error = nullptr;
+    if (!arv_camera_is_feature_available(camera_, name.c_str(), &error)) {
+      if (error != nullptr) {g_error_free(error);}
+      return;
+    }
+    vixel_interfaces::msg::CameraFeature feature;
+    feature.name = name;
+    feature.value_type = "integer";
+    feature.readable = feature_readable(camera_, name.c_str());
+    feature.writable = feature_writable(camera_, name.c_str());
+    feature.unit = unit;
+    if (!feature.readable) {return;}
+    const auto value = arv_camera_get_integer(camera_, name.c_str(), &error);
+    if (error != nullptr) {g_error_free(error); return;}
+    std::int64_t minimum = 0;
+    std::int64_t maximum = 0;
+    arv_camera_get_integer_bounds(camera_, name.c_str(), &minimum, &maximum, &error);
+    if (error != nullptr) {g_error_free(error); return;}
+    feature.current_value_json = std::to_string(value);
+    feature.minimum_value_json = std::to_string(minimum);
+    feature.maximum_value_json = std::to_string(maximum);
+    output.push_back(feature);
+  }
+
+  void add_boolean_feature(
+    std::vector<vixel_interfaces::msg::CameraFeature> & output, const std::string & name)
+  {
+    GError * error = nullptr;
+    if (!arv_camera_is_feature_available(camera_, name.c_str(), &error)) {
+      if (error != nullptr) {g_error_free(error);}
+      return;
+    }
+    vixel_interfaces::msg::CameraFeature feature;
+    feature.name = name;
+    feature.value_type = "boolean";
+    feature.readable = feature_readable(camera_, name.c_str());
+    feature.writable = feature_writable(camera_, name.c_str());
+    if (!feature.readable) {return;}
+    const auto value = arv_camera_get_boolean(camera_, name.c_str(), &error);
+    if (error != nullptr) {g_error_free(error); return;}
+    feature.current_value_json = value ? "true" : "false";
+    output.push_back(feature);
+  }
+
+  void add_packet_delay_feature(
+    std::vector<vixel_interfaces::msg::CameraFeature> & output)
+  {
+    if (!arv_camera_is_gv_device(camera_)) {return;}
+    GError * error = nullptr;
+    const auto value = arv_camera_gv_get_packet_delay(camera_, &error);
+    if (error != nullptr) {g_error_free(error); return;}
+    vixel_interfaces::msg::CameraFeature feature;
+    feature.name = "PacketDelayNs";
+    feature.value_type = "integer";
+    feature.readable = true;
+    feature.writable = false;
+    feature.unit = "ns";
+    feature.current_value_json = std::to_string(value);
     output.push_back(feature);
   }
 
@@ -1959,6 +2447,14 @@ private:
   std::atomic<std::int64_t> cached_ptp_refreshed_ns_{0};
   std::string ptp_capability_detail_{"PTP not requested"};
   std::string device_version_;
+  CaptureCadence cadence_;
+  std::uint32_t minimum_capture_interval_ms_{0};
+  bool cadence_configured_{false};
+  bool cadence_ready_{false};
+  std::string cadence_limit_reason_;
+  std::string trigger_overlap_value_;
+  std::int64_t packet_delay_ns_{0};
+  bool exposure_auto_enabled_{false};
   std::mutex camera_control_mutex_;
   bool transfer_start_required_{false};
   std::mutex request_mutex_;
@@ -2252,6 +2748,8 @@ private:
         iterator->second->assignment().provider_settings_json &&
         assignment->second.preview_rate_hz ==
         iterator->second->assignment().preview_rate_hz &&
+        assignment->second.requested_capture_interval_ms ==
+        iterator->second->assignment().requested_capture_interval_ms &&
         assignment->second.calibration_url ==
         iterator->second->assignment().calibration_url &&
         assignment->second.network_id == iterator->second->assignment().network_id &&
@@ -2476,6 +2974,8 @@ private:
     std::map<std::string, std::vector<std::string>> locking_members;
     std::map<std::string, std::vector<std::string>> unsupported_members;
     std::map<std::string, std::vector<std::string>> warming_members;
+    std::map<std::string, std::vector<std::string>> cadence_failed_members;
+    std::map<std::string, std::vector<std::string>> cadence_unconfigured_members;
     for (const auto & item : assignments_) {
       const auto & assignment = item.second;
       if (assignment.sync_group.empty()) {continue;}
@@ -2487,11 +2987,32 @@ private:
       group.trigger_source = assignment.group_trigger_source;
       group.operating_mode = assignment.operating_mode;
       group.preview_rate_hz = assignment.preview_rate_hz;
+      group.requested_capture_interval_ms = assignment.requested_capture_interval_ms;
       group.preferred_master_id = assignment.preferred_master_id;
       group.member_ids.push_back(item.first);
       const auto session = sessions_.find(item.first);
       if (session != sessions_.end() && session->second->ready()) {
         group.online_member_ids.push_back(item.first);
+        const auto minimum_interval = session->second->minimum_capture_interval_ms();
+        if (minimum_interval > group.minimum_capture_interval_ms) {
+          group.minimum_capture_interval_ms = minimum_interval;
+          group.cadence_limit_reason = item.first + ": " +
+            session->second->cadence_limit_reason();
+        }
+        const auto action_queue_size = session->second->action_queue_size();
+        group.action_queue_size = group.action_queue_size == 0 ? action_queue_size :
+          std::min(group.action_queue_size, action_queue_size);
+        if (!session->second->cadence_configured()) {
+          cadence_unconfigured_members[assignment.sync_group].push_back(item.first);
+        } else if (assignment.requested_capture_interval_ms != 0 &&
+          !session->second->cadence_ready())
+        {
+          cadence_failed_members[assignment.sync_group].push_back(item.first);
+          // A hard negotiation failure is more useful than the ordinary
+          // slowest-member explanation selected above.
+          group.cadence_limit_reason = item.first + ": " +
+            session->second->cadence_limit_reason();
+        }
         if (assignment.operating_mode == "capture" &&
           !session->second->capture_primed())
         {
@@ -2524,16 +3045,30 @@ private:
       group.synchronization_method = !group.locking_member_ids.empty() ?
         "ptp_relocking" : group.unsynchronized_member_ids.empty() ?
         "ptp_scheduled_action" : "mixed";
+      if (group.minimum_capture_interval_ms != 0) {
+        group.maximum_capture_rate_hz =
+          1000.0 / static_cast<double>(group.minimum_capture_interval_ms);
+      }
       group.ptp_ready = !group.online_member_ids.empty() &&
         group.locking_member_ids.empty() && group.unsynchronized_member_ids.empty();
       const bool members_ready = group.operating_mode == "idle" ||
         group.missing_member_ids.empty() ||
         (group.missing_policy == "degraded" && !group.online_member_ids.empty());
       const auto & warming = warming_members[group.group_id];
-      group.ready = members_ready && group.locking_member_ids.empty() && warming.empty();
+      const auto & cadence_failed = cadence_failed_members[group.group_id];
+      const auto & cadence_unconfigured = cadence_unconfigured_members[group.group_id];
+      group.cadence_configured = group.requested_capture_interval_ms == 0 ||
+        (members_ready && !group.online_member_ids.empty() && cadence_unconfigured.empty());
+      group.cadence_ready = group.requested_capture_interval_ms == 0 ||
+        (group.cadence_configured && cadence_failed.empty() &&
+        group.minimum_capture_interval_ms != 0 &&
+        group.minimum_capture_interval_ms <= group.requested_capture_interval_ms);
+      group.ready = members_ready && group.locking_member_ids.empty() && warming.empty() &&
+        group.cadence_ready;
       if (!group.locking_member_ids.empty() ||
         (group.operating_mode == "capture" &&
-        (!group.unsynchronized_member_ids.empty() || !warming.empty())))
+        (!group.unsynchronized_member_ids.empty() || !warming.empty() ||
+        !cadence_failed.empty() || !cadence_unconfigured.empty())))
       {
         std::ostringstream notice;
         const auto & locking = locking_members[group.group_id];
@@ -2551,6 +3086,22 @@ private:
           if (!locking.empty() || !unsupported.empty()) {notice << ". ";}
           notice << "Waiting for a clean initial metering frame from: ";
           notice << joined(warming);
+        }
+        if (!cadence_unconfigured.empty()) {
+          if (!locking.empty() || !unsupported.empty() || !warming.empty()) {notice << ". ";}
+          notice << "Waiting for cadence configuration from: ";
+          notice << joined(cadence_unconfigured);
+        }
+        if (!cadence_failed.empty()) {
+          if (!locking.empty() || !unsupported.empty() || !warming.empty() ||
+            !cadence_unconfigured.empty())
+          {
+            notice << ". ";
+          }
+          notice << "Capture cadence unsupported by: " << joined(cadence_failed);
+          if (!group.cadence_limit_reason.empty()) {
+            notice << " (" << group.cadence_limit_reason << ')';
+          }
         }
         group.last_error = notice.str();
       }

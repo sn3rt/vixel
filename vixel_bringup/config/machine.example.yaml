@@ -57,6 +57,8 @@ providers:
     software_trigger_lead_time_ms: 10
     encode_queue_depth: 8
     capture_png_compression: 1
+    # Added to the camera-derived exposure/readout cadence limit.
+    cadence_safety_margin_ms: 10
     ptp:
       action_lead_time_ms: 100
       tolerance_ns: 100000
@@ -75,6 +77,10 @@ recording:
   root_directory: /var/lib/vixel/captures
   minimum_free_bytes: 5368709120
   capture_timeout_ms: 10000
+  # Includes camera restarts, PTP relock, and initial auto-exposure metering.
+  sequence_prepare_timeout_ms: 60000
+  # Automatically reduced to fit the cameras' reported action queues.
+  sequence_dispatch_lead_ms: 150
   recent_limit: 100
   max_inflight_captures: 32
   gps:

@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from types import SimpleNamespace
 
 from vixel_manager.manager_node import (
@@ -10,11 +11,38 @@ from vixel_manager.manager_node import (
 
 def test_provider_group_status_must_match_requested_mode():
     status = SimpleNamespace(
-        operating_mode="preview", member_ids=["left", "right"]
+        operating_mode="preview", member_ids=["left", "right"],
+        requested_capture_interval_ms=0,
     )
 
     assert not _provider_group_is_current(status, ["left", "right"], "capture")
     assert _provider_group_is_current(status, ["right", "left"], "preview")
+    assert not _provider_group_is_current(
+        status, ["right", "left"], "preview", 200
+    )
+
+
+def test_prepare_capture_groups_sets_mode_and_requested_interval_atomically():
+    manager = InventoryManager.__new__(InventoryManager)
+    manager.registry = SimpleNamespace(inventory={
+        "sync_groups": {"front": {}, "back": {}}
+    })
+    manager.group_modes = {"front": "idle", "back": "preview"}
+    manager.group_capture_intervals = {"front": 0, "back": 0}
+    manager.generation = 7
+    manager.lock = threading.RLock()
+    published = []
+    manager._publish_state = lambda: published.append(True)
+    request = SimpleNamespace(group_ids=["front", "back"], interval_ms=200)
+    response = SimpleNamespace(accepted=False, message="")
+
+    result = manager._prepare_capture_groups(request, response)
+
+    assert result.accepted is True
+    assert manager.group_modes == {"front": "capture", "back": "capture"}
+    assert manager.group_capture_intervals == {"front": 200, "back": 200}
+    assert manager.generation == 8
+    assert published == [True]
 
 
 def test_runtime_sensor_from_previous_mode_is_not_ready():

@@ -40,6 +40,8 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   ament_add_gtest(test_recorder_config test/test_recorder_config.cpp)
   target_link_libraries(test_recorder_config recorder_config yaml-cpp)
+  ament_add_gtest(test_sequence_timing test/test_sequence_timing.cpp)
+  target_include_directories(test_sequence_timing PRIVATE include)
 endif()
 
 ament_package()

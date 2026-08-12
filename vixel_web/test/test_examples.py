@@ -273,12 +273,13 @@ def test_periodic_example_sets_capture_mode_and_waits_until_groups_are_ready(mon
     monkeypatch.setattr(example.time, "sleep", lambda _seconds: None)
 
     example.prepare_capture_groups(
-        "http://127.0.0.1:8080", ["front", "back"], 5.0, 10.0
+        "http://127.0.0.1:8080", ["front", "back"], 5.0, 10.0, 5.0
     )
 
     mode_calls = [call for call in calls if call[1] == "/api/v1/mode"]
     assert [call[3]["target_id"] for call in mode_calls] == ["front", "back"]
     assert all(call[3]["mode"] == "capture" for call in mode_calls)
+    assert all(call[3]["capture_interval_ms"] == 5000 for call in mode_calls)
     assert len([call for call in calls if call[1] == "/api/v1/groups"]) == 3
 
 

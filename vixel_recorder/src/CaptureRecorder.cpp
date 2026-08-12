@@ -1,4 +1,5 @@
 #include "vixel_recorder/RecorderConfig.hpp"
+#include "vixel_recorder/SequenceTiming.hpp"
 
 #include <nlohmann/json.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -17,6 +18,7 @@
 #include <vixel_interfaces/srv/capture_group.hpp>
 #include <vixel_interfaces/srv/cancel_capture_operation.hpp>
 #include <vixel_interfaces/srv/get_capture_operation.hpp>
+#include <vixel_interfaces/srv/prepare_capture_groups.hpp>
 #include <vixel_interfaces/srv/start_capture_sequence.hpp>
 #include <vixel_interfaces/srv/submit_capture_batch.hpp>
 
@@ -28,8 +30,10 @@
 #include <cctype>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iomanip>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -52,6 +56,7 @@ namespace
 using CaptureGroup = vixel_interfaces::srv::CaptureGroup;
 using CaptureRecord = vixel_interfaces::msg::CaptureRecord;
 using CaptureOperation = vixel_interfaces::msg::CaptureOperation;
+using PrepareCaptureGroups = vixel_interfaces::srv::PrepareCaptureGroups;
 using RecordCapture = vixel_interfaces::action::RecordCapture;
 using GoalHandle = rclcpp_action::ServerGoalHandle<RecordCapture>;
 using ClientGoalHandle = rclcpp_action::ClientGoalHandle<RecordCapture>;
@@ -285,6 +290,7 @@ public:
         std::lock_guard<std::mutex> lock(state_mutex_);
         groups_.clear();
         for (const auto & group : message->groups) {groups_[group.group_id] = group;}
+        state_changed_.notify_all();
       });
     if (config_.gps_enabled) {
       gps_subscription_ = create_subscription<sensor_msgs::msg::NavSatFix>(
@@ -295,6 +301,8 @@ public:
         });
     }
     capture_client_ = create_client<CaptureGroup>("/vixel/capture_group");
+    prepare_capture_groups_client_ = create_client<PrepareCaptureGroups>(
+      "/vixel/prepare_capture_groups");
     capture_callback_group_ = create_callback_group(
       rclcpp::CallbackGroupType::Reentrant);
     records_publisher_ = create_publisher<vixel_interfaces::msg::CaptureRecordArray>(
@@ -370,7 +378,7 @@ private:
 
   std::optional<std::string> validate_operation_request(
     const std::vector<std::string> & group_ids, const std::string & request_id,
-    const std::string & metadata_json)
+    const std::string & metadata_json, bool require_capture_ready = true)
   {
     if (group_ids.empty()) {return "at least one synchronization group is required";}
     if (request_id.size() > 64 || (!request_id.empty() && !safe_identifier(request_id))) {
@@ -392,11 +400,50 @@ private:
       if (!unique.insert(group_id).second) {return "group_ids contains a duplicate";}
       const auto group = groups_.find(group_id);
       if (group == groups_.end()) {return "unknown synchronization group " + group_id;}
-      if (group->second.operating_mode != "capture" || !group->second.ready) {
+      if (require_capture_ready &&
+        (group->second.operating_mode != "capture" || !group->second.ready))
+      {
         return "synchronization group " + group_id + " is not capture-ready";
       }
     }
     return std::nullopt;
+  }
+
+  std::optional<std::string> validate_sequence_interval(
+    const std::vector<std::string> & group_ids, std::uint32_t interval_ms)
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    for (const auto & group_id : group_ids) {
+      const auto group = groups_.find(group_id);
+      if (group == groups_.end() || group->second.minimum_capture_interval_ms == 0) {
+        continue;
+      }
+      if (!capture_interval_supported(
+          interval_ms, group->second.minimum_capture_interval_ms))
+      {
+        std::ostringstream message;
+        message << "requested interval " << interval_ms << " ms is faster than group " <<
+          group_id << " minimum " << group->second.minimum_capture_interval_ms << " ms";
+        if (!group->second.cadence_limit_reason.empty()) {
+          message << " (" << group->second.cadence_limit_reason << ')';
+        }
+        return message.str();
+      }
+    }
+    return std::nullopt;
+  }
+
+  std::uint32_t operation_action_queue_size(const std::vector<std::string> & group_ids)
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    std::uint32_t result = std::numeric_limits<std::uint32_t>::max();
+    for (const auto & group_id : group_ids) {
+      const auto group = groups_.find(group_id);
+      const auto size = group == groups_.end() || group->second.action_queue_size == 0 ?
+        1U : group->second.action_queue_size;
+      result = std::min(result, size);
+    }
+    return result == std::numeric_limits<std::uint32_t>::max() ? 1U : result;
   }
 
   std::string make_operation_id()
@@ -406,15 +453,65 @@ private:
     return value;
   }
 
+  std::optional<std::string> reserve_groups(
+    const std::vector<std::string> & group_ids, const std::string & operation_id)
+  {
+    std::lock_guard<std::mutex> lock(group_reservations_mutex_);
+    for (const auto & group_id : group_ids) {
+      const auto reserved = group_reservations_.find(group_id);
+      if (reserved != group_reservations_.end()) {
+        return "synchronization group " + group_id +
+               " is reserved by operation " + reserved->second;
+      }
+      const auto active = active_group_captures_.find(group_id);
+      if (active != active_group_captures_.end() && active->second != 0) {
+        return "synchronization group " + group_id + " already has an active capture";
+      }
+    }
+    for (const auto & group_id : group_ids) {group_reservations_[group_id] = operation_id;}
+    return std::nullopt;
+  }
+
+  std::optional<std::string> group_reservation_conflict(
+    const std::vector<std::string> & group_ids)
+  {
+    std::lock_guard<std::mutex> lock(group_reservations_mutex_);
+    for (const auto & group_id : group_ids) {
+      const auto reserved = group_reservations_.find(group_id);
+      if (reserved != group_reservations_.end()) {
+        return "synchronization group " + group_id +
+               " is reserved by operation " + reserved->second;
+      }
+      const auto active = active_group_captures_.find(group_id);
+      if (active != active_group_captures_.end() && active->second != 0) {
+        return "synchronization group " + group_id + " already has an active capture";
+      }
+    }
+    return std::nullopt;
+  }
+
+  void release_groups(
+    const std::vector<std::string> & group_ids, const std::string & operation_id)
+  {
+    std::lock_guard<std::mutex> lock(group_reservations_mutex_);
+    for (const auto & group_id : group_ids) {
+      const auto reserved = group_reservations_.find(group_id);
+      if (reserved != group_reservations_.end() && reserved->second == operation_id) {
+        group_reservations_.erase(reserved);
+      }
+    }
+  }
+
   std::shared_ptr<OperationState> create_operation(
     const std::string & kind, const std::vector<std::string> & group_ids,
     const std::string & request_id, std::uint32_t count, std::uint32_t interval_ms,
     bool synchronize_groups, const std::string & metadata_json,
-    const builtin_interfaces::msg::Time & first_time)
+    const builtin_interfaces::msg::Time & first_time,
+    const std::string & operation_id = {})
   {
     auto operation = std::make_shared<OperationState>();
     operation->value.stamp = now();
-    operation->value.operation_id = make_operation_id();
+    operation->value.operation_id = operation_id.empty() ? make_operation_id() : operation_id;
     operation->value.kind = kind;
     operation->value.status = "accepted";
     operation->value.message = "capture operation accepted";
@@ -445,6 +542,11 @@ private:
       response->message = *error;
       return;
     }
+    if (const auto error = group_reservation_conflict(request->group_ids)) {
+      response->accepted = false;
+      response->message = *error;
+      return;
+    }
     const auto first = std::chrono::system_clock::now() + 750ms;
     const auto first_message = system_time_message(first);
     auto operation = create_operation(
@@ -463,7 +565,7 @@ private:
     std::shared_ptr<vixel_interfaces::srv::StartCaptureSequence::Response> response)
   {
     if (const auto error = validate_operation_request(
-        request->group_ids, request->request_id, request->metadata_json))
+        request->group_ids, request->request_id, request->metadata_json, false))
     {
       response->accepted = false;
       response->message = *error;
@@ -474,20 +576,157 @@ private:
       response->message = "interval_ms must be between 100 and 86400000";
       return;
     }
-    const auto first = std::chrono::system_clock::now() + 1000ms;
-    const auto first_message = system_time_message(first);
+    const auto operation_id = make_operation_id();
+    if (const auto error = reserve_groups(request->group_ids, operation_id)) {
+      response->accepted = false;
+      response->message = *error;
+      return;
+    }
     auto operation = create_operation(
       "sequence", request->group_ids, request->request_id, request->count,
-      request->interval_ms, request->synchronize_groups, request->metadata_json, first_message);
+      request->interval_ms, request->synchronize_groups, request->metadata_json,
+      builtin_interfaces::msg::Time{}, operation_id);
+    {
+      std::lock_guard<std::mutex> lock(operations_mutex_);
+      operation->value.status = "preparing";
+      operation->value.message = "configuring capture groups for requested interval";
+      operation->value.stamp = now();
+      ++operations_generation_;
+    }
+    publish_operations();
     response->accepted = true;
-    response->message = request->count == 0 ?
-      "continuous sequence accepted" : "finite sequence accepted";
+    response->message = "sequence accepted; preparing capture cadence";
     response->operation_id = operation->value.operation_id;
-    response->first_scheduled_time = first_message;
     std::thread(
-      [this, operation, first, count = request->count]() {
-        schedule_operation(operation, first, count);
+      [this, operation, count = request->count]() {
+        prepare_and_schedule_sequence(operation, count);
       }).detach();
+  }
+
+  void fail_sequence_preparation(
+    const std::shared_ptr<OperationState> & operation, const std::string & message)
+  {
+    {
+      std::lock_guard<std::mutex> lock(operations_mutex_);
+      operation->stop_scheduling = true;
+      operation->scheduling_done = true;
+      operation->value.status = operation->cancelled_by_user ? "cancelled" : "failed";
+      operation->value.message = message;
+      operation->value.stamp = now();
+      ++operations_generation_;
+    }
+    release_groups(operation->value.group_ids, operation->value.operation_id);
+    publish_operations();
+  }
+
+  void prepare_and_schedule_sequence(
+    const std::shared_ptr<OperationState> & operation, std::uint32_t count)
+  {
+    if (!prepare_capture_groups_client_->wait_for_service(2s)) {
+      fail_sequence_preparation(operation, "capture group preparation service is unavailable");
+      return;
+    }
+    auto request = std::make_shared<PrepareCaptureGroups::Request>();
+    request->group_ids = operation->value.group_ids;
+    request->interval_ms = operation->value.interval_ms;
+    auto future = prepare_capture_groups_client_->async_send_request(request);
+    if (future.wait_for(5s) != std::future_status::ready) {
+      fail_sequence_preparation(operation, "timed out requesting capture group preparation");
+      return;
+    }
+    const auto response = future.get();
+    if (!response->accepted) {
+      fail_sequence_preparation(operation, response->message);
+      return;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + config_.sequence_prepare_timeout;
+    std::string last_status{"waiting for capture group status"};
+    while (rclcpp::ok() && std::chrono::steady_clock::now() < deadline) {
+      bool stopped = false;
+      bool cancelled = false;
+      std::string stopped_message;
+      {
+        std::lock_guard<std::mutex> lock(operations_mutex_);
+        stopped = operation->stop_scheduling;
+        cancelled = operation->cancelled_by_user;
+        stopped_message = operation->value.message;
+      }
+      if (stopped) {
+        fail_sequence_preparation(
+          operation, cancelled ? "sequence cancelled during preparation" : stopped_message);
+        return;
+      }
+
+      bool ready = true;
+      std::optional<std::string> permanent_error;
+      {
+        std::unique_lock<std::mutex> lock(state_mutex_);
+        for (const auto & group_id : operation->value.group_ids) {
+          const auto iterator = groups_.find(group_id);
+          if (iterator == groups_.end()) {
+            ready = false;
+            last_status = "waiting for synchronization group " + group_id;
+            continue;
+          }
+          const auto & group = iterator->second;
+          if (group.operating_mode != "capture" ||
+            group.requested_capture_interval_ms != operation->value.interval_ms)
+          {
+            ready = false;
+            last_status = "waiting for " + group_id + " to apply " +
+              std::to_string(operation->value.interval_ms) + " ms cadence";
+            continue;
+          }
+          if (!group.cadence_configured) {
+            ready = false;
+            last_status = group.last_error.empty() ?
+              "waiting for " + group_id + " cadence configuration" : group.last_error;
+            continue;
+          }
+          if (!group.cadence_ready) {
+            permanent_error = group.cadence_limit_reason.empty() ?
+              (group.last_error.empty() ?
+              "synchronization group " + group_id +
+              " cannot satisfy the requested capture interval" : group.last_error) :
+              group.cadence_limit_reason;
+            break;
+          }
+          if (!group.ready) {
+            ready = false;
+            last_status = group.last_error.empty() ?
+              "waiting for synchronization group " + group_id + " readiness" :
+              group.last_error;
+          }
+        }
+        if (!ready && !permanent_error) {state_changed_.wait_for(lock, 100ms);}
+      }
+      if (permanent_error) {
+        fail_sequence_preparation(operation, *permanent_error);
+        return;
+      }
+      if (ready) {
+        if (const auto error = validate_sequence_interval(
+            operation->value.group_ids, operation->value.interval_ms))
+        {
+          fail_sequence_preparation(operation, *error);
+          return;
+        }
+        const auto first = std::chrono::system_clock::now() + 1000ms;
+        {
+          std::lock_guard<std::mutex> lock(operations_mutex_);
+          operation->value.first_scheduled_time = system_time_message(first);
+          operation->value.message = "capture groups prepared; scheduling captures";
+          operation->value.stamp = now();
+          ++operations_generation_;
+        }
+        publish_operations();
+        schedule_operation(operation, first, count);
+        return;
+      }
+    }
+    fail_sequence_preparation(
+      operation, "capture group preparation timed out: " + last_status);
   }
 
   void get_capture_operation(
@@ -552,14 +791,21 @@ private:
         operation->value.stamp = now();
         ++operations_generation_;
       }
+      if (operation->value.kind == "sequence") {
+        release_groups(operation->value.group_ids, operation->value.operation_id);
+      }
       publish_operations();
       return;
     }
     const auto interval = std::chrono::milliseconds(operation->value.interval_ms);
+    const auto action_queue_size = operation_action_queue_size(operation->value.group_ids);
+    const auto dispatch_lead = operation->value.kind == "sequence" ?
+      sequence_dispatch_lead(config_.sequence_dispatch_lead, interval, action_queue_size) :
+      config_.sequence_dispatch_lead;
     std::uint32_t cycle = 1;
     while (rclcpp::ok() && (count == 0 || cycle <= count)) {
       const auto target = first_time + interval * (cycle - 1);
-      const auto dispatch = target - 750ms;
+      const auto dispatch = target - dispatch_lead;
       while (rclcpp::ok() && std::chrono::system_clock::now() < dispatch) {
         {
           std::lock_guard<std::mutex> lock(operations_mutex_);
@@ -588,16 +834,23 @@ private:
       dispatch_cycle(operation, cycle, target);
       ++cycle;
     }
+    bool release_reservation = false;
     {
       std::lock_guard<std::mutex> lock(operations_mutex_);
       operation->scheduling_done = true;
-      if (operation->value.pending_saves == 0) {finish_operation_locked(*operation);}
+      if (operation->value.pending_saves == 0) {
+        finish_operation_locked(*operation);
+        release_reservation = operation->value.kind == "sequence";
+      }
       else if (!operation->stop_scheduling) {
         operation->value.status = "draining";
         operation->value.message = "all captures scheduled; waiting for saves";
       }
       operation->value.stamp = now();
       ++operations_generation_;
+    }
+    if (release_reservation) {
+      release_groups(operation->value.group_ids, operation->value.operation_id);
     }
     publish_operations();
   }
@@ -679,6 +932,7 @@ private:
     const std::shared_ptr<OperationState> & operation, std::uint32_t cycle,
     bool success, const std::string & message)
   {
+    bool release_reservation = false;
     {
       std::lock_guard<std::mutex> lock(operations_mutex_);
       if (operation->value.pending_saves != 0) {--operation->value.pending_saves;}
@@ -694,9 +948,13 @@ private:
       }
       if (operation->scheduling_done && operation->value.pending_saves == 0) {
         finish_operation_locked(*operation);
+        release_reservation = operation->value.kind == "sequence";
       }
       operation->value.stamp = now();
       ++operations_generation_;
+    }
+    if (release_reservation) {
+      release_groups(operation->value.group_ids, operation->value.operation_id);
     }
     publish_operations();
   }
@@ -759,10 +1017,31 @@ private:
       }
     }
     {
+      std::lock_guard<std::mutex> lock(group_reservations_mutex_);
+      const auto reserved = group_reservations_.find(goal->group_id);
+      if (reserved != group_reservations_.end() &&
+        (goal->operation_id.empty() || goal->operation_id != reserved->second))
+      {
+        return rclcpp_action::GoalResponse::REJECT;
+      }
+      const auto active = active_group_captures_.find(goal->group_id);
+      if (reserved == group_reservations_.end() &&
+        active != active_group_captures_.end() && active->second != 0)
+      {
+        return rclcpp_action::GoalResponse::REJECT;
+      }
+      ++active_group_captures_[goal->group_id];
+    }
+    {
       std::lock_guard<std::mutex> lock(active_captures_mutex_);
       if (active_capture_count_ >= config_.max_inflight_captures ||
         (!goal->request_id.empty() && active_capture_ids_.count(goal->request_id) != 0))
       {
+        std::lock_guard<std::mutex> group_lock(group_reservations_mutex_);
+        auto active = active_group_captures_.find(goal->group_id);
+        if (active != active_group_captures_.end() && --active->second == 0) {
+          active_group_captures_.erase(active);
+        }
         return rclcpp_action::GoalResponse::REJECT;
       }
       ++active_capture_count_;
@@ -853,6 +1132,9 @@ private:
       std::size_t & count;
       std::set<std::string> & capture_ids;
       std::string capture_id;
+      std::mutex & group_mutex;
+      std::map<std::string, std::size_t> & active_groups;
+      std::string group_id;
       bool released{false};
 
       void release()
@@ -861,6 +1143,13 @@ private:
         if (released) {return;}
         if (count != 0) {--count;}
         if (!capture_id.empty()) {capture_ids.erase(capture_id);}
+        {
+          std::lock_guard<std::mutex> group_lock(group_mutex);
+          auto active = active_groups.find(group_id);
+          if (active != active_groups.end() && --active->second == 0) {
+            active_groups.erase(active);
+          }
+        }
         released = true;
       }
 
@@ -870,7 +1159,8 @@ private:
       }
     } guard{
       active_captures_mutex_, active_capture_count_, active_capture_ids_,
-      handle->get_goal()->request_id};
+      handle->get_goal()->request_id, group_reservations_mutex_,
+      active_group_captures_, handle->get_goal()->group_id};
 
     auto result = std::make_shared<RecordCapture::Result>();
     CaptureRecord record;
@@ -1306,7 +1596,11 @@ private:
   std::mutex active_captures_mutex_;
   std::size_t active_capture_count_{0};
   std::set<std::string> active_capture_ids_;
+  std::mutex group_reservations_mutex_;
+  std::map<std::string, std::string> group_reservations_;
+  std::map<std::string, std::size_t> active_group_captures_;
   std::mutex state_mutex_;
+  std::condition_variable state_changed_;
   std::map<std::string, vixel_interfaces::msg::Sensor> sensors_;
   std::map<std::string, vixel_interfaces::msg::SyncGroup> groups_;
   std::shared_ptr<FrameBucket> capture_frames_{std::make_shared<FrameBucket>()};
@@ -1327,6 +1621,7 @@ private:
   sensor_msgs::msg::NavSatFix::ConstSharedPtr latest_gps_;
   rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr gps_subscription_;
   rclcpp::Client<CaptureGroup>::SharedPtr capture_client_;
+  rclcpp::Client<PrepareCaptureGroups>::SharedPtr prepare_capture_groups_client_;
   rclcpp::Publisher<vixel_interfaces::msg::CaptureRecordArray>::SharedPtr records_publisher_;
   rclcpp_action::Server<RecordCapture>::SharedPtr action_server_;
   rclcpp_action::Client<RecordCapture>::SharedPtr operation_capture_client_;
