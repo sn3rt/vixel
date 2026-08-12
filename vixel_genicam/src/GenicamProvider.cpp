@@ -2059,9 +2059,8 @@ private:
   {
     const auto context = get_node_base_interface()->get_context();
     if (!rclcpp::ok(context)) {return;}
-    std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
-    if (!lock.owns_lock()) {return;}
     std::map<std::string, DeviceRecord> discovered;
+    std::string discovery_error;
     const auto discovery_started = std::chrono::steady_clock::now();
     try {
       std::lock_guard<std::mutex> aravis_lock(aravis_mutex_);
@@ -2102,10 +2101,17 @@ private:
           collect_current_devices(item.second.interface, discovered);
         }
       }
+      arv_gv_interface_set_discovery_interface_name(nullptr);
     } catch (const std::exception & error) {
-      last_system_error_ = error.what();
+      discovery_error = error.what();
     }
     if (!rclcpp::ok(context)) {return;}
+
+    // Network discovery takes about one second on this host. Keep it outside
+    // the session mutex so a routine scan cannot delay a scheduled action past
+    // its requested exposure time.
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (!discovery_error.empty()) {last_system_error_ = discovery_error;}
     records_.clear();
     vixel_interfaces::msg::SensorObservationArray message;
     message.header.stamp = now();
@@ -2512,6 +2518,11 @@ private:
     const std::shared_ptr<vixel_interfaces::srv::ProviderCapture::Request> request,
     std::shared_ptr<vixel_interfaces::srv::ProviderCapture::Response> response)
   {
+    // Serialize only the short scheduling phase. Once frame requests have been
+    // queued the session workers and response waiters continue concurrently.
+    // This prevents a newer capture from overtaking an older timestamp while
+    // both contend with status or session maintenance.
+    std::unique_lock<std::mutex> scheduling_lock(capture_scheduling_mutex_);
     std::unique_lock<std::mutex> lock(mutex_);
     const auto lead = std::chrono::milliseconds(config_.ptp_action_lead_time_ms);
     auto release_at = std::chrono::steady_clock::now() + lead;
@@ -2660,6 +2671,7 @@ private:
       }
     }
     lock.unlock();
+    scheduling_lock.unlock();
 
     for (const auto & item : completions) {
       const auto & completion = item.second;
@@ -2747,6 +2759,7 @@ private:
   }
 
   GenicamConfig config_;
+  std::mutex capture_scheduling_mutex_;
   std::mutex mutex_;
   std::mutex aravis_mutex_;
   std::map<std::string, DeviceRecord> records_;
