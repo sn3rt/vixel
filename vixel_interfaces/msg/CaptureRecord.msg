@@ -15,3 +15,7 @@ string[] requested_sensor_ids
 string[] participating_sensor_ids
 string[] saved_sensor_ids
 string[] missing_sensor_ids
+string operation_id
+uint32 cycle
+string metadata_json
+string timings_json

@@ -52,15 +52,17 @@ Providers that support persistent camera capture also publish
 one frame uses the `capture_id` and timestamp returned by `ProviderCapture`;
 indexes start at zero, `chunk_count` is constant, and the reassembled bytes must
 be a full-resolution lossless image. The current recorder accepts PNG and
-persists decoded BGR8 PNG files.
+persists the provider's lossless PNG bytes without decoding or re-encoding.
 
 Chunking is required because full-resolution raw images or a single compressed
 sample can exceed practical synchronous DDS sample sizes on multi-interface
 camera hosts. Preview transport remains independent and best-effort.
 
 `ProviderCapture.trigger_only` distinguishes publish-only acquisition from the
-persistent recorder transport. Providers complete the call after participating
-frames have been published, return failed members separately, and report
+persistent recorder transport. `has_requested_time` allows a scheduler to queue
+an exposure 20 ms to 5 seconds into the common clock. Providers complete saved
+capture calls after acquisition; lossless encoding and chunk publication may
+continue asynchronously. They return failed members separately and report
 `trigger_span_ns` when they can measure host dispatch timing. Trigger-only
 requests need not publish lossless capture chunks; standard `image_raw` and
 camera-info topics remain the processing interface.

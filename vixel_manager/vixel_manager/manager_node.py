@@ -39,6 +39,7 @@ from vixel_interfaces.srv import (
     PurgeKnownSensor,
     ProviderCapture,
     ProvisionSensor,
+    ReloadCameraProfiles,
     SetOperatingMode,
     SetPortMode,
     UpdateSensorMetadata,
@@ -46,6 +47,11 @@ from vixel_interfaces.srv import (
     UpsertSyncGroup,
 )
 
+from .camera_profiles import (
+    CameraProfileError,
+    load_camera_profiles,
+    resolve_camera_settings,
+)
 from .registry import Allocation, Registry, RegistryError, VALID_OPERATING_MODES
 from .port_status import PortStatus, PortStatusMonitor
 
@@ -116,6 +122,20 @@ class InventoryManager(Node):
 
         inventory_file = self._writable_inventory_path(str(inventory_file))
         self.registry = Registry(str(machine_file), inventory_file, str(legacy_file))
+        self.camera_profiles_directory = str(
+            self.registry.machine["camera_profiles"]["directory"]
+        )
+        self.camera_profiles = load_camera_profiles(self.camera_profiles_directory)
+        missing_profiles = sorted({
+            str(sensor.get("camera_profile", ""))
+            for sensor in self.registry.inventory["known_sensors"].values()
+            if sensor.get("camera_profile")
+            and sensor.get("camera_profile") not in self.camera_profiles
+        })
+        if missing_profiles:
+            raise RegistryError(
+                "inventory selects missing camera profiles: " + ", ".join(missing_profiles)
+            )
         self.camera_backend = str(
             self.declare_parameter("camera_backend", "genicam").value
         )
@@ -181,6 +201,12 @@ class InventoryManager(Node):
             UpdateKnownSensor,
             "update_known_sensor",
             self._update_known_sensor,
+            callback_group=self.callback_group,
+        )
+        self.reload_profiles_service = self.create_service(
+            ReloadCameraProfiles,
+            "reload_camera_profiles",
+            self._reload_camera_profiles,
             callback_group=self.callback_group,
         )
         self.purge_known_service = self.create_service(
@@ -329,6 +355,33 @@ class InventoryManager(Node):
             f"/vixel/providers/{provider}/capture",
             callback_group=self.callback_group,
         )
+
+    def _reload_camera_profiles(self, _request, response):
+        """Atomically replace the profile catalogue after validating selections."""
+        try:
+            loaded = load_camera_profiles(self.camera_profiles_directory)
+            selected = {
+                str(sensor.get("camera_profile", ""))
+                for sensor in self.registry.inventory["known_sensors"].values()
+                if sensor.get("camera_profile")
+            }
+            missing = sorted(selected - set(loaded))
+            if missing:
+                raise CameraProfileError(
+                    "selected camera profiles are missing: " + ", ".join(missing)
+                )
+            self.camera_profiles = loaded
+            with self.lock:
+                self.generation += 1
+            self._publish_state()
+            response.success = True
+            response.message = f"loaded {len(loaded)} camera profile(s)"
+            response.profile_names = sorted(loaded)
+        except CameraProfileError as error:
+            response.success = False
+            response.message = str(error)
+            response.profile_names = sorted(self.camera_profiles)
+        return response
 
     def _runtime_provider(self, record: dict[str, Any]) -> str:
         return self.camera_backend if record.get("kind", "camera") == "camera" else record["provider"]
@@ -583,6 +636,7 @@ class InventoryManager(Node):
         message.current_address = str(latest.get("current_address", ""))
         message.network_id = str(latest.get("network_id", ""))
         message.notes = str(record.get("notes", ""))
+        message.camera_profile = str(record.get("camera_profile", ""))
         message.provider_settings_json = json.dumps(
             record.get("provider_settings", {}), separators=(",", ":"), sort_keys=True
         )
@@ -825,9 +879,25 @@ class InventoryManager(Node):
             assignment.preview_rate_hz = float(
                 group.get("preview_rate_hz", self.registry.machine["defaults"]["preview_rate_hz"])
             )
-            effective_settings = dict(
-                snapshot["known_sensors"].get(sensor_id, {}).get("provider_settings", {})
+            known = snapshot["known_sensors"].get(sensor_id, {})
+            provider_config = self.registry.machine["providers"].get(runtime_provider, {})
+            portable_defaults = dict(provider_config.get("imaging", {}))
+            if "exposure_time_us" in portable_defaults:
+                portable_defaults["exposure_us"] = portable_defaults.pop("exposure_time_us")
+            if "capture_png_compression" in provider_config:
+                portable_defaults["capture_png_compression"] = provider_config[
+                    "capture_png_compression"
+                ]
+            for key in ("preview_width", "preview_format", "png_compression", "jpeg_quality"):
+                if key in self.registry.machine["defaults"]:
+                    portable_defaults[key] = self.registry.machine["defaults"][key]
+            effective_settings = resolve_camera_settings(
+                portable_defaults,
+                self.camera_profiles,
+                str(known.get("camera_profile", "")),
+                dict(known.get("provider_settings", {})),
             )
+            effective_settings["camera_profile"] = str(known.get("camera_profile", ""))
             if group_id:
                 effective_settings["trigger_source"] = "Action0"
             assignment.provider_settings_json = json.dumps(
@@ -1220,8 +1290,12 @@ class InventoryManager(Node):
             settings = json.loads(request.provider_settings_json or "{}")
             if not isinstance(settings, dict):
                 raise RegistryError("provider_settings must be a JSON object")
+            profile = str(request.camera_profile)
+            if profile and profile not in self.camera_profiles:
+                raise RegistryError(f"unknown camera profile {profile}")
             self.registry.update_known_sensor(request.sensor_id, {
                 "notes": request.notes,
+                "camera_profile": profile,
                 "provider_settings": settings,
             })
             with self.lock:
@@ -1324,7 +1398,8 @@ class InventoryManager(Node):
         return response
 
     def _request_group_capture(
-        self, group_id: str, request_id: str, *, trigger_only: bool
+        self, group_id: str, request_id: str, *, trigger_only: bool,
+        has_requested_time: bool = False, requested_time=None,
     ):
         group = self.registry.inventory["sync_groups"].get(group_id)
         if not group:
@@ -1342,12 +1417,19 @@ class InventoryManager(Node):
         provider_request.missing_policy = group["missing_policy"]
         provider_request.preferred_master_id = ""
         provider_request.trigger_only = trigger_only
+        provider_request.has_requested_time = has_requested_time
+        if has_requested_time and requested_time is not None:
+            provider_request.requested_time = requested_time
         return self._wait_for_future(client.call_async(provider_request), timeout=30.0)
 
     def _capture_group(self, request, response):
         try:
             provider_response = self._request_group_capture(
-                request.group_id, request.request_id, trigger_only=request.trigger_only
+                request.group_id,
+                request.request_id,
+                trigger_only=request.trigger_only,
+                has_requested_time=request.has_requested_time,
+                requested_time=request.requested_time,
             )
             response.success = provider_response.success
             response.message = provider_response.message

@@ -4,6 +4,7 @@ from http.server import ThreadingHTTPServer
 from types import SimpleNamespace
 
 from vixel_web.gateway import (
+    capture_operation_to_dict,
     capture_record_to_dict,
     group_to_dict,
     Handler,
@@ -68,6 +69,24 @@ def test_capture_record_is_exposed_as_json():
     assert value["scheduled_time"] == {"sec": 12, "nanosec": 34}
     assert value["saved_sensor_ids"] == ["a", "b"]
     assert value["trigger_span_ns"] == 1200
+
+
+def test_capture_operation_is_exposed_as_json():
+    stamp = SimpleNamespace(sec=12, nanosec=34)
+    operation = SimpleNamespace(
+        operation_id="operation_1", kind="sequence", status="running",
+        message="capturing", group_ids=["front", "back"], requested_cycles=10,
+        scheduled_cycles=4, completed_cycles=2, failed_cycles=0, pending_saves=4,
+        capture_ids=["run_1_front"], first_scheduled_time=stamp,
+        last_scheduled_time=stamp, interval_ms=500, synchronize_groups=True,
+        metadata_json='{"job":"test"}',
+    )
+
+    value = capture_operation_to_dict(operation)
+
+    assert value["interval_ms"] == 500
+    assert value["group_ids"] == ["front", "back"]
+    assert value["metadata"] == {"job": "test"}
 
 
 def test_health_response_tracks_manager_age_and_counts():
@@ -203,6 +222,7 @@ def test_known_sensor_json_fields_are_exposed_as_structured_values():
         last_seen_at="2026-07-21T10:00:00+00:00", sighting_count=3,
         transport="gige", interface_name="enp7s0", current_address="192.168.2.11",
         network_id="camera_link_2", notes="spare",
+        camera_profile="lucid_indoor",
         provider_settings_json='{"exposure_us":1200}',
         last_configuration_json='{"location_label":"front_left"}',
         changes_json='[{"timestamp":"2026-07-21T10:00:00+00:00"}]',
@@ -212,5 +232,6 @@ def test_known_sensor_json_fields_are_exposed_as_structured_values():
     value = known_sensor_to_dict(sensor)
 
     assert value["provider_settings"] == {"exposure_us": 1200}
+    assert value["camera_profile"] == "lucid_indoor"
     assert value["last_configuration"]["location_label"] == "front_left"
     assert value["changes"][0]["timestamp"].startswith("2026-07-21")

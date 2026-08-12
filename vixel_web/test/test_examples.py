@@ -210,6 +210,25 @@ def test_periodic_save_uses_capture_endpoint(monkeypatch):
     assert result["capture_id"] == "saved_front"
 
 
+def test_periodic_sequence_uses_server_managed_cadence(monkeypatch):
+    example = load_example("http_trigger_groups_periodic")
+    captured = {}
+
+    def request(base_url, path, timeout, body=None):
+        captured.update(base_url=base_url, path=path, timeout=timeout, body=body)
+        return {"accepted": True, "operation_id": "operation_1"}
+
+    monkeypatch.setattr(example, "api_request", request)
+    result = example.start_save_sequence(
+        "http://127.0.0.1:8080", ["front", "back"], 0.5, 10, "periodic", 5.0
+    )
+
+    assert result["operation_id"] == "operation_1"
+    assert captured["path"] == "/api/v1/capture-operations/sequence"
+    assert captured["body"]["interval_ms"] == 500
+    assert captured["body"]["synchronize_groups"] is True
+
+
 def test_examples_are_linked_from_documentation():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     operations = (ROOT / "docs" / "operations.md").read_text(encoding="utf-8")

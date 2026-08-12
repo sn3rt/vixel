@@ -1,0 +1,5 @@
+string operation_id
+---
+bool success
+string message
+CaptureOperation operation

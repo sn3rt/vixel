@@ -1,0 +1,11 @@
+schema_version: 1
+name: lucid_triton_manual
+description: Fixed exposure and gain starting point for LUCID Triton capture
+settings:
+  pixel_format: BGR8
+  exposure_auto: "Off"
+  exposure_us: 1500.0
+  gain_auto: "Off"
+  gain_db: 0.0
+  frame_rate_hz: 10.0
+  capture_png_compression: 1

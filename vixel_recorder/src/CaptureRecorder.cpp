@@ -3,18 +3,26 @@
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/compressed_image.hpp>
+#include <sensor_msgs/msg/nav_sat_fix.hpp>
 #include <vixel_interfaces/action/record_capture.hpp>
 #include <vixel_interfaces/msg/capture_frame_chunk.hpp>
+#include <vixel_interfaces/msg/capture_operation.hpp>
+#include <vixel_interfaces/msg/capture_operation_array.hpp>
 #include <vixel_interfaces/msg/capture_record.hpp>
 #include <vixel_interfaces/msg/capture_record_array.hpp>
 #include <vixel_interfaces/msg/sensor_array.hpp>
 #include <vixel_interfaces/msg/sync_group_array.hpp>
 #include <vixel_interfaces/srv/capture_group.hpp>
+#include <vixel_interfaces/srv/cancel_capture_operation.hpp>
+#include <vixel_interfaces/srv/get_capture_operation.hpp>
+#include <vixel_interfaces/srv/start_capture_sequence.hpp>
+#include <vixel_interfaces/srv/submit_capture_batch.hpp>
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cctype>
 #include <filesystem>
@@ -42,8 +50,21 @@ namespace
 {
 using CaptureGroup = vixel_interfaces::srv::CaptureGroup;
 using CaptureRecord = vixel_interfaces::msg::CaptureRecord;
+using CaptureOperation = vixel_interfaces::msg::CaptureOperation;
 using RecordCapture = vixel_interfaces::action::RecordCapture;
 using GoalHandle = rclcpp_action::ServerGoalHandle<RecordCapture>;
+using ClientGoalHandle = rclcpp_action::ClientGoalHandle<RecordCapture>;
+
+struct OperationState
+{
+  CaptureOperation value;
+  std::string request_prefix;
+  bool stop_scheduling{false};
+  bool cancelled_by_user{false};
+  bool scheduling_done{false};
+  std::map<std::uint32_t, std::size_t> cycle_results;
+  std::map<std::uint32_t, std::size_t> cycle_failures;
+};
 
 struct RecorderConfig
 {
@@ -51,6 +72,10 @@ struct RecorderConfig
   std::uintmax_t minimum_free_bytes{5ULL * 1024ULL * 1024ULL * 1024ULL};
   std::chrono::milliseconds capture_timeout{10000};
   std::size_t recent_limit{100};
+  std::size_t max_inflight_captures{32};
+  bool gps_enabled{false};
+  std::string gps_topic{"/fix"};
+  std::chrono::milliseconds gps_max_age{2000};
 };
 
 template<typename T>
@@ -71,9 +96,22 @@ RecorderConfig load_config(const std::string & path)
   result.capture_timeout = std::chrono::milliseconds(
     read_or(recording, "capture_timeout_ms", static_cast<int>(result.capture_timeout.count())));
   result.recent_limit = read_or(recording, "recent_limit", result.recent_limit);
+  result.max_inflight_captures = read_or(
+    recording, "max_inflight_captures", result.max_inflight_captures);
+  const auto gps = recording["gps"];
+  result.gps_enabled = read_or(gps, "enabled", result.gps_enabled);
+  result.gps_topic = read_or(gps, "topic", result.gps_topic);
+  result.gps_max_age = std::chrono::milliseconds(
+    read_or(gps, "max_age_ms", static_cast<int>(result.gps_max_age.count())));
   if (result.root_directory.empty()) {throw std::runtime_error("recording root is empty");}
   if (result.capture_timeout < 1s || result.capture_timeout > 60s) {
     throw std::runtime_error("recording capture timeout must be between 1 and 60 seconds");
+  }
+  if (result.max_inflight_captures == 0 || result.max_inflight_captures > 256) {
+    throw std::runtime_error("recording max_inflight_captures must be between 1 and 256");
+  }
+  if (result.gps_enabled && (result.gps_topic.empty() || result.gps_max_age.count() < 0)) {
+    throw std::runtime_error("recording GPS topic/max_age_ms is invalid");
   }
   return result;
 }
@@ -104,6 +142,17 @@ std::string generated_capture_id(std::uint64_t sequence)
   result << "capture_" << std::put_time(&value, "%Y%m%dT%H%M%S") <<
     std::setfill('0') << std::setw(3) << milliseconds.count() << "Z_" << sequence;
   return result.str();
+}
+
+builtin_interfaces::msg::Time system_time_message(
+  const std::chrono::system_clock::time_point & value)
+{
+  const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    value.time_since_epoch()).count();
+  builtin_interfaces::msg::Time result;
+  result.sec = static_cast<std::int32_t>(ns / 1000000000LL);
+  result.nanosec = static_cast<std::uint32_t>(ns % 1000000000LL);
+  return result;
 }
 
 bool safe_identifier(const std::string & value)
@@ -173,7 +222,9 @@ struct FrameBucket
 
   std::mutex mutex;
   std::condition_variable changed;
-  std::map<std::string, std::vector<sensor_msgs::msg::CompressedImage::ConstSharedPtr>> images;
+  std::map<
+    std::string,
+    std::map<std::string, sensor_msgs::msg::CompressedImage::ConstSharedPtr>> images;
   std::map<std::string, std::map<std::string, ChunkAssembly>> assemblies;
   std::map<std::string, std::vector<sensor_msgs::msg::CameraInfo::ConstSharedPtr>> camera_info;
 };
@@ -189,14 +240,6 @@ struct CaptureSubscriptions
     std::string, rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr>
   info_subscriptions;
 };
-
-void append_bounded(
-  std::vector<sensor_msgs::msg::CompressedImage::ConstSharedPtr> & values,
-  sensor_msgs::msg::CompressedImage::ConstSharedPtr value)
-{
-  values.push_back(std::move(value));
-  if (values.size() > 4) {values.erase(values.begin());}
-}
 
 void append_bounded(
   std::vector<sensor_msgs::msg::CameraInfo::ConstSharedPtr> & values,
@@ -215,7 +258,13 @@ void accept_chunk(
   {
     return;
   }
-  auto & assembly = frames.assemblies[sensor_id][chunk.capture_id];
+  auto & sensor_assemblies = frames.assemblies[sensor_id];
+  if (sensor_assemblies.count(chunk.capture_id) == 0) {
+    while (sensor_assemblies.size() >= 64) {
+      sensor_assemblies.erase(sensor_assemblies.begin());
+    }
+  }
+  auto & assembly = sensor_assemblies[chunk.capture_id];
   if (assembly.chunk_count == 0) {
     assembly.header = chunk.header;
     assembly.format = chunk.format;
@@ -245,7 +294,11 @@ void accept_chunk(
   for (const auto & value : assembly.chunks) {
     image->data.insert(image->data.end(), value.begin(), value.end());
   }
-  append_bounded(frames.images[sensor_id], std::move(image));
+  auto & sensor_images = frames.images[sensor_id];
+  if (sensor_images.count(chunk.capture_id) == 0) {
+    while (sensor_images.size() >= 64) {sensor_images.erase(sensor_images.begin());}
+  }
+  sensor_images[chunk.capture_id] = std::move(image);
   frames.assemblies[sensor_id].erase(chunk.capture_id);
   frames.changed.notify_all();
 }
@@ -282,9 +335,17 @@ public:
         groups_.clear();
         for (const auto & group : message->groups) {groups_[group.group_id] = group;}
       });
+    if (config_.gps_enabled) {
+      gps_subscription_ = create_subscription<sensor_msgs::msg::NavSatFix>(
+        config_.gps_topic, rclcpp::SensorDataQoS(),
+        [this](sensor_msgs::msg::NavSatFix::ConstSharedPtr fix) {
+          std::lock_guard<std::mutex> lock(gps_mutex_);
+          latest_gps_ = std::move(fix);
+        });
+    }
     capture_client_ = create_client<CaptureGroup>("/vixel/capture_group");
     capture_callback_group_ = create_callback_group(
-      rclcpp::CallbackGroupType::MutuallyExclusive, false);
+      rclcpp::CallbackGroupType::Reentrant, false);
     records_publisher_ = create_publisher<vixel_interfaces::msg::CaptureRecordArray>(
       "/vixel/capture_records", state_qos);
     action_server_ = rclcpp_action::create_server<RecordCapture>(
@@ -292,7 +353,32 @@ public:
       std::bind(&CaptureRecorder::handle_goal, this, std::placeholders::_1, std::placeholders::_2),
       std::bind(&CaptureRecorder::handle_cancel, this, std::placeholders::_1),
       std::bind(&CaptureRecorder::handle_accepted, this, std::placeholders::_1));
+    operation_capture_client_ = rclcpp_action::create_client<RecordCapture>(
+      this, "/vixel/record_capture");
+    operations_publisher_ = create_publisher<vixel_interfaces::msg::CaptureOperationArray>(
+      "/vixel/capture_operations", state_qos);
+    submit_batch_service_ = create_service<vixel_interfaces::srv::SubmitCaptureBatch>(
+      "/vixel/submit_capture_batch",
+      std::bind(
+        &CaptureRecorder::submit_capture_batch, this, std::placeholders::_1,
+        std::placeholders::_2));
+    start_sequence_service_ = create_service<vixel_interfaces::srv::StartCaptureSequence>(
+      "/vixel/start_capture_sequence",
+      std::bind(
+        &CaptureRecorder::start_capture_sequence, this, std::placeholders::_1,
+        std::placeholders::_2));
+    get_operation_service_ = create_service<vixel_interfaces::srv::GetCaptureOperation>(
+      "/vixel/get_capture_operation",
+      std::bind(
+        &CaptureRecorder::get_capture_operation, this, std::placeholders::_1,
+        std::placeholders::_2));
+    cancel_operation_service_ = create_service<vixel_interfaces::srv::CancelCaptureOperation>(
+      "/vixel/cancel_capture_operation",
+      std::bind(
+        &CaptureRecorder::cancel_capture_operation, this, std::placeholders::_1,
+        std::placeholders::_2));
     publish_records();
+    publish_operations();
     RCLCPP_INFO(
       get_logger(), "Capture recorder ready at %s (minimum free %.2f GiB)",
       config_.root_directory.c_str(),
@@ -300,6 +386,401 @@ public:
   }
 
 private:
+  nlohmann::json gps_for_capture(const builtin_interfaces::msg::Time & capture_time)
+  {
+    sensor_msgs::msg::NavSatFix::ConstSharedPtr fix;
+    {
+      std::lock_guard<std::mutex> lock(gps_mutex_);
+      fix = latest_gps_;
+    }
+    if (!fix || fix->status.status < 0 || !std::isfinite(fix->latitude) ||
+      !std::isfinite(fix->longitude) || !std::isfinite(fix->altitude))
+    {
+      return nlohmann::json::object();
+    }
+    const auto capture_ns = static_cast<std::int64_t>(capture_time.sec) * 1000000000LL +
+      capture_time.nanosec;
+    const auto fix_ns = static_cast<std::int64_t>(fix->header.stamp.sec) * 1000000000LL +
+      fix->header.stamp.nanosec;
+    const auto age_ms = std::llabs(capture_ns - fix_ns) / 1000000LL;
+    if (fix_ns == 0 || age_ms > config_.gps_max_age.count()) {
+      return nlohmann::json::object();
+    }
+    return {
+      {"topic", config_.gps_topic}, {"stamp", stamp_json(fix->header.stamp)},
+      {"age_ms", age_ms}, {"frame_id", fix->header.frame_id},
+      {"status", fix->status.status}, {"service", fix->status.service},
+      {"latitude", fix->latitude}, {"longitude", fix->longitude},
+      {"altitude", fix->altitude},
+      {"position_covariance", fix->position_covariance},
+      {"position_covariance_type", fix->position_covariance_type}
+    };
+  }
+
+  std::optional<std::string> validate_operation_request(
+    const std::vector<std::string> & group_ids, const std::string & request_id,
+    const std::string & metadata_json)
+  {
+    if (group_ids.empty()) {return "at least one synchronization group is required";}
+    if (request_id.size() > 64 || (!request_id.empty() && !safe_identifier(request_id))) {
+      return "request_id must be a safe identifier of at most 64 characters";
+    }
+    if (metadata_json.size() > 65536) {return "metadata_json exceeds 64 KiB";}
+    if (!metadata_json.empty()) {
+      try {
+        if (!nlohmann::json::parse(metadata_json).is_object()) {
+          return "metadata_json must contain a JSON object";
+        }
+      } catch (const std::exception & error) {
+        return std::string("metadata_json is invalid: ") + error.what();
+      }
+    }
+    std::set<std::string> unique;
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    for (const auto & group_id : group_ids) {
+      if (!unique.insert(group_id).second) {return "group_ids contains a duplicate";}
+      const auto group = groups_.find(group_id);
+      if (group == groups_.end()) {return "unknown synchronization group " + group_id;}
+      if (group->second.operating_mode != "capture" || !group->second.ready) {
+        return "synchronization group " + group_id + " is not capture-ready";
+      }
+    }
+    return std::nullopt;
+  }
+
+  std::string make_operation_id()
+  {
+    auto value = generated_capture_id(++operation_sequence_);
+    value.replace(0, std::string("capture").size(), "operation");
+    return value;
+  }
+
+  std::shared_ptr<OperationState> create_operation(
+    const std::string & kind, const std::vector<std::string> & group_ids,
+    const std::string & request_id, std::uint32_t count, std::uint32_t interval_ms,
+    bool synchronize_groups, const std::string & metadata_json,
+    const builtin_interfaces::msg::Time & first_time)
+  {
+    auto operation = std::make_shared<OperationState>();
+    operation->value.stamp = now();
+    operation->value.operation_id = make_operation_id();
+    operation->value.kind = kind;
+    operation->value.status = "accepted";
+    operation->value.message = "capture operation accepted";
+    operation->value.group_ids = group_ids;
+    operation->value.requested_cycles = count;
+    operation->value.interval_ms = interval_ms;
+    operation->value.synchronize_groups = synchronize_groups;
+    operation->value.metadata_json = metadata_json;
+    operation->value.first_scheduled_time = first_time;
+    operation->request_prefix = request_id.empty() ? operation->value.operation_id : request_id;
+    {
+      std::lock_guard<std::mutex> lock(operations_mutex_);
+      operations_[operation->value.operation_id] = operation;
+      ++operations_generation_;
+    }
+    publish_operations();
+    return operation;
+  }
+
+  void submit_capture_batch(
+    const std::shared_ptr<vixel_interfaces::srv::SubmitCaptureBatch::Request> request,
+    std::shared_ptr<vixel_interfaces::srv::SubmitCaptureBatch::Response> response)
+  {
+    if (const auto error = validate_operation_request(
+        request->group_ids, request->request_id, request->metadata_json))
+    {
+      response->accepted = false;
+      response->message = *error;
+      return;
+    }
+    const auto first = std::chrono::system_clock::now() + 750ms;
+    const auto first_message = system_time_message(first);
+    auto operation = create_operation(
+      "batch", request->group_ids, request->request_id, 1, 0,
+      request->synchronize_groups, request->metadata_json,
+      request->synchronize_groups ? first_message : builtin_interfaces::msg::Time{});
+    response->accepted = true;
+    response->message = "batch accepted for asynchronous capture";
+    response->operation_id = operation->value.operation_id;
+    if (request->synchronize_groups) {response->scheduled_time = first_message;}
+    std::thread([this, operation, first]() {schedule_operation(operation, first, 1);}).detach();
+  }
+
+  void start_capture_sequence(
+    const std::shared_ptr<vixel_interfaces::srv::StartCaptureSequence::Request> request,
+    std::shared_ptr<vixel_interfaces::srv::StartCaptureSequence::Response> response)
+  {
+    if (const auto error = validate_operation_request(
+        request->group_ids, request->request_id, request->metadata_json))
+    {
+      response->accepted = false;
+      response->message = *error;
+      return;
+    }
+    if (request->interval_ms < 100 || request->interval_ms > 86400000U) {
+      response->accepted = false;
+      response->message = "interval_ms must be between 100 and 86400000";
+      return;
+    }
+    const auto first = std::chrono::system_clock::now() + 1000ms;
+    const auto first_message = system_time_message(first);
+    auto operation = create_operation(
+      "sequence", request->group_ids, request->request_id, request->count,
+      request->interval_ms, request->synchronize_groups, request->metadata_json, first_message);
+    response->accepted = true;
+    response->message = request->count == 0 ?
+      "continuous sequence accepted" : "finite sequence accepted";
+    response->operation_id = operation->value.operation_id;
+    response->first_scheduled_time = first_message;
+    std::thread(
+      [this, operation, first, count = request->count]() {
+        schedule_operation(operation, first, count);
+      }).detach();
+  }
+
+  void get_capture_operation(
+    const std::shared_ptr<vixel_interfaces::srv::GetCaptureOperation::Request> request,
+    std::shared_ptr<vixel_interfaces::srv::GetCaptureOperation::Response> response)
+  {
+    std::lock_guard<std::mutex> lock(operations_mutex_);
+    const auto operation = operations_.find(request->operation_id);
+    if (operation == operations_.end()) {
+      response->success = false;
+      response->message = "unknown capture operation";
+      return;
+    }
+    response->success = true;
+    response->message = "capture operation found";
+    response->operation = operation->second->value;
+  }
+
+  void cancel_capture_operation(
+    const std::shared_ptr<vixel_interfaces::srv::CancelCaptureOperation::Request> request,
+    std::shared_ptr<vixel_interfaces::srv::CancelCaptureOperation::Response> response)
+  {
+    {
+      std::lock_guard<std::mutex> lock(operations_mutex_);
+      const auto operation = operations_.find(request->operation_id);
+      if (operation == operations_.end()) {
+        response->success = false;
+        response->message = "unknown capture operation";
+        return;
+      }
+      auto & state = *operation->second;
+      if (state.scheduling_done && state.value.pending_saves == 0) {
+        response->success = false;
+        response->message = "capture operation has already finished";
+        response->operation = state.value;
+        return;
+      }
+      state.stop_scheduling = true;
+      state.cancelled_by_user = true;
+      state.value.status = state.value.pending_saves == 0 ? "cancelled" : "draining";
+      state.value.message = "future captures cancelled; accepted captures will finish";
+      state.value.stamp = now();
+      ++operations_generation_;
+      response->success = true;
+      response->message = state.value.message;
+      response->operation = state.value;
+    }
+    publish_operations();
+  }
+
+  void schedule_operation(
+    const std::shared_ptr<OperationState> & operation,
+    const std::chrono::system_clock::time_point & first_time, std::uint32_t count)
+  {
+    if (!operation_capture_client_->wait_for_action_server(2s)) {
+      {
+        std::lock_guard<std::mutex> lock(operations_mutex_);
+        operation->stop_scheduling = true;
+        operation->scheduling_done = true;
+        operation->value.status = "failed";
+        operation->value.message = "capture action server is unavailable";
+        operation->value.stamp = now();
+        ++operations_generation_;
+      }
+      publish_operations();
+      return;
+    }
+    const auto interval = std::chrono::milliseconds(operation->value.interval_ms);
+    std::uint32_t cycle = 1;
+    while (rclcpp::ok() && (count == 0 || cycle <= count)) {
+      const auto target = first_time + interval * (cycle - 1);
+      const auto dispatch = target - 750ms;
+      while (rclcpp::ok() && std::chrono::system_clock::now() < dispatch) {
+        {
+          std::lock_guard<std::mutex> lock(operations_mutex_);
+          if (operation->stop_scheduling) {break;}
+        }
+        std::this_thread::sleep_for(20ms);
+      }
+      {
+        std::lock_guard<std::mutex> lock(operations_mutex_);
+        if (operation->stop_scheduling) {break;}
+      }
+      {
+        std::lock_guard<std::mutex> lock(active_captures_mutex_);
+        if (active_capture_count_ + operation->value.group_ids.size() >
+          config_.max_inflight_captures)
+        {
+          std::lock_guard<std::mutex> operations_lock(operations_mutex_);
+          operation->stop_scheduling = true;
+          operation->value.status = "draining";
+          operation->value.message =
+            "sequence stopped at recorder capacity; accepted captures will finish";
+          ++operations_generation_;
+          break;
+        }
+      }
+      dispatch_cycle(operation, cycle, target);
+      ++cycle;
+    }
+    {
+      std::lock_guard<std::mutex> lock(operations_mutex_);
+      operation->scheduling_done = true;
+      if (operation->value.pending_saves == 0) {finish_operation_locked(*operation);}
+      else if (!operation->stop_scheduling) {
+        operation->value.status = "draining";
+        operation->value.message = "all captures scheduled; waiting for saves";
+      }
+      operation->value.stamp = now();
+      ++operations_generation_;
+    }
+    publish_operations();
+  }
+
+  void dispatch_cycle(
+    const std::shared_ptr<OperationState> & operation, std::uint32_t cycle,
+    const std::chrono::system_clock::time_point & target)
+  {
+    const auto requested_time = system_time_message(target);
+    std::vector<std::pair<std::string, RecordCapture::Goal>> goals;
+    {
+      std::lock_guard<std::mutex> lock(operations_mutex_);
+      operation->value.status = "running";
+      operation->value.message = "capturing";
+      std::size_t group_index = 0;
+      for (const auto & group_id : operation->value.group_ids) {
+        RecordCapture::Goal goal;
+        goal.group_id = group_id;
+        goal.request_id = operation->request_prefix + "_" + std::to_string(cycle) + "_" + group_id;
+        if (!safe_identifier(goal.request_id)) {
+          operation->value.pending_saves -= goals.size();
+          operation->value.capture_ids.resize(
+            operation->value.capture_ids.size() - goals.size());
+          goals.clear();
+          operation->stop_scheduling = true;
+          operation->value.status = "failed";
+          operation->value.message = "generated capture ID is too long or unsafe";
+          break;
+        }
+        goal.has_requested_time = operation->value.kind == "sequence" ||
+          operation->value.synchronize_groups;
+        const auto group_target = target +
+          (operation->value.synchronize_groups ? 0ms :
+          std::chrono::milliseconds(5 * static_cast<std::int64_t>(group_index)));
+        goal.requested_time = system_time_message(group_target);
+        goal.operation_id = operation->value.operation_id;
+        goal.cycle = cycle;
+        goal.metadata_json = operation->value.metadata_json;
+        operation->value.capture_ids.push_back(goal.request_id);
+        ++operation->value.pending_saves;
+        goals.emplace_back(group_id, std::move(goal));
+        ++group_index;
+      }
+      if (!operation->stop_scheduling) {
+        ++operation->value.scheduled_cycles;
+        if (operation->value.kind == "sequence" || operation->value.synchronize_groups) {
+          operation->value.last_scheduled_time = requested_time;
+        }
+      }
+      operation->value.stamp = now();
+      ++operations_generation_;
+    }
+    publish_operations();
+    if (operation->stop_scheduling) {return;}
+    for (auto & item : goals) {
+      rclcpp_action::Client<RecordCapture>::SendGoalOptions options;
+      options.goal_response_callback =
+        [this, operation, cycle](const ClientGoalHandle::SharedPtr & handle) {
+          if (!handle) {
+            capture_finished(operation, cycle, false, "capture action rejected");
+          }
+        };
+      options.result_callback =
+        [this, operation, cycle](const ClientGoalHandle::WrappedResult & result) {
+          const bool success = result.code == rclcpp_action::ResultCode::SUCCEEDED &&
+            result.result && result.result->success;
+          const auto message = result.result ? result.result->message : "capture action failed";
+          capture_finished(operation, cycle, success, message);
+        };
+      try {
+        operation_capture_client_->async_send_goal(item.second, options);
+      } catch (const std::exception & error) {
+        capture_finished(operation, cycle, false, error.what());
+      }
+    }
+  }
+
+  void capture_finished(
+    const std::shared_ptr<OperationState> & operation, std::uint32_t cycle,
+    bool success, const std::string & message)
+  {
+    {
+      std::lock_guard<std::mutex> lock(operations_mutex_);
+      if (operation->value.pending_saves != 0) {--operation->value.pending_saves;}
+      ++operation->cycle_results[cycle];
+      if (!success) {
+        ++operation->cycle_failures[cycle];
+        operation->stop_scheduling = true;
+        operation->value.message = message;
+      }
+      if (operation->cycle_results[cycle] == operation->value.group_ids.size()) {
+        if (operation->cycle_failures[cycle] == 0) {++operation->value.completed_cycles;}
+        else {++operation->value.failed_cycles;}
+      }
+      if (operation->scheduling_done && operation->value.pending_saves == 0) {
+        finish_operation_locked(*operation);
+      }
+      operation->value.stamp = now();
+      ++operations_generation_;
+    }
+    publish_operations();
+  }
+
+  void finish_operation_locked(OperationState & operation)
+  {
+    if (operation.stop_scheduling) {
+      operation.value.status = operation.cancelled_by_user ? "cancelled" : "failed";
+      if (operation.value.message.empty()) {
+        operation.value.message = "capture operation stopped";
+      }
+    } else if (operation.value.failed_cycles != 0) {
+      operation.value.status = "failed";
+      operation.value.message = "one or more capture cycles failed";
+    } else {
+      operation.value.status = "complete";
+      operation.value.message = "all capture cycles saved";
+    }
+  }
+
+  void publish_operations()
+  {
+    if (!operations_publisher_) {return;}
+    vixel_interfaces::msg::CaptureOperationArray message;
+    message.header.stamp = now();
+    {
+      std::lock_guard<std::mutex> lock(operations_mutex_);
+      message.generation = operations_generation_;
+      for (auto iterator = operations_.rbegin(); iterator != operations_.rend(); ++iterator) {
+        message.operations.push_back(iterator->second->value);
+      }
+    }
+    operations_publisher_->publish(message);
+  }
+
   rclcpp_action::GoalResponse handle_goal(
     const rclcpp_action::GoalUUID &, std::shared_ptr<const RecordCapture::Goal> goal)
   {
@@ -307,26 +788,34 @@ private:
     if (!goal->request_id.empty() && !safe_identifier(goal->request_id)) {
       return rclcpp_action::GoalResponse::REJECT;
     }
-    std::vector<std::string> member_ids;
+    if (goal->metadata_json.size() > 65536) {
+      return rclcpp_action::GoalResponse::REJECT;
+    }
+    if (!goal->metadata_json.empty()) {
+      try {
+        if (!nlohmann::json::parse(goal->metadata_json).is_object()) {
+          return rclcpp_action::GoalResponse::REJECT;
+        }
+      } catch (...) {
+        return rclcpp_action::GoalResponse::REJECT;
+      }
+    }
     {
       std::lock_guard<std::mutex> lock(state_mutex_);
       const auto group = groups_.find(goal->group_id);
       if (group == groups_.end() || group->second.member_ids.empty()) {
         return rclcpp_action::GoalResponse::REJECT;
       }
-      member_ids = group->second.member_ids;
     }
     {
       std::lock_guard<std::mutex> lock(active_captures_mutex_);
-      if (active_capture_groups_.count(goal->group_id) != 0 ||
-        std::any_of(member_ids.begin(), member_ids.end(), [this](const auto & sensor_id) {
-          return active_capture_sensors_.count(sensor_id) != 0;
-        }))
+      if (active_capture_count_ >= config_.max_inflight_captures ||
+        (!goal->request_id.empty() && active_capture_ids_.count(goal->request_id) != 0))
       {
         return rclcpp_action::GoalResponse::REJECT;
       }
-      active_capture_groups_[goal->group_id] = member_ids;
-      active_capture_sensors_.insert(member_ids.begin(), member_ids.end());
+      ++active_capture_count_;
+      if (!goal->request_id.empty()) {active_capture_ids_.insert(goal->request_id);}
     }
     return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
   }
@@ -365,17 +854,25 @@ private:
       return;
     }
     const auto sensor_id = sensor.sensor_id;
-    const auto capture_qos = rclcpp::QoS(rclcpp::KeepLast(128)).reliable();
+    const auto capture_qos = rclcpp::QoS(rclcpp::KeepLast(256)).reliable();
     rclcpp::SubscriptionOptions options;
     options.callback_group = capture_callback_group_;
     capture_image_subscriptions_[sensor_id] =
       create_subscription<vixel_interfaces::msg::CaptureFrameChunk>(
       sensor.topic_base + "/image_capture/chunks", capture_qos,
-      [](vixel_interfaces::msg::CaptureFrameChunk::ConstSharedPtr) {}, options);
+      [frames = capture_frames_, sensor_id](
+        vixel_interfaces::msg::CaptureFrameChunk::ConstSharedPtr chunk) {
+        std::lock_guard<std::mutex> lock(frames->mutex);
+        accept_chunk(*frames, sensor_id, *chunk);
+      }, options);
     capture_info_subscriptions_[sensor_id] =
       create_subscription<sensor_msgs::msg::CameraInfo>(
       sensor.topic_base + "/camera_info", rclcpp::SensorDataQoS(),
-      [](sensor_msgs::msg::CameraInfo::ConstSharedPtr) {}, options);
+      [frames = capture_frames_, sensor_id](sensor_msgs::msg::CameraInfo::ConstSharedPtr info) {
+        std::lock_guard<std::mutex> lock(frames->mutex);
+        append_bounded(frames->camera_info[sensor_id], std::move(info));
+        frames->changed.notify_all();
+      }, options);
   }
 
   CaptureSubscriptions subscribe(const std::vector<std::string> & sensor_ids)
@@ -383,14 +880,6 @@ private:
     CaptureSubscriptions result;
     std::lock_guard<std::mutex> state_lock(state_mutex_);
     result.frames = capture_frames_;
-    {
-      std::lock_guard<std::mutex> frames_lock(capture_frames_->mutex);
-      for (const auto & sensor_id : sensor_ids) {
-        capture_frames_->images.erase(sensor_id);
-        capture_frames_->assemblies.erase(sensor_id);
-        capture_frames_->camera_info.erase(sensor_id);
-      }
-    }
     for (const auto & sensor_id : sensor_ids) {
       auto sensor = sensors_.find(sensor_id);
       if (sensor == sensors_.end() || sensor->second.topic_base.empty()) {
@@ -405,20 +894,23 @@ private:
 
   void execute(const std::shared_ptr<GoalHandle> & handle)
   {
+    const auto execution_started = std::chrono::steady_clock::now();
+    auto acquisition_finished = execution_started;
     struct ActiveGuard
     {
       std::mutex & mutex;
-      std::map<std::string, std::vector<std::string>> & groups;
-      std::set<std::string> & sensors;
-      std::string group_id;
+      std::size_t & count;
+      std::set<std::string> & capture_ids;
+      std::string capture_id;
+      bool released{false};
 
       void release()
       {
         std::lock_guard<std::mutex> lock(mutex);
-        const auto group = groups.find(group_id);
-        if (group == groups.end()) {return;}
-        for (const auto & sensor_id : group->second) {sensors.erase(sensor_id);}
-        groups.erase(group);
+        if (released) {return;}
+        if (count != 0) {--count;}
+        if (!capture_id.empty()) {capture_ids.erase(capture_id);}
+        released = true;
       }
 
       ~ActiveGuard()
@@ -426,24 +918,19 @@ private:
         release();
       }
     } guard{
-      active_captures_mutex_, active_capture_groups_, active_capture_sensors_,
-      handle->get_goal()->group_id};
+      active_captures_mutex_, active_capture_count_, active_capture_ids_,
+      handle->get_goal()->request_id};
 
     auto result = std::make_shared<RecordCapture::Result>();
     CaptureRecord record;
+    nlohmann::json gps_metadata = nlohmann::json::object();
     record.group_id = handle->get_goal()->group_id;
+    record.operation_id = handle->get_goal()->operation_id;
+    record.cycle = handle->get_goal()->cycle;
+    record.metadata_json = handle->get_goal()->metadata_json;
     record.started_at = utc_now();
     std::filesystem::path staging;
     try {
-      std::vector<std::string> reserved_member_ids;
-      {
-        std::lock_guard<std::mutex> lock(active_captures_mutex_);
-        const auto reservation = active_capture_groups_.find(record.group_id);
-        if (reservation == active_capture_groups_.end()) {
-          throw std::runtime_error("capture reservation is missing");
-        }
-        reserved_member_ids = reservation->second;
-      }
       vixel_interfaces::msg::SyncGroup group;
       std::map<std::string, vixel_interfaces::msg::Sensor> sensor_snapshot;
       {
@@ -454,9 +941,6 @@ private:
         }
         group = group_iterator->second;
         sensor_snapshot = sensors_;
-      }
-      if (group.member_ids != reserved_member_ids) {
-        throw std::runtime_error("synchronization group changed while capture was starting");
       }
       if (group.operating_mode != "capture") {
         throw std::runtime_error("set synchronization group to capture mode first");
@@ -505,6 +989,8 @@ private:
       request->group_id = record.group_id;
       request->request_id = record.capture_id;
       request->trigger_only = false;
+      request->has_requested_time = handle->get_goal()->has_requested_time;
+      request->requested_time = handle->get_goal()->requested_time;
       auto response_future = capture_client_->async_send_request(request);
       if (response_future.wait_for(config_.capture_timeout + 5s) != std::future_status::ready) {
         throw std::runtime_error("capture group service timed out");
@@ -521,6 +1007,7 @@ private:
       if (record.participating_sensor_ids.empty()) {
         throw std::runtime_error("capture has no participating sensors");
       }
+      if (config_.gps_enabled) {gps_metadata = gps_for_capture(record.scheduled_time);}
 
       feedback(
         handle, "waiting", "Waiting for captured image messages", 35, {},
@@ -529,69 +1016,14 @@ private:
       std::map<std::string, sensor_msgs::msg::CameraInfo::ConstSharedPtr> captured_info;
       std::size_t reported_count = 0;
       const auto deadline = std::chrono::steady_clock::now() + config_.capture_timeout;
-      rclcpp::WaitSet wait_set;
-      struct WaitSetSubscriptions
-      {
-        rclcpp::WaitSet & wait_set;
-        std::vector<std::shared_ptr<rclcpp::SubscriptionBase>> subscriptions;
-
-        void add(const std::shared_ptr<rclcpp::SubscriptionBase> & subscription)
-        {
-          wait_set.add_subscription(subscription);
-          subscriptions.push_back(subscription);
-        }
-
-        ~WaitSetSubscriptions()
-        {
-          for (
-            auto iterator = subscriptions.rbegin();
-            iterator != subscriptions.rend(); ++iterator)
-          {
-            try {
-              wait_set.remove_subscription(*iterator);
-            } catch (...) {
-              // Cleanup must not mask the capture result during stack unwinding.
-            }
-          }
-        }
-      } wait_set_subscriptions{wait_set, {}};
-      for (const auto & subscription : subscriptions.image_subscriptions) {
-        wait_set_subscriptions.add(subscription.second);
-      }
-      for (const auto & subscription : subscriptions.info_subscriptions) {
-        wait_set_subscriptions.add(subscription.second);
-      }
-      std::size_t chunks_taken = 0;
       while (std::chrono::steady_clock::now() < deadline) {
-        const auto wait_result = wait_set.wait(100ms);
-        (void)wait_result;
-        for (const auto & sensor_id : record.participating_sensor_ids) {
-          vixel_interfaces::msg::CaptureFrameChunk chunk;
-          rclcpp::MessageInfo message_info;
-          while (subscriptions.image_subscriptions.at(sensor_id)->take(chunk, message_info)) {
-            if (++chunks_taken == 1) {
-              RCLCPP_INFO(
-                get_logger(), "Receiving capture %s chunks",
-                record.capture_id.c_str());
-            }
-            std::lock_guard<std::mutex> lock(subscriptions.frames->mutex);
-            accept_chunk(*subscriptions.frames, sensor_id, chunk);
-          }
-          sensor_msgs::msg::CameraInfo info;
-          while (subscriptions.info_subscriptions.at(sensor_id)->take(info, message_info)) {
-            std::lock_guard<std::mutex> lock(subscriptions.frames->mutex);
-            append_bounded(
-              subscriptions.frames->camera_info[sensor_id],
-              std::make_shared<sensor_msgs::msg::CameraInfo>(info));
-          }
-        }
         {
-          std::lock_guard<std::mutex> lock(subscriptions.frames->mutex);
+          std::unique_lock<std::mutex> lock(subscriptions.frames->mutex);
+          subscriptions.frames->changed.wait_for(lock, 100ms);
           for (const auto & sensor_id : record.participating_sensor_ids) {
-            for (const auto & image : subscriptions.frames->images[sensor_id]) {
-              if (same_stamp(image->header.stamp, record.scheduled_time)) {
-                captured[sensor_id] = image;
-              }
+            const auto image = subscriptions.frames->images[sensor_id].find(record.capture_id);
+            if (image != subscriptions.frames->images[sensor_id].end()) {
+              captured[sensor_id] = image->second;
             }
             for (const auto & info : subscriptions.frames->camera_info[sensor_id]) {
               if (same_stamp(info->header.stamp, record.scheduled_time)) {
@@ -627,11 +1059,14 @@ private:
         }
         throw std::runtime_error("timed out waiting for one or more captured images");
       }
-
-      // The cameras are no longer needed once every lossless frame is held in
-      // this execution thread. Allow the next capture to acquire them while
-      // this capture is written to disk.
-      guard.release();
+      acquisition_finished = std::chrono::steady_clock::now();
+      {
+        std::lock_guard<std::mutex> lock(subscriptions.frames->mutex);
+        for (const auto & sensor_id : record.participating_sensor_ids) {
+          subscriptions.frames->images[sensor_id].erase(record.capture_id);
+          subscriptions.frames->assemblies[sensor_id].erase(record.capture_id);
+        }
+      }
 
       const auto date = record.started_at.substr(0, 10);
       const auto parent = config_.root_directory / date.substr(0, 4) / date.substr(5, 2) /
@@ -690,7 +1125,16 @@ private:
       record.completed_at = utc_now();
       record.directory = final_directory.string();
       record.message = response->message + "; images saved";
-      write_manifest(staging, record, sensor_manifest);
+      const auto writing_finished = std::chrono::steady_clock::now();
+      record.timings_json = nlohmann::json({
+        {"acquire_and_receive_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
+            acquisition_finished - execution_started).count()},
+        {"write_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
+            writing_finished - acquisition_finished).count()},
+        {"total_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
+            writing_finished - execution_started).count()}
+      }).dump();
+      write_manifest(staging, record, sensor_manifest, gps_metadata);
       std::filesystem::rename(staging, final_directory);
       staging.clear();
       add_record(record);
@@ -704,6 +1148,13 @@ private:
       handle->succeed(result);
       return;
     } catch (const std::exception & error) {
+      if (!record.capture_id.empty()) {
+        std::lock_guard<std::mutex> lock(capture_frames_->mutex);
+        for (const auto & sensor_id : record.requested_sensor_ids) {
+          capture_frames_->images[sensor_id].erase(record.capture_id);
+          capture_frames_->assemblies[sensor_id].erase(record.capture_id);
+        }
+      }
       record.status = handle->is_canceling() ? "cancelled" : "failed";
       record.completed_at = utc_now();
       record.message = error.what();
@@ -725,7 +1176,8 @@ private:
 
   void write_manifest(
     const std::filesystem::path & directory, const CaptureRecord & record,
-    const nlohmann::json & sensors)
+    const nlohmann::json & sensors,
+    const nlohmann::json & gps = nlohmann::json::object())
   {
     nlohmann::json timings = nlohmann::json::array();
     for (const auto & timing : record.camera_timings) {
@@ -736,9 +1188,17 @@ private:
         {"synchronized", timing.synchronized},
       });
     }
+    nlohmann::json metadata = nlohmann::json::object();
+    nlohmann::json capture_timings = nlohmann::json::object();
+    if (!record.metadata_json.empty()) {metadata = nlohmann::json::parse(record.metadata_json);}
+    if (!record.timings_json.empty()) {
+      capture_timings = nlohmann::json::parse(record.timings_json);
+    }
     nlohmann::json manifest{
-      {"schema_version", 1}, {"capture_id", record.capture_id},
+      {"schema_version", 2}, {"capture_id", record.capture_id},
       {"group_id", record.group_id}, {"status", record.status},
+      {"operation_id", record.operation_id}, {"cycle", record.cycle},
+      {"metadata", metadata}, {"capture_timings", capture_timings},
       {"message", record.message}, {"started_at", record.started_at},
       {"completed_at", record.completed_at},
       {"scheduled_time", stamp_json(record.scheduled_time)},
@@ -753,6 +1213,7 @@ private:
       {"synchronization", "ptp_scheduled_action_with_software_fallback"},
       {"sensors", sensors}
     };
+    if (!gps.empty()) {manifest["gps"] = gps;}
     std::ofstream output(directory / "manifest.json");
     output << std::setw(2) << manifest << '\n';
     if (!output) {throw std::runtime_error("failed to write capture manifest");}
@@ -823,6 +1284,10 @@ private:
     CaptureRecord record;
     record.capture_id = value.value("capture_id", directory.filename().string());
     record.group_id = value.value("group_id", "");
+    record.operation_id = value.value("operation_id", "");
+    record.cycle = value.value("cycle", 0U);
+    record.metadata_json = value.value("metadata", nlohmann::json::object()).dump();
+    record.timings_json = value.value("capture_timings", nlohmann::json::object()).dump();
     record.status = value.value("status", "unknown");
     record.directory = directory.string();
     record.message = value.value("message", "");
@@ -879,9 +1344,10 @@ private:
 
   RecorderConfig config_;
   std::atomic<std::uint64_t> capture_sequence_{0};
+  std::atomic<std::uint64_t> operation_sequence_{0};
   std::mutex active_captures_mutex_;
-  std::map<std::string, std::vector<std::string>> active_capture_groups_;
-  std::set<std::string> active_capture_sensors_;
+  std::size_t active_capture_count_{0};
+  std::set<std::string> active_capture_ids_;
   std::mutex state_mutex_;
   std::map<std::string, vixel_interfaces::msg::Sensor> sensors_;
   std::map<std::string, vixel_interfaces::msg::SyncGroup> groups_;
@@ -899,9 +1365,23 @@ private:
   std::uint64_t records_generation_{0};
   rclcpp::Subscription<vixel_interfaces::msg::SensorArray>::SharedPtr sensors_subscription_;
   rclcpp::Subscription<vixel_interfaces::msg::SyncGroupArray>::SharedPtr groups_subscription_;
+  std::mutex gps_mutex_;
+  sensor_msgs::msg::NavSatFix::ConstSharedPtr latest_gps_;
+  rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr gps_subscription_;
   rclcpp::Client<CaptureGroup>::SharedPtr capture_client_;
   rclcpp::Publisher<vixel_interfaces::msg::CaptureRecordArray>::SharedPtr records_publisher_;
   rclcpp_action::Server<RecordCapture>::SharedPtr action_server_;
+  rclcpp_action::Client<RecordCapture>::SharedPtr operation_capture_client_;
+  std::mutex operations_mutex_;
+  std::map<std::string, std::shared_ptr<OperationState>> operations_;
+  std::uint64_t operations_generation_{0};
+  rclcpp::Publisher<vixel_interfaces::msg::CaptureOperationArray>::SharedPtr
+  operations_publisher_;
+  rclcpp::Service<vixel_interfaces::srv::SubmitCaptureBatch>::SharedPtr submit_batch_service_;
+  rclcpp::Service<vixel_interfaces::srv::StartCaptureSequence>::SharedPtr start_sequence_service_;
+  rclcpp::Service<vixel_interfaces::srv::GetCaptureOperation>::SharedPtr get_operation_service_;
+  rclcpp::Service<vixel_interfaces::srv::CancelCaptureOperation>::SharedPtr
+  cancel_operation_service_;
 };
 
 }  // namespace vixel_recorder

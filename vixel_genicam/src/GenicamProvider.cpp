@@ -35,12 +35,14 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cctype>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <initializer_list>
 #include <limits>
@@ -725,7 +727,7 @@ public:
       base + "/image_raw", rclcpp::SensorDataQoS());
     compressed_publisher_ = node->create_publisher<sensor_msgs::msg::CompressedImage>(
       base + "/image_raw/compressed", rclcpp::SensorDataQoS());
-    const auto capture_qos = rclcpp::QoS(rclcpp::KeepLast(128)).reliable();
+    const auto capture_qos = rclcpp::QoS(rclcpp::KeepLast(256)).reliable();
     capture_publisher_ = node->create_publisher<vixel_interfaces::msg::CaptureFrameChunk>(
       base + "/image_capture/chunks", capture_qos);
     info_publisher_ = node->create_publisher<sensor_msgs::msg::CameraInfo>(
@@ -736,8 +738,10 @@ public:
 
   void publish(
     const cv::Mat & image, const builtin_interfaces::msg::Time & stamp,
-    const std::string & capture_id = {}, bool publish_capture_chunks = false)
+    const std::string & capture_id = {}, bool publish_capture_chunks = false,
+    int png_compression = 1)
   {
+    std::lock_guard<std::mutex> lock(publish_mutex_);
     std_msgs::msg::Header header;
     header.stamp = stamp;
     header.frame_id = frame_id_;
@@ -759,7 +763,7 @@ public:
       std::vector<std::uint8_t> encoded;
       if (!cv::imencode(
           ".png", image, encoded,
-          {cv::IMWRITE_PNG_COMPRESSION, config_.png_compression}))
+          {cv::IMWRITE_PNG_COMPRESSION, png_compression}))
       {
         throw std::runtime_error("OpenCV failed to encode full-resolution capture as PNG");
       }
@@ -787,6 +791,7 @@ public:
         capture_id.c_str(), assignment_sensor_id_.c_str(), chunk_count);
     }
 
+    if (compressed_publisher_->get_subscription_count() == 0) {return;}
     cv::Mat preview = image;
     if (image.cols > config_.preview_width) {
       const double scale = static_cast<double>(config_.preview_width) / image.cols;
@@ -813,6 +818,7 @@ public:
   }
 
 private:
+  std::mutex publish_mutex_;
   std::string assignment_sensor_id_;
   std::string frame_id_;
   GenicamConfig config_;
@@ -848,7 +854,16 @@ public:
     bool publish_capture_chunks{false};
     std::chrono::steady_clock::time_point release_at{};
     bool force_software_trigger{false};
+    bool metering{false};
     std::shared_ptr<FrameCompletion> completion;
+  };
+
+  struct EncodeJob
+  {
+    cv::Mat image;
+    builtin_interfaces::msg::Time stamp;
+    std::string capture_id;
+    bool publish_capture_chunks{false};
   };
 
   struct PtpState
@@ -906,6 +921,7 @@ public:
     streaming_.store(true);
     ready_.store(true);
     worker_ = std::thread(&CameraSession::worker_loop, this);
+    encoder_ = std::thread(&CameraSession::encoder_loop, this);
   }
 
   void shutdown()
@@ -913,8 +929,9 @@ public:
     if (stopping_.exchange(true)) {return;}
     {
       std::lock_guard<std::mutex> request_lock(request_mutex_);
-      if (pending_request_ && pending_request_->completion) {
-        auto completion = pending_request_->completion;
+      for (const auto & request : pending_requests_) {
+        if (!request.completion) {continue;}
+        auto completion = request.completion;
         {
           std::lock_guard<std::mutex> completion_lock(completion->mutex);
           completion->error = "camera session stopped";
@@ -922,11 +939,12 @@ public:
         }
         completion->changed.notify_all();
       }
-      pending_request_.reset();
-      request_active_ = false;
+      pending_requests_.clear();
     }
     request_cv_.notify_all();
+    encode_cv_.notify_all();
     if (worker_.joinable()) {worker_.join();}
+    if (encoder_.joinable()) {encoder_.join();}
     if (camera_ != nullptr && streaming_.exchange(false)) {
       GError * error = nullptr;
       if (transfer_start_required_) {
@@ -950,21 +968,38 @@ public:
     return true;
   }
 
+  bool metering_due(const std::chrono::steady_clock::time_point tick)
+  {
+    if (assignment_.operating_mode != "capture" || metering_rate_hz_ <= 0.0 ||
+      tick < next_metering_ || pipeline_depth_.load() != 0)
+    {
+      return false;
+    }
+    next_metering_ = tick + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+      std::chrono::duration<double>(1.0 / metering_rate_hz_));
+    return true;
+  }
+
   std::shared_ptr<FrameCompletion> request_frame(
     const builtin_interfaces::msg::Time & stamp, const std::string & capture_id = {},
     bool publish_capture_chunks = false,
     std::chrono::steady_clock::time_point release_at = {},
-    bool force_software_trigger = false)
+    bool force_software_trigger = false, bool metering = false)
   {
     std::lock_guard<std::mutex> lock(request_mutex_);
-    if (!ready_.load() || request_active_) {return {};}
+    if (!ready_.load() || pipeline_depth_.load() >=
+      static_cast<std::size_t>(config_.encode_queue_depth))
+    {
+      return {};
+    }
     std::shared_ptr<FrameCompletion> completion;
     if (!capture_id.empty()) {
       completion = std::make_shared<FrameCompletion>();
     }
-    pending_request_ = FrameRequest{
-      stamp, capture_id, publish_capture_chunks, release_at, force_software_trigger, completion};
-    request_active_ = true;
+    pending_requests_.push_back(FrameRequest{
+      stamp, capture_id, publish_capture_chunks, release_at, force_software_trigger,
+      metering, completion});
+    ++pipeline_depth_;
     request_cv_.notify_one();
     return completion;
   }
@@ -976,20 +1011,31 @@ public:
   std::int64_t ptp_offset_ns()
   {
     if (!ptp_action_) {return 0;}
-    const auto state = read_ptp_state();
-    return state.offset_exposed ? state.offset_ns : 0;
+    ensure_ptp_cache();
+    return cached_ptp_offset_ns_.load();
   }
   bool ptp_locked()
   {
     if (!ptp_action_) {return false;}
-    const auto state = read_ptp_state();
-    if (lower(state.status) != "slave") {return false;}
-    return !state.offset_exposed ||
-           std::llabs(state.offset_ns) <= config_.ptp_tolerance_ns;
+    ensure_ptp_cache();
+    return cached_ptp_locked_.load();
   }
   std::uint64_t ptp_time_ns()
   {
-    if (!ptp_action_) {throw std::runtime_error("camera has no PTP action clock");}
+    ensure_ptp_cache();
+    const auto system_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+    return static_cast<std::uint64_t>(system_ns + cached_ptp_clock_offset_ns_.load());
+  }
+  std::uint64_t ptp_time_for_system_ns(std::uint64_t system_ns)
+  {
+    ensure_ptp_cache();
+    return static_cast<std::uint64_t>(
+      static_cast<std::int64_t>(system_ns) + cached_ptp_clock_offset_ns_.load());
+  }
+
+  std::uint64_t read_ptp_time_ns()
+  {
     std::lock_guard<std::mutex> lock(camera_control_mutex_);
     GError * error = nullptr;
     arv_camera_execute_command(camera_, ptp_latch_feature_.c_str(), &error);
@@ -1033,7 +1079,7 @@ public:
       result.last_error = last_error_;
     }
     if (ptp_action_) {
-      const auto state = read_ptp_state();
+      const auto state = refresh_ptp_cache();
       result.status_detail = "PTP " + state.status + ", offset " +
         (!state.offset_exposed ? std::string("not exposed by camera") :
         state.offset_ns == std::numeric_limits<std::int64_t>::max() ?
@@ -1060,6 +1106,35 @@ public:
   }
 
 private:
+  PtpState refresh_ptp_cache()
+  {
+    const auto state = read_ptp_state();
+    const bool locked = lower(state.status) == "slave" &&
+      (!state.offset_exposed || std::llabs(state.offset_ns) <= config_.ptp_tolerance_ns);
+    if (locked) {
+      const auto camera_ns = read_ptp_time_ns();
+      const auto system_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+      cached_ptp_clock_offset_ns_.store(
+        static_cast<std::int64_t>(camera_ns) - system_ns);
+    }
+    cached_ptp_offset_ns_.store(state.offset_exposed ? state.offset_ns : 0);
+    cached_ptp_locked_.store(locked);
+    cached_ptp_refreshed_ns_.store(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    return state;
+  }
+
+  void ensure_ptp_cache()
+  {
+    const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (now_ns - cached_ptp_refreshed_ns_.load() > 1500'000'000LL) {
+      (void)refresh_ptp_cache();
+    }
+  }
+
   PtpState read_ptp_state()
   {
     std::lock_guard<std::mutex> lock(camera_control_mutex_);
@@ -1170,6 +1245,47 @@ private:
       arv_camera_set_gain(camera_, gain, &error);
       throw_on_error(error, "setting gain");
     }
+
+    const auto set_optional_float = [this, &settings](
+      const char * setting_name, std::initializer_list<const char *> candidates)
+      {
+        if (!settings || !settings[setting_name]) {return;}
+        const auto value = settings[setting_name].as<double>();
+        for (const auto * candidate : candidates) {
+          GError * feature_error = nullptr;
+          const bool available = arv_camera_is_feature_available(
+            camera_, candidate, &feature_error);
+          if (feature_error != nullptr) {g_error_free(feature_error); continue;}
+          if (!available) {continue;}
+          arv_camera_set_float(camera_, candidate, value, &feature_error);
+          if (feature_error == nullptr) {return;}
+          g_error_free(feature_error);
+          feature_error = nullptr;
+          arv_camera_set_integer(
+            camera_, candidate, static_cast<std::int64_t>(std::llround(value)),
+            &feature_error);
+          throw_on_error(feature_error, std::string("setting ") + candidate);
+          return;
+        }
+        RCLCPP_WARN(
+          node_->get_logger(), "%s has no supported node for portable setting %s",
+          assignment_.sensor_id.c_str(), setting_name);
+      };
+    set_optional_float(
+      "exposure_auto_upper_us",
+      {"ExposureAutoUpperLimit", "AutoExposureTimeUpperLimit"});
+    set_optional_float(
+      "gain_auto_upper_db", {"GainAutoUpperLimit", "AutoGainUpperLimit"});
+    set_optional_float(
+      "auto_brightness_target", {"TargetBrightness", "AutoTargetBrightness"});
+    capture_png_compression_ = std::clamp(
+      setting(
+        settings, "capture_png_compression", config_.capture_png_compression),
+      0, 9);
+    const bool automatic = auto_mode(exposure_auto) != ARV_AUTO_OFF ||
+      auto_mode(gain_auto) != ARV_AUTO_OFF;
+    metering_rate_hz_ = automatic ? std::clamp(
+      setting(settings, "metering_rate_hz", 2.0), 0.0, 10.0) : 0.0;
 
     double frame_rate = setting(settings, "frame_rate_hz", config_.imaging.frame_rate_hz);
     if (assignment_.operating_mode == "preview" && !settings["frame_rate_hz"]) {
@@ -1475,10 +1591,13 @@ private:
       {
         std::unique_lock<std::mutex> lock(request_mutex_);
         request_cv_.wait_for(lock, 200ms, [this]() {
-          return stopping_.load() || pending_request_.has_value();
+          return stopping_.load() || !pending_requests_.empty();
         });
         if (stopping_.load()) {break;}
-        request.swap(pending_request_);
+        if (!pending_requests_.empty()) {
+          request = std::move(pending_requests_.front());
+          pending_requests_.pop_front();
+        }
       }
       if (!request) {continue;}
       if (request->completion) {
@@ -1538,16 +1657,29 @@ private:
                   "incomplete image buffer: " + buffer_status_name(status) + " (status " +
                   std::to_string(status) + ")");
         }
-        cv::Mat image;
-        try {image = to_bgr(buffer);} catch (...) {
-          arv_stream_push_buffer(stream_, buffer);
-          throw;
-        }
         if (request->completion) {
           request->completion->device_timestamp_ns = arv_buffer_get_timestamp(buffer);
           request->completion->synchronized = ptp_action_ && !request->force_software_trigger;
           request->completion->ptp_offset_ns = request->completion->synchronized ?
             ptp_offset_ns() : 0;
+        }
+        if (request->metering) {
+          arv_stream_push_buffer(stream_, buffer);
+          if (restore_action_trigger) {
+            GError * error = nullptr;
+            std::lock_guard<std::mutex> lock(camera_control_mutex_);
+            arv_camera_set_trigger(camera_, "Action0", &error);
+            throw_on_error(error, "restoring Action0 after metering frame");
+            restore_action_trigger = false;
+          }
+          ++completed_frames_;
+          --pipeline_depth_;
+          continue;
+        }
+        cv::Mat image;
+        try {image = to_bgr(buffer);} catch (...) {
+          arv_stream_push_buffer(stream_, buffer);
+          throw;
         }
         arv_stream_push_buffer(stream_, buffer);
         if (restore_action_trigger) {
@@ -1557,12 +1689,19 @@ private:
           throw_on_error(error, "restoring Action0 after temporary software-triggered frame");
           restore_action_trigger = false;
         }
-        // Full-resolution one-shot frames use a dedicated lossless compressed
-        // topic. Sending the 9 MiB BGR sample directly can stall synchronous
-        // DDS writers on hosts with several active camera interfaces.
-        endpoint_->publish(
-          image, request->stamp, request->capture_id, request->publish_capture_chunks);
-        completed_frames_.fetch_add(1);
+        if (request->publish_capture_chunks) {
+          {
+            std::lock_guard<std::mutex> lock(encode_mutex_);
+            encode_jobs_.push_back(EncodeJob{
+              std::move(image), request->stamp, request->capture_id, true});
+          }
+          encode_cv_.notify_one();
+        } else {
+          endpoint_->publish(
+            image, request->stamp, request->capture_id, false, capture_png_compression_);
+          ++completed_frames_;
+          --pipeline_depth_;
+        }
         if (request->completion) {
           {
             std::lock_guard<std::mutex> completion_lock(request->completion->mutex);
@@ -1612,11 +1751,40 @@ private:
             node_->get_logger(), "Acquisition failed for %s: %s",
             assignment_.sensor_id.c_str(), error.what());
         }
+        --pipeline_depth_;
       }
+    }
+  }
+
+  void encoder_loop()
+  {
+    while (true) {
+      std::optional<EncodeJob> job;
       {
-        std::lock_guard<std::mutex> request_lock(request_mutex_);
-        request_active_ = false;
+        std::unique_lock<std::mutex> lock(encode_mutex_);
+        encode_cv_.wait_for(lock, 200ms, [this]() {
+          return stopping_.load() || !encode_jobs_.empty();
+        });
+        if (encode_jobs_.empty() && stopping_.load()) {break;}
+        if (!encode_jobs_.empty()) {
+          job = std::move(encode_jobs_.front());
+          encode_jobs_.pop_front();
+        }
       }
+      if (!job) {continue;}
+      try {
+        endpoint_->publish(
+          job->image, job->stamp, job->capture_id,
+          job->publish_capture_chunks, capture_png_compression_);
+        ++completed_frames_;
+      } catch (const std::exception & error) {
+        std::lock_guard<std::mutex> error_lock(error_mutex_);
+        last_error_ = std::string("capture encoding failed: ") + error.what();
+        RCLCPP_ERROR(
+          node_->get_logger(), "Encoding failed for %s: %s",
+          assignment_.sensor_id.c_str(), error.what());
+      }
+      --pipeline_depth_;
     }
   }
 
@@ -1683,6 +1851,7 @@ private:
   ArvCamera * camera_{nullptr};
   ArvStream * stream_{nullptr};
   std::thread worker_;
+  std::thread encoder_;
   std::atomic<bool> stopping_{false};
   std::atomic<bool> streaming_{false};
   std::atomic<bool> ready_{false};
@@ -1697,15 +1866,25 @@ private:
   std::string ptp_latch_feature_;
   std::string ptp_latch_value_feature_;
   std::chrono::steady_clock::time_point next_ptp_offset_probe_{};
+  std::atomic<bool> cached_ptp_locked_{false};
+  std::atomic<std::int64_t> cached_ptp_offset_ns_{0};
+  std::atomic<std::int64_t> cached_ptp_clock_offset_ns_{0};
+  std::atomic<std::int64_t> cached_ptp_refreshed_ns_{0};
   std::string ptp_capability_detail_{"PTP not requested"};
   std::string device_version_;
   std::mutex camera_control_mutex_;
   bool transfer_start_required_{false};
   std::mutex request_mutex_;
   std::condition_variable request_cv_;
-  std::optional<FrameRequest> pending_request_;
-  bool request_active_{false};
+  std::deque<FrameRequest> pending_requests_;
+  std::mutex encode_mutex_;
+  std::condition_variable encode_cv_;
+  std::deque<EncodeJob> encode_jobs_;
+  std::atomic<std::size_t> pipeline_depth_{0};
+  int capture_png_compression_{1};
+  double metering_rate_hz_{0.0};
   std::chrono::steady_clock::time_point next_preview_{};
+  std::chrono::steady_clock::time_point next_metering_{};
   std::chrono::steady_clock::time_point next_warning_{};
   mutable std::mutex error_mutex_;
   bool warning_active_{false};
@@ -2026,6 +2205,8 @@ private:
     for (auto & item : sessions_) {
       if (item.second->preview_due(tick)) {
         item.second->request_frame(stamp);
+      } else if (item.second->metering_due(tick)) {
+        item.second->request_frame(stamp, "", false, tick, true, true);
       }
     }
   }
@@ -2200,7 +2381,9 @@ private:
   {
     std::unique_lock<std::mutex> lock(mutex_);
     const auto lead = std::chrono::milliseconds(config_.ptp_action_lead_time_ms);
-    const auto release_at = std::chrono::steady_clock::now() + lead;
+    auto release_at = std::chrono::steady_clock::now() + lead;
+    const auto default_scheduled_time = now() + rclcpp::Duration::from_nanoseconds(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(lead).count());
     response->capture_id = request->request_id.empty() ?
       "group_" + std::to_string(++capture_sequence_) : request->request_id;
     std::vector<std::pair<
@@ -2210,6 +2393,15 @@ private:
     std::optional<std::uint64_t> action_time;
     std::optional<std::uint64_t> minimum_ptp_time;
     std::optional<std::uint64_t> maximum_ptp_time;
+    std::optional<std::uint64_t> minimum_requested_ptp_time;
+    std::optional<std::uint64_t> maximum_requested_ptp_time;
+    if (request->has_requested_time && request->requested_time.sec < 0) {
+      response->success = false;
+      response->message = "requested capture time is invalid";
+      return;
+    }
+    const auto requested_ns = static_cast<std::uint64_t>(request->requested_time.sec) *
+      1000000000ULL + request->requested_time.nanosec;
     std::vector<std::string> locking_member_ids;
     for (const auto & sensor_id : request->member_ids) {
       const auto session = sessions_.find(sensor_id);
@@ -2226,6 +2418,14 @@ private:
         std::min(*minimum_ptp_time, current_ptp_time) : current_ptp_time;
       maximum_ptp_time = maximum_ptp_time ?
         std::max(*maximum_ptp_time, current_ptp_time) : current_ptp_time;
+      if (request->has_requested_time) {
+        const auto requested_ptp_time =
+          session->second->ptp_time_for_system_ns(requested_ns);
+        minimum_requested_ptp_time = minimum_requested_ptp_time ?
+          std::min(*minimum_requested_ptp_time, requested_ptp_time) : requested_ptp_time;
+        maximum_requested_ptp_time = maximum_requested_ptp_time ?
+          std::max(*maximum_requested_ptp_time, requested_ptp_time) : requested_ptp_time;
+      }
       action_networks[session->second->network().id] = session->second->network();
     }
     if (!locking_member_ids.empty()) {
@@ -2236,26 +2436,48 @@ private:
         response->message.c_str());
       return;
     }
-    if (maximum_ptp_time) {
+    if (request->has_requested_time) {
+      const auto system_now = now();
+      const auto system_now_ns = static_cast<std::int64_t>(system_now.nanoseconds());
+      const auto delay_ns = static_cast<std::int64_t>(requested_ns) - system_now_ns;
+      if (delay_ns < 20'000'000LL || delay_ns > 5'000'000'000LL)
+      {
+        response->success = false;
+        response->message = "requested capture time must be 20 ms to 5 s in the future";
+        return;
+      }
+      release_at = std::chrono::steady_clock::now() + std::chrono::nanoseconds(delay_ns);
+      if (minimum_requested_ptp_time && maximum_requested_ptp_time) {
+        action_time = *minimum_requested_ptp_time +
+          (*maximum_requested_ptp_time - *minimum_requested_ptp_time) / 2U;
+        if (maximum_ptp_time && *action_time < *maximum_ptp_time + 20'000'000ULL) {
+          response->success = false;
+          response->message = "requested PTP action lacks 20 ms camera-clock margin";
+          return;
+        }
+      }
+    } else if (maximum_ptp_time) {
       action_time = *maximum_ptp_time +
         static_cast<std::uint64_t>(config_.ptp_action_lead_time_ms) * 1000000ULL;
+    }
+    if (maximum_ptp_time) {
       RCLCPP_INFO(
         get_logger(),
-        "Scheduling group %s at PTP %llu from camera range %llu..%llu (%llu ns spread, %d ms lead)",
+        "Scheduling group %s at PTP %llu from camera range %llu..%llu (%llu ns spread)",
         request->group_id.c_str(),
         static_cast<unsigned long long>(*action_time),
         static_cast<unsigned long long>(*minimum_ptp_time),
         static_cast<unsigned long long>(*maximum_ptp_time),
-        static_cast<unsigned long long>(*maximum_ptp_time - *minimum_ptp_time),
-        config_.ptp_action_lead_time_ms);
+        static_cast<unsigned long long>(*maximum_ptp_time - *minimum_ptp_time));
     }
-    if (action_time) {
+    if (request->has_requested_time) {
+      response->scheduled_time = request->requested_time;
+    } else if (action_time) {
       response->scheduled_time.sec = static_cast<std::int32_t>(*action_time / 1000000000ULL);
       response->scheduled_time.nanosec =
         static_cast<std::uint32_t>(*action_time % 1000000000ULL);
     } else {
-      response->scheduled_time = now() + rclcpp::Duration::from_nanoseconds(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(lead).count());
+      response->scheduled_time = default_scheduled_time;
     }
     std::uint64_t earliest_dispatch = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t latest_dispatch = 0;

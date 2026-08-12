@@ -1,0 +1,11 @@
+string[] group_ids
+string request_id
+uint32 interval_ms
+uint32 count
+bool synchronize_groups
+string metadata_json
+---
+bool accepted
+string message
+string operation_id
+builtin_interfaces/Time first_scheduled_time

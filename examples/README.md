@@ -77,13 +77,12 @@ python3 examples/http_trigger_groups_periodic.py \
   front back --interval 2 --mode save
 ```
 
-Save mode submits the group recording requests concurrently. Disjoint groups
-record in parallel, preserving PTP synchronization within each group and
-keeping their images and manifests in separate directories. Groups that share
-a camera cannot record concurrently and one request will be rejected. If PNG
-encoding or storage takes longer than the requested interval, the script prints
-an interval-overrun warning and begins the next cycle as soon as the previous
-one has finished.
+Save mode submits one server-managed sequence and polls its operation status.
+Use `--interval 0.5 --count 10` for ten 2 Hz cycles. All listed groups share
+each cycle's requested PTP timestamp, while each group keeps its own directory
+and manifest. Camera acquisition continues on schedule while previous PNGs are
+encoded and saved. If a bounded queue fills, the sequence stops scheduling new
+cycles and drains all captures already accepted.
 
 ## Trigger through ROS and save in the client
 

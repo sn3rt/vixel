@@ -19,6 +19,7 @@ string interface_name
 string current_address
 string network_id
 string notes
+string camera_profile
 string provider_settings_json
 string last_configuration_json
 string changes_json

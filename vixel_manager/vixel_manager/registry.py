@@ -109,6 +109,7 @@ def _known_from_sensor(
         "latest_observation": {},
         "changes": [],
         "notes": "",
+        "camera_profile": "",
         "provider_settings": {},
         "hardware_key": hardware_key(sensor),
         "last_provider": sensor.get("provider", ""),
@@ -173,13 +174,20 @@ def validate_machine(data: dict[str, Any]) -> dict[str, Any]:
     networks = result.setdefault("managed_networks", {})
     providers = result.setdefault("providers", {})
     recording = result.setdefault("recording", {})
+    camera_profiles = result.setdefault("camera_profiles", {})
     defaults = result.setdefault("defaults", {})
     if (
         not isinstance(networks, dict)
         or not isinstance(providers, dict)
         or not isinstance(recording, dict)
+        or not isinstance(camera_profiles, dict)
     ):
-        raise RegistryError("managed_networks, providers, and recording must be mappings")
+        raise RegistryError(
+            "managed_networks, providers, recording, and camera_profiles must be mappings"
+        )
+    camera_profiles.setdefault("directory", "/etc/vixel/camera-profiles")
+    if not str(camera_profiles["directory"]).strip():
+        raise RegistryError("camera_profiles.directory must not be empty")
     # Releases before the generic backend stored the same camera settings under
     # providers.lucid. Keep existing machines bootable while presenting only
     # the generic provider to the rest of the runtime.
@@ -368,6 +376,7 @@ def validate_inventory(data: dict[str, Any], machine: dict[str, Any]) -> dict[st
         sensor.setdefault("latest_observation", {})
         sensor.setdefault("changes", [])
         sensor.setdefault("notes", "")
+        sensor.setdefault("camera_profile", "")
         sensor.setdefault("provider_settings", {})
         sensor.setdefault("last_configuration", None)
         sensor.setdefault("replaced_by", "")
@@ -380,6 +389,8 @@ def validate_inventory(data: dict[str, Any], machine: dict[str, Any]) -> dict[st
         sensor["changes"] = sensor["changes"][-MAX_KNOWN_CHANGES:]
         if not isinstance(sensor["provider_settings"], dict):
             raise RegistryError(f"known sensor {sensor_id} provider_settings must be a mapping")
+        if not isinstance(sensor["camera_profile"], str):
+            raise RegistryError(f"known sensor {sensor_id} camera_profile must be a string")
         if not isinstance(sensor["last_configuration"], (dict, type(None))):
             raise RegistryError(f"known sensor {sensor_id} last_configuration is invalid")
         try:
@@ -857,7 +868,7 @@ class Registry:
             previous = copy.deepcopy(self.inventory)
             if "provider_settings" in values and not isinstance(values["provider_settings"], dict):
                 raise RegistryError("provider_settings must be a JSON object")
-            allowed = {"notes", "provider_settings"}
+            allowed = {"notes", "camera_profile", "provider_settings"}
             self.inventory["known_sensors"][sensor_id].update({
                 key: copy.deepcopy(value) for key, value in values.items() if key in allowed
             })

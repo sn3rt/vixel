@@ -88,10 +88,10 @@ curl -X POST -H 'Content-Type: application/json' -d '{}' \
 Runnable Python clients for HTTP triggering and ROS image reception are in
 [the examples guide](../examples/README.md).
 
-Vixel does not schedule periodic triggers internally. A ROS node, cron job, or
-other application can call either interface at its required interval. Disjoint
-groups may run concurrently; a request using an already busy camera is rejected
-according to the group's missing-member policy.
+Vixel can schedule saved captures internally. The sequence service assigns
+exposure timestamps ahead of time, so PNG encoding and disk writes from earlier
+cycles do not delay later triggers. Trigger-only applications may still call the
+action at their own cadence.
 
 To persist a capture, put the group in capture mode and use **Capture and save**
 in the dashboard. A ROS client can invoke the same action:
@@ -103,9 +103,9 @@ ros2 action send_goal /vixel/record_capture \
 ```
 
 An empty request ID generates one. A supplied ID may contain letters, numbers,
-`.`, `_`, and `-`. Recordings for disjoint groups may run concurrently; a new
-recording is rejected when any of its cameras already belongs to an active
-recording.
+`.`, `_`, and `-`. Recordings for disjoint groups and successive recordings on
+the same cameras may overlap. Acquisition, PNG encoding, chunk transport, and
+disk persistence are separate pipeline stages bounded by configured limits.
 
 The example clients expose both operations with the same mode names:
 
@@ -122,18 +122,31 @@ python3 examples/http_trigger.py front --mode save
 Only save mode produces files. Publish mode returns a trigger ID and publishes
 the frames on the camera topics for subscribers.
 
-To record separate disjoint groups on the same interval, dispatch their save
-requests together:
+To record groups on a fixed interval, use the server-managed sequence:
 
 ```bash
 python3 examples/http_trigger_groups_periodic.py \
-  front back --interval 2 --mode save
+  front back --interval 0.5 --mode save --count 10
 ```
 
 Each cycle creates a separate capture directory and manifest per group. The
-groups choose scheduled PTP times independently, so cameras within each group
-are synchronized while the groups fire close together rather than sharing one
-guaranteed exposure timestamp.
+example requests one shared timestamp for every included group. The requested
+500 ms cadence is based on exposure timestamps; completed files may appear
+later and out of order. If a queue reaches its configured limit, Vixel stops
+scheduling that sequence and finishes every capture it already accepted.
+
+The equivalent HTTP request returns `202 Accepted` immediately:
+
+```bash
+curl -X POST -H 'Content-Type: application/json' \
+  -d '{"group_ids":["front","back"],"interval_ms":500,"count":10,"synchronize_groups":true,"metadata":{"job":"example"}}' \
+  http://127.0.0.1:8080/api/v1/capture-operations/sequence
+```
+
+Poll `GET /api/v1/capture-operations/<operation_id>` or subscribe to
+`/vixel/capture_operations`. A count of zero runs until cancelled with
+`POST /api/v1/capture-operations/<operation_id>/cancel`. One-shot asynchronous
+batches use `POST /api/v1/capture-operations/batch`.
 
 Successful sets are stored below
 `/var/lib/vixel/captures/YYYY/MM/DD/<capture_id>/` by default. Each directory
@@ -152,6 +165,7 @@ Primary state topics:
 - `/vixel/ports`
 - `/vixel/sync_groups`
 - `/vixel/capture_records`
+- `/vixel/capture_operations`
 
 Per-camera topics:
 
@@ -168,6 +182,12 @@ lists results but intentionally provides no download or delete endpoint.
 Trigger-only acquisition uses the `/vixel/trigger_group` action. The HTTP API
 exposes the same operation at `POST /api/v1/groups/<group_id>/trigger`; saved
 capture remains at `POST /api/v1/groups/<group_id>/capture`.
+
+Asynchronous recording uses `/vixel/submit_capture_batch` and
+`/vixel/start_capture_sequence`; operation status and cancellation use
+`/vixel/get_capture_operation` and `/vixel/cancel_capture_operation`. Caller
+metadata is stored as a JSON object in every resulting manifest. Optional GPS
+metadata is sampled without waiting for a fix.
 
 Control actions and services cover enrollment, placement resolution, operating
 mode, metadata, port mode, known-sensor maintenance, sync groups, capture, and

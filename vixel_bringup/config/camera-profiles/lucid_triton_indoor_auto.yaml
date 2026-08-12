@@ -1,0 +1,13 @@
+schema_version: 1
+name: lucid_triton_indoor_auto
+description: Constrained automatic exposure for LUCID Triton indoor capture
+settings:
+  pixel_format: BGR8
+  exposure_auto: Continuous
+  exposure_auto_upper_us: 10000.0
+  gain_auto: Continuous
+  gain_auto_upper_db: 12.0
+  auto_brightness_target: 50.0
+  metering_rate_hz: 2.0
+  frame_rate_hz: 10.0
+  capture_png_compression: 1

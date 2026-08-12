@@ -1,0 +1,17 @@
+builtin_interfaces/Time stamp
+string operation_id
+string kind
+string status
+string message
+string[] group_ids
+uint32 requested_cycles
+uint32 scheduled_cycles
+uint32 completed_cycles
+uint32 failed_cycles
+uint32 pending_saves
+string[] capture_ids
+builtin_interfaces/Time first_scheduled_time
+builtin_interfaces/Time last_scheduled_time
+uint32 interval_ms
+bool synchronize_groups
+string metadata_json

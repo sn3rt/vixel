@@ -30,6 +30,11 @@ recording:
   minimum_free_bytes: 5368709120
   capture_timeout_ms: 10000
   recent_limit: 100
+  max_inflight_captures: 32
+  gps:
+    enabled: false
+    topic: /fix
+    max_age_ms: 2000
 ```
 
 The recorder rejects a new capture when available space is below
@@ -37,10 +42,27 @@ The recorder rejects a new capture when available space is below
 `capture_timeout_ms` applies after the group trigger is accepted.
 `recent_limit` limits the history loaded into ROS and the dashboard, not the
 number of capture directories retained on disk.
+`max_inflight_captures` bounds frames being received or saved. A managed
+sequence stops scheduling new exposures at this limit and drains everything
+already accepted. GPS is optional and never delays a capture; a recent valid
+ROS 2 `sensor_msgs/NavSatFix` is copied into the manifest when enabled. ROS 1
+GPS publishers can be exposed through `ros1_bridge`.
 
 ## Portable camera settings
 
-The **Known sensor details → Camera settings** field accepts JSON. Common
+Reusable administrator-managed profiles are loaded from
+`/etc/vixel/camera-profiles/*.yaml` by default. A camera selects a profile in
+**Known sensor details** and may add per-camera JSON overrides. Resolution is
+machine defaults, then profile settings, then per-camera overrides; grouped
+capture finally enforces `Action0` and PTP.
+
+Portable constrained-auto and fixed manual examples are installed under
+`share/vixel/config/camera-profiles/`. Copy the profiles you approve into the
+configured admin directory, then call `/vixel/reload_camera_profiles` or restart
+the stack. The dashboard can select profiles and set overrides but cannot edit
+the administrator-owned profile files.
+
+The **Known sensor details → Per-camera overrides** field accepts JSON. Common
 portable settings include:
 
 ```json
@@ -50,8 +72,13 @@ portable settings include:
   "height": 1536,
   "exposure_auto": "Off",
   "exposure_us": 1500.0,
+  "exposure_auto_upper_us": 10000.0,
   "gain_auto": "Off",
   "gain_db": 2.0,
+  "gain_auto_upper_db": 12.0,
+  "auto_brightness_target": 50.0,
+  "metering_rate_hz": 2.0,
+  "capture_png_compression": 1,
   "frame_rate_hz": 4.0,
   "packet_size": 9000,
   "packet_delay_ns": 100000,
@@ -76,6 +103,14 @@ trigger-source selector. Cameras without the required nodes fall back to the
 software barrier and remain part of the group, with their result marked
 unsynchronized. Individual settings remain effective for ungrouped cameras.
 
+Manual exposure uses `exposure_auto: "Off"` with `exposure_us`, and manual
+gain uses `gain_auto: "Off"` with `gain_db`. With either automatic control
+enabled, `metering_rate_hz` defaults to 2 Hz and requests unsaved, unencoded
+metering frames while a capture group is idle. Saved sequence frames also
+update camera auto-exposure/gain, so
+metering yields whenever a sequence is running. The upper-limit settings keep
+automatic exposure from exceeding the motion/cadence budget.
+
 `providers.genicam.software_trigger_lead_time_ms` controls the short interval
 between arming all group workers and releasing their software triggers. It
 defaults to 10 ms and accepts values from 1 through 100 ms; it is preparation
@@ -85,7 +120,7 @@ PTP scheduled capture defaults can be tuned under `providers.genicam.ptp`:
 
 ```yaml
 ptp:
-    action_lead_time_ms: 500
+  action_lead_time_ms: 100
   tolerance_ns: 100000
   action_device_key: 1
 ```

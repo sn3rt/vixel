@@ -1,5 +1,6 @@
 string sensor_id
 string notes
+string camera_profile
 string provider_settings_json
 ---
 bool success

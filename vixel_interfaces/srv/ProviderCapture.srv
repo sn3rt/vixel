@@ -4,6 +4,8 @@ string[] member_ids
 string missing_policy
 string preferred_master_id
 bool trigger_only
+bool has_requested_time
+builtin_interfaces/Time requested_time
 ---
 bool success
 string message

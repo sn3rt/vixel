@@ -16,6 +16,8 @@ TEST(GenicamConfig, LoadsProviderAndNetworks)
 providers:
   genicam:
     buffer_count: 20
+    encode_queue_depth: 12
+    capture_png_compression: 2
     imaging:
       frame_rate_hz: 4.0
 defaults:
@@ -29,6 +31,8 @@ defaults:
   EXPECT_EQ(config.networks.at("link").packet_size, 8192);
   EXPECT_EQ(config.networks.at("link").packet_delay, 100000);
   EXPECT_EQ(config.buffer_count, 20);
+  EXPECT_EQ(config.encode_queue_depth, 12);
+  EXPECT_EQ(config.capture_png_compression, 2);
   EXPECT_DOUBLE_EQ(config.imaging.frame_rate_hz, 4.0);
   EXPECT_EQ(config.preview_width, 800);
   EXPECT_EQ(config.preview_format, "png");

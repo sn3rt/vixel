@@ -1,5 +1,8 @@
 schema_version: 1
 
+camera_profiles:
+  directory: /etc/vixel/camera-profiles
+
 # Copy this file to /etc/vixel/machine.yaml and replace every example interface,
 # MAC address, and subnet with values for the target computer. The locally
 # administered MAC addresses below are intentionally not real hardware.
@@ -52,8 +55,10 @@ providers:
     buffer_count: 16
     socket_buffer_bytes: 33554432
     software_trigger_lead_time_ms: 10
+    encode_queue_depth: 8
+    capture_png_compression: 1
     ptp:
-      action_lead_time_ms: 500
+      action_lead_time_ms: 100
       tolerance_ns: 100000
       action_device_key: 1
     imaging:
@@ -71,11 +76,16 @@ recording:
   minimum_free_bytes: 5368709120
   capture_timeout_ms: 10000
   recent_limit: 100
+  max_inflight_captures: 32
+  gps:
+    enabled: false
+    topic: /fix
+    max_age_ms: 2000
 
 defaults:
   startup_mode: idle
   preview_rate_hz: 2.0
   preview_width: 960
   preview_format: jpeg
-  png_compression: 3
+  png_compression: 1
   jpeg_quality: 70

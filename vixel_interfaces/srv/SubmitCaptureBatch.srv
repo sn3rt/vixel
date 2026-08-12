@@ -1,0 +1,9 @@
+string[] group_ids
+string request_id
+bool synchronize_groups
+string metadata_json
+---
+bool accepted
+string message
+string operation_id
+builtin_interfaces/Time scheduled_time

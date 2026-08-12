@@ -307,12 +307,14 @@ def test_known_sensor_notes_and_provider_settings_round_trip(tmp_path):
     registry.save()
     registry.update_known_sensor("lucid_test0001", {
         "notes": "Spare camera",
+        "camera_profile": "indoor_auto",
         "provider_settings": {"exposure_us": 1200},
     })
 
     reloaded = Registry(str(registry.machine_path), str(inventory_path))
     known = reloaded.inventory["known_sensors"]["lucid_test0001"]
     assert known["notes"] == "Spare camera"
+    assert known["camera_profile"] == "indoor_auto"
     assert known["provider_settings"] == {"exposure_us": 1200}
 
 

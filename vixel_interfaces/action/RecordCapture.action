@@ -1,5 +1,10 @@
 string group_id
 string request_id
+bool has_requested_time
+builtin_interfaces/Time requested_time
+string operation_id
+uint32 cycle
+string metadata_json
 ---
 bool success
 string message

@@ -83,6 +83,81 @@ def trigger_cycle(
         return {group: future.result() for group, future in futures.items()}
 
 
+def api_request(
+    base_url: str, path: str, timeout: float, body: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    request = urllib.request.Request(
+        f"{base_url.rstrip('/')}{path}",
+        data=None if body is None else json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="GET" if body is None else "POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            result = json.load(response)
+    except urllib.error.HTTPError as error:
+        try:
+            detail = json.loads(error.read().decode("utf-8")).get("message", "")
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            detail = ""
+        raise RuntimeError(detail or f"HTTP {error.code}: {error.reason}") from error
+    except urllib.error.URLError as error:
+        raise RuntimeError(f"cannot reach Vixel API: {error.reason}") from error
+    if not isinstance(result, dict) or result.get("success") is False:
+        raise RuntimeError(str(result.get("message", "invalid API response")))
+    return result
+
+
+def start_save_sequence(
+    base_url: str, groups: list[str], interval: float, count: int,
+    request_prefix: str, timeout: float,
+) -> dict[str, Any]:
+    return api_request(
+        base_url, "/api/v1/capture-operations/sequence", timeout,
+        {
+            "group_ids": groups,
+            "request_id": request_prefix,
+            "interval_ms": round(interval * 1000),
+            "count": count,
+            "synchronize_groups": True,
+            "metadata": {"source": "http_trigger_groups_periodic.py"},
+        },
+    )
+
+
+def monitor_save_sequence(
+    base_url: str, operation_id: str, timeout: float,
+) -> dict[str, Any]:
+    last_progress = None
+    encoded_id = urllib.parse.quote(operation_id, safe="")
+    while True:
+        result = api_request(
+            base_url, f"/api/v1/capture-operations/{encoded_id}", timeout
+        )
+        operation = result["operation"]
+        progress = (
+            operation.get("scheduled_cycles", 0), operation.get("completed_cycles", 0),
+            operation.get("failed_cycles", 0), operation.get("pending_saves", 0),
+            operation.get("status", ""),
+        )
+        if progress != last_progress:
+            print(
+                f"sequence {operation_id}: status={progress[4]} scheduled={progress[0]} "
+                f"saved={progress[1]} failed={progress[2]} pending={progress[3]}"
+            )
+            last_progress = progress
+        if operation.get("status") in {"complete", "failed", "cancelled"}:
+            return operation
+        time.sleep(0.25)
+
+
+def cancel_save_sequence(base_url: str, operation_id: str, timeout: float) -> None:
+    encoded_id = urllib.parse.quote(operation_id, safe="")
+    api_request(
+        base_url, f"/api/v1/capture-operations/{encoded_id}/cancel", timeout, {}
+    )
+
+
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(
         description="Trigger multiple disjoint Vixel groups concurrently and periodically."
@@ -116,6 +191,31 @@ def main(argv: list[str] | None = None) -> int:
     request_prefix = args.request_prefix or time.strftime(
         "periodic_%Y%m%dT%H%M%SZ", time.gmtime()
     )
+    if args.mode == "save":
+        operation_id = ""
+        try:
+            accepted = start_save_sequence(
+                args.base_url, args.group_ids, args.interval, args.count,
+                request_prefix, args.timeout,
+            )
+            operation_id = str(accepted["operation_id"])
+            print(
+                f"sequence accepted: operation={operation_id} interval={args.interval:.3f} s "
+                f"groups={','.join(args.group_ids)}"
+            )
+            operation = monitor_save_sequence(args.base_url, operation_id, args.timeout)
+            return 0 if operation.get("status") == "complete" else 1
+        except KeyboardInterrupt:
+            if operation_id:
+                try:
+                    cancel_save_sequence(args.base_url, operation_id, args.timeout)
+                    print(f"sequence {operation_id}: cancellation requested")
+                except RuntimeError as error:
+                    print(f"could not cancel sequence: {error}", file=sys.stderr)
+            return 0
+        except (RuntimeError, ValueError, KeyError) as error:
+            print(f"Periodic trigger-and-save failed: {error}", file=sys.stderr)
+            return 1
     try:
         while args.count == 0 or sequence < args.count:
             sequence += 1

@@ -29,6 +29,7 @@ from vixel_interfaces.action import (
     TriggerGroup,
 )
 from vixel_interfaces.msg import (
+    CaptureOperationArray,
     CaptureRecordArray,
     KnownSensorArray,
     ManagedPortArray,
@@ -36,11 +37,15 @@ from vixel_interfaces.msg import (
     SyncGroupArray,
 )
 from vixel_interfaces.srv import (
+    CancelCaptureOperation,
     DeleteSyncGroup,
     ForgetSensor,
+    GetCaptureOperation,
     PurgeKnownSensor,
     SetOperatingMode,
     SetPortMode,
+    StartCaptureSequence,
+    SubmitCaptureBatch,
     UpdateSensorMetadata,
     UpdateKnownSensor,
     UpsertSyncGroup,
@@ -169,6 +174,7 @@ def known_sensor_to_dict(sensor) -> dict[str, Any]:
         "current_address": sensor.current_address,
         "network_id": sensor.network_id,
         "notes": sensor.notes,
+        "camera_profile": getattr(sensor, "camera_profile", ""),
         "provider_settings": _json_value(sensor.provider_settings_json, {}),
         "last_configuration": _json_value(sensor.last_configuration_json, None),
         "changes": _json_value(sensor.changes_json, []),
@@ -221,6 +227,10 @@ def port_to_dict(port) -> dict[str, Any]:
 def capture_record_to_dict(record) -> dict[str, Any]:
     return {
         "capture_id": record.capture_id,
+        "operation_id": getattr(record, "operation_id", ""),
+        "cycle": int(getattr(record, "cycle", 0)),
+        "metadata": _json_value(getattr(record, "metadata_json", ""), {}),
+        "capture_timings": _json_value(getattr(record, "timings_json", ""), {}),
         "group_id": record.group_id,
         "status": record.status,
         "directory": record.directory,
@@ -247,6 +257,33 @@ def capture_record_to_dict(record) -> dict[str, Any]:
         "participating_sensor_ids": list(record.participating_sensor_ids),
         "saved_sensor_ids": list(record.saved_sensor_ids),
         "missing_sensor_ids": list(record.missing_sensor_ids),
+    }
+
+
+def capture_operation_to_dict(operation) -> dict[str, Any]:
+    return {
+        "operation_id": operation.operation_id,
+        "kind": operation.kind,
+        "status": operation.status,
+        "message": operation.message,
+        "group_ids": list(operation.group_ids),
+        "requested_cycles": int(operation.requested_cycles),
+        "scheduled_cycles": int(operation.scheduled_cycles),
+        "completed_cycles": int(operation.completed_cycles),
+        "failed_cycles": int(operation.failed_cycles),
+        "pending_saves": int(operation.pending_saves),
+        "capture_ids": list(operation.capture_ids),
+        "first_scheduled_time": {
+            "sec": operation.first_scheduled_time.sec,
+            "nanosec": operation.first_scheduled_time.nanosec,
+        },
+        "last_scheduled_time": {
+            "sec": operation.last_scheduled_time.sec,
+            "nanosec": operation.last_scheduled_time.nanosec,
+        },
+        "interval_ms": int(operation.interval_ms),
+        "synchronize_groups": bool(operation.synchronize_groups),
+        "metadata": _json_value(operation.metadata_json, {}),
     }
 
 
@@ -279,6 +316,7 @@ class GatewayNode(Node):
         self.groups: dict[str, dict[str, Any]] = {}
         self.ports: dict[str, dict[str, Any]] = {}
         self.operations: dict[str, dict[str, Any]] = {}
+        self.capture_operations: dict[str, dict[str, Any]] = {}
         self.capture_records: list[dict[str, Any]] = []
         self.frames: dict[
             str, tuple[bytes, float, int] | tuple[bytes, float, int, str]
@@ -303,6 +341,10 @@ class GatewayNode(Node):
         self.capture_records_subscription = self.create_subscription(
             CaptureRecordArray, "/vixel/capture_records", self._capture_records, STATE_QOS,
             callback_group=self.callback_group
+        )
+        self.capture_operations_subscription = self.create_subscription(
+            CaptureOperationArray, "/vixel/capture_operations", self._capture_operations,
+            STATE_QOS, callback_group=self.callback_group
         )
         self.enroll_client = ActionClient(
             self, EnrollSensor, "/vixel/enroll_sensor", callback_group=self.callback_group
@@ -338,6 +380,22 @@ class GatewayNode(Node):
         )
         self.record_capture_client = ActionClient(
             self, RecordCapture, "/vixel/record_capture", callback_group=self.callback_group
+        )
+        self.submit_capture_batch_client = self.create_client(
+            SubmitCaptureBatch, "/vixel/submit_capture_batch",
+            callback_group=self.callback_group
+        )
+        self.start_capture_sequence_client = self.create_client(
+            StartCaptureSequence, "/vixel/start_capture_sequence",
+            callback_group=self.callback_group
+        )
+        self.get_capture_operation_client = self.create_client(
+            GetCaptureOperation, "/vixel/get_capture_operation",
+            callback_group=self.callback_group
+        )
+        self.cancel_capture_operation_client = self.create_client(
+            CancelCaptureOperation, "/vixel/cancel_capture_operation",
+            callback_group=self.callback_group
         )
         self.trigger_group_client = ActionClient(
             self, TriggerGroup, "/vixel/trigger_group", callback_group=self.callback_group
@@ -413,6 +471,15 @@ class GatewayNode(Node):
             ]
             self.changed.notify_all()
 
+    def _capture_operations(self, message: CaptureOperationArray):
+        with self.changed:
+            self.generation = max(self.generation + 1, int(message.generation))
+            self.capture_operations = {
+                operation.operation_id: capture_operation_to_dict(operation)
+                for operation in message.operations
+            }
+            self.changed.notify_all()
+
     def _frame(self, sensor_id: str, message: CompressedImage):
         image_format = message.format.lower()
         if "png" in image_format:
@@ -441,6 +508,7 @@ class GatewayNode(Node):
                 "groups": list(self.groups.values()),
                 "ports": list(self.ports.values()),
                 "operations": list(self.operations.values()),
+                "capture_operations": list(self.capture_operations.values()),
                 "capture_records": list(self.capture_records),
             }
 
@@ -459,6 +527,7 @@ class GatewayNode(Node):
             "inventory_file": self.inventory_file,
             "managed_networks": [],
             "providers": [],
+            "camera_profiles": [],
             "error": "",
         }
         try:
@@ -468,6 +537,23 @@ class GatewayNode(Node):
                 {"network_id": key, **value}
                 for key, value in (machine.get("managed_networks") or {}).items()
             ]
+            profiles_directory = pathlib.Path(
+                (machine.get("camera_profiles") or {}).get(
+                    "directory", "/etc/vixel/camera-profiles"
+                )
+            )
+            if profiles_directory.is_dir():
+                profile_names = []
+                for path in profiles_directory.iterdir():
+                    if path.suffix.lower() not in {".yaml", ".yml"}:
+                        continue
+                    try:
+                        with path.open("r", encoding="utf-8") as stream:
+                            profile = yaml.safe_load(stream) or {}
+                        profile_names.append(str(profile.get("name", path.stem)))
+                    except (OSError, yaml.YAMLError):
+                        continue
+                result["camera_profiles"] = sorted(set(profile_names))
             result["providers"] = sorted((machine.get("providers") or {}).keys())
         except (OSError, yaml.YAMLError) as error:
             result["error"] = str(error)
@@ -485,7 +571,7 @@ class GatewayNode(Node):
 
     def call_service(self, client, request, timeout=10.0):
         if not client.wait_for_service(timeout_sec=2.0):
-            raise RuntimeError("Vixel inventory manager service is unavailable")
+            raise RuntimeError("Vixel ROS service is unavailable")
         return self.wait_future(client.call_async(request), timeout)
 
     def enroll(self, sensor_id: str, body: dict[str, Any], operation_id: str = ""):
@@ -556,6 +642,91 @@ class GatewayNode(Node):
             "directory": wrapped.result.directory,
             "saved_sensor_ids": list(wrapped.result.saved_sensor_ids),
             "missing_sensor_ids": list(wrapped.result.missing_sensor_ids),
+        }
+
+    @staticmethod
+    def _capture_operation_request(body: dict[str, Any]) -> tuple[list[str], str, bool, str]:
+        group_ids = body.get("group_ids", [])
+        metadata = body.get("metadata", {})
+        if not isinstance(group_ids, list) or not all(isinstance(value, str) for value in group_ids):
+            raise ValueError("group_ids must be an array of strings")
+        if not isinstance(metadata, dict):
+            raise ValueError("metadata must be a JSON object")
+        return (
+            group_ids,
+            str(body.get("request_id", "")),
+            bool(body.get("synchronize_groups", True)),
+            json.dumps(metadata, separators=(",", ":"), sort_keys=True),
+        )
+
+    def submit_capture_batch(self, body: dict[str, Any]):
+        group_ids, request_id, synchronize, metadata_json = self._capture_operation_request(body)
+        request = SubmitCaptureBatch.Request()
+        request.group_ids = group_ids
+        request.request_id = request_id
+        request.synchronize_groups = synchronize
+        request.metadata_json = metadata_json
+        response = self.call_service(self.submit_capture_batch_client, request)
+        if not response.accepted:
+            raise RuntimeError(response.message)
+        return {
+            "accepted": True,
+            "message": response.message,
+            "operation_id": response.operation_id,
+            "scheduled_time": {
+                "sec": response.scheduled_time.sec,
+                "nanosec": response.scheduled_time.nanosec,
+            },
+        }
+
+    def start_capture_sequence(self, body: dict[str, Any]):
+        group_ids, request_id, synchronize, metadata_json = self._capture_operation_request(body)
+        interval_ms = int(body.get("interval_ms", 0))
+        count = int(body.get("count", 0))
+        if count < 0 or count > 0xFFFFFFFF:
+            raise ValueError("count must be zero or a positive 32-bit integer")
+        request = StartCaptureSequence.Request()
+        request.group_ids = group_ids
+        request.request_id = request_id
+        request.interval_ms = interval_ms
+        request.count = count
+        request.synchronize_groups = synchronize
+        request.metadata_json = metadata_json
+        response = self.call_service(self.start_capture_sequence_client, request)
+        if not response.accepted:
+            raise RuntimeError(response.message)
+        return {
+            "accepted": True,
+            "message": response.message,
+            "operation_id": response.operation_id,
+            "first_scheduled_time": {
+                "sec": response.first_scheduled_time.sec,
+                "nanosec": response.first_scheduled_time.nanosec,
+            },
+        }
+
+    def cancel_capture_operation(self, operation_id: str):
+        request = CancelCaptureOperation.Request()
+        request.operation_id = operation_id
+        response = self.call_service(self.cancel_capture_operation_client, request)
+        if not response.success:
+            raise RuntimeError(response.message)
+        return {
+            "success": True,
+            "message": response.message,
+            "operation": capture_operation_to_dict(response.operation),
+        }
+
+    def get_capture_operation(self, operation_id: str):
+        request = GetCaptureOperation.Request()
+        request.operation_id = operation_id
+        response = self.call_service(self.get_capture_operation_client, request)
+        if not response.success:
+            raise KeyError(response.message)
+        return {
+            "success": True,
+            "message": response.message,
+            "operation": capture_operation_to_dict(response.operation),
         }
 
     def trigger_group(self, group_id: str, body: dict[str, Any]):
@@ -696,6 +867,9 @@ class GatewayNode(Node):
         request = UpdateKnownSensor.Request()
         request.sensor_id = sensor_id
         request.notes = str(body.get("notes", current.get("notes", "")))
+        request.camera_profile = str(
+            body.get("camera_profile", current.get("camera_profile", ""))
+        )
         request.provider_settings_json = json.dumps(
             settings, separators=(",", ":"), sort_keys=True
         )
@@ -858,6 +1032,20 @@ class Handler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.OK, {
                 "generation": snapshot["generation"], "operations": snapshot["operations"]
             })
+        elif parsed.path == "/api/v1/capture-operations":
+            snapshot = self.server.node.snapshot()
+            self._json(HTTPStatus.OK, {
+                "generation": snapshot["generation"],
+                "capture_operations": snapshot["capture_operations"],
+            })
+        elif len(parts) == 4 and parts[:3] == ["api", "v1", "capture-operations"]:
+            try:
+                self._json(
+                    HTTPStatus.OK,
+                    self.server.node.get_capture_operation(parts[3]),
+                )
+            except (KeyError, RuntimeError, TimeoutError) as error:
+                self._error(HTTPStatus.NOT_FOUND, str(error))
         elif parsed.path == "/api/v1/captures":
             snapshot = self.server.node.snapshot()
             self._json(HTTPStatus.OK, {
@@ -967,6 +1155,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, node.record_capture(parts[3], body))
             elif method == "POST" and len(parts) == 5 and parts[:3] == ["api", "v1", "groups"] and parts[4] == "trigger":
                 self._json(HTTPStatus.OK, node.trigger_group(parts[3], body))
+            elif method == "POST" and parsed.path == "/api/v1/capture-operations/batch":
+                self._json(HTTPStatus.ACCEPTED, node.submit_capture_batch(body))
+            elif method == "POST" and parsed.path == "/api/v1/capture-operations/sequence":
+                self._json(HTTPStatus.ACCEPTED, node.start_capture_sequence(body))
+            elif (
+                method == "POST" and len(parts) == 5
+                and parts[:3] == ["api", "v1", "capture-operations"]
+                and parts[4] == "cancel"
+            ):
+                self._json(HTTPStatus.OK, node.cancel_capture_operation(parts[3]))
             else:
                 self._error(HTTPStatus.NOT_FOUND, "not found")
         except (ValueError, KeyError, RuntimeError, TimeoutError, json.JSONDecodeError) as error:
@@ -1108,3 +1306,6 @@ def main(args=None):
 
 if __name__ == "__main__":
     main()
+    GetCaptureOperation,
+    StartCaptureSequence,
+    SubmitCaptureBatch,

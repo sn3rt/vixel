@@ -87,6 +87,17 @@ GenicamConfig load_genicam_config(const std::string & path)
   config.buffer_count = std::max(4, read_or(provider, "buffer_count", config.buffer_count));
   config.socket_buffer_bytes = read_or(
     provider, "socket_buffer_bytes", config.socket_buffer_bytes);
+  config.encode_queue_depth = read_or(
+    provider, "encode_queue_depth", config.encode_queue_depth);
+  if (config.encode_queue_depth < 1 || config.encode_queue_depth > 64) {
+    throw std::runtime_error("providers.genicam.encode_queue_depth must be between 1 and 64");
+  }
+  config.capture_png_compression = read_or(
+    provider, "capture_png_compression", config.capture_png_compression);
+  if (config.capture_png_compression < 0 || config.capture_png_compression > 9) {
+    throw std::runtime_error(
+            "providers.genicam.capture_png_compression must be between 0 and 9");
+  }
   config.software_trigger_lead_time_ms = read_or(
     provider, "software_trigger_lead_time_ms", config.software_trigger_lead_time_ms);
   if (config.software_trigger_lead_time_ms < 1 ||
