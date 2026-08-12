@@ -1005,6 +1005,13 @@ private:
       record.participating_sensor_ids = response->participating_sensor_ids;
       record.missing_sensor_ids = response->missing_sensor_ids;
       if (!response->success) {throw std::runtime_error(response->message);}
+      const auto synchronized_count = std::count_if(
+        response->camera_timings.begin(), response->camera_timings.end(),
+        [](const auto & timing) {return timing.synchronized;});
+      if (synchronized_count > 1 && !response->within_tolerance) {
+        throw std::runtime_error(
+                "provider returned out-of-tolerance synchronized frames");
+      }
       if (record.participating_sensor_ids.empty()) {
         throw std::runtime_error("capture has no participating sensors");
       }

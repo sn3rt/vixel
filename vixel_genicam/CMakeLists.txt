@@ -47,6 +47,8 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   ament_add_gtest(test_genicam_config test/test_genicam_config.cpp)
   target_link_libraries(test_genicam_config genicam_config yaml-cpp)
+  ament_add_gtest(test_frame_timestamp test/test_frame_timestamp.cpp)
+  target_include_directories(test_frame_timestamp PRIVATE include)
 endif()
 
 ament_package()

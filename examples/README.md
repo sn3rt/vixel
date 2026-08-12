@@ -78,8 +78,9 @@ python3 examples/http_trigger_groups_periodic.py \
 ```
 
 The periodic helper first requests capture mode for every named group and waits
-until all cameras are online, armed, and synchronization-ready. The wait defaults
-to 60 seconds and can be changed with `--ready-timeout`.
+until all cameras are online, armed, synchronization-ready, and—when automatic
+exposure or gain is enabled—have returned a clean initial metering frame. The
+wait defaults to 60 seconds and can be changed with `--ready-timeout`.
 
 Save mode submits one server-managed sequence and polls its operation status.
 Use `--interval 0.5 --count 10` for ten 2 Hz cycles. All listed groups share

@@ -66,7 +66,9 @@ group requests.
 
 Results include per-camera timing records, `exposure_skew_ns` for synchronized
 members, and `within_tolerance`. `trigger_span_ns` remains command-dispatch
-timing and must not be interpreted as exposure skew.
+timing and must not be interpreted as exposure skew. A grouped capture with two
+or more synchronized frames fails when its measured exposure skew exceeds the
+configured PTP tolerance; writing both files is not considered success.
 
 Use **Trigger and publish** for processing without writing files. Subscribe to
 each member's `image_raw` topic before triggering; the resulting images use the

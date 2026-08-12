@@ -107,9 +107,12 @@ Manual exposure uses `exposure_auto: "Off"` with `exposure_us`, and manual
 gain uses `gain_auto: "Off"` with `gain_db`. With either automatic control
 enabled, `metering_rate_hz` defaults to 2 Hz and requests unsaved, unencoded
 metering frames while a capture group is idle. Saved sequence frames also
-update camera auto-exposure/gain, so
-metering yields whenever a sequence is running. The upper-limit settings keep
-automatic exposure from exceeding the motion/cadence budget.
+update camera auto-exposure/gain, so metering yields whenever a sequence is
+running. A group becomes capture-ready only after every automatic camera has
+returned one clean initial metering frame. Scheduled frames are matched to their
+PTP action timestamp; an old metering frame can never be relabelled as a later
+saved capture. The upper-limit settings keep automatic exposure from exceeding
+the motion/cadence budget.
 
 `providers.genicam.software_trigger_lead_time_ms` controls the short interval
 between arming all group workers and releasing their software triggers. It

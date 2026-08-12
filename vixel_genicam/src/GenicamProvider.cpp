@@ -1,4 +1,5 @@
 #include "vixel_genicam/GenicamConfig.hpp"
+#include "vixel_genicam/FrameTimestamp.hpp"
 
 #include <arv.h>
 #include <camera_info_manager/camera_info_manager.hpp>
@@ -856,6 +857,7 @@ public:
     std::chrono::steady_clock::time_point release_at{};
     bool force_software_trigger{false};
     bool metering{false};
+    std::uint64_t expected_device_timestamp_ns{0};
     std::shared_ptr<FrameCompletion> completion;
   };
 
@@ -995,7 +997,8 @@ public:
     const builtin_interfaces::msg::Time & stamp, const std::string & capture_id = {},
     bool publish_capture_chunks = false,
     std::chrono::steady_clock::time_point release_at = {},
-    bool force_software_trigger = false, bool metering = false)
+    bool force_software_trigger = false, bool metering = false,
+    std::uint64_t expected_device_timestamp_ns = 0)
   {
     std::lock_guard<std::mutex> lock(request_mutex_);
     if (!ready_.load() || pipeline_depth_.load() >=
@@ -1009,13 +1012,14 @@ public:
     }
     pending_requests_.push_back(FrameRequest{
       stamp, capture_id, publish_capture_chunks, release_at, force_software_trigger,
-      metering, completion});
+      metering, expected_device_timestamp_ns, completion});
     ++pipeline_depth_;
     request_cv_.notify_one();
     return completion;
   }
 
   bool ready() const {return ready_.load();}
+  bool capture_primed() const {return capture_primed_.load();}
   bool software_trigger() const {return software_trigger_;}
   bool ptp_action() const {return ptp_action_;}
   const NetworkConfig & network() const {return network_;}
@@ -1297,6 +1301,8 @@ private:
       auto_mode(gain_auto) != ARV_AUTO_OFF;
     metering_rate_hz_ = automatic ? std::clamp(
       setting(settings, "metering_rate_hz", 2.0), 0.0, 10.0) : 0.0;
+    capture_primed_.store(
+      assignment_.operating_mode != "capture" || metering_rate_hz_ <= 0.0);
 
     double frame_rate = setting(settings, "frame_rate_hz", config_.imaging.frame_rate_hz);
     if (assignment_.operating_mode == "preview" && !settings["frame_rate_hz"]) {
@@ -1597,6 +1603,7 @@ private:
 
   void worker_loop()
   {
+    ArvBuffer * deferred_buffer = nullptr;
     while (!stopping_.load()) {
       std::optional<FrameRequest> request;
       {
@@ -1646,13 +1653,71 @@ private:
             error_text(error, "software trigger");
           if (!trigger_error.empty()) {throw std::runtime_error(trigger_error);}
         }
-        auto * buffer = arv_stream_timeout_pop_buffer(
-          stream_, static_cast<std::uint64_t>(config_.image_timeout_ms) * 1000U);
-        if (buffer == nullptr) {throw std::runtime_error("image timeout");}
+        const auto frame_deadline = std::chrono::steady_clock::now() +
+          std::chrono::milliseconds(config_.image_timeout_ms);
+        ArvBuffer * buffer = nullptr;
+        while (buffer == nullptr) {
+          if (deferred_buffer != nullptr) {
+            buffer = deferred_buffer;
+            deferred_buffer = nullptr;
+          } else {
+            const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
+              frame_deadline - std::chrono::steady_clock::now());
+            if (remaining <= 0us) {throw std::runtime_error("image timeout");}
+            buffer = arv_stream_timeout_pop_buffer(
+              stream_, static_cast<std::uint64_t>(remaining.count()));
+            if (buffer == nullptr) {throw std::runtime_error("image timeout");}
+          }
+
+          const auto device_timestamp_ns = arv_buffer_get_timestamp(buffer);
+          if (request->expected_device_timestamp_ns != 0 && device_timestamp_ns == 0) {
+            arv_stream_push_buffer(stream_, buffer);
+            buffer = nullptr;
+            throw std::runtime_error(
+                    "scheduled PTP frame has no device timestamp");
+          }
+          const auto relation = classify_frame_timestamp(
+            device_timestamp_ns, request->expected_device_timestamp_ns,
+            static_cast<std::uint64_t>(config_.ptp_tolerance_ns));
+          if (relation == FrameTimestampRelation::stale) {
+            if (arv_buffer_get_status(buffer) != ARV_BUFFER_STATUS_SUCCESS) {
+              ++incomplete_frames_;
+            }
+            RCLCPP_WARN(
+              node_->get_logger(),
+              "Discarding stale frame for %s: expected PTP %llu, received %llu",
+              assignment_.sensor_id.c_str(),
+              static_cast<unsigned long long>(request->expected_device_timestamp_ns),
+              static_cast<unsigned long long>(device_timestamp_ns));
+            arv_stream_push_buffer(stream_, buffer);
+            buffer = nullptr;
+            continue;
+          }
+          if (relation == FrameTimestampRelation::future) {
+            const auto status = arv_buffer_get_status(buffer);
+            if (status == ARV_BUFFER_STATUS_SUCCESS) {
+              // Keep the frame for the next queued request. It proves this
+              // camera skipped the current action, but may exactly match the
+              // following action and must not be silently relabelled.
+              deferred_buffer = buffer;
+            } else {
+              arv_stream_push_buffer(stream_, buffer);
+              ++incomplete_frames_;
+            }
+            buffer = nullptr;
+            throw std::runtime_error(
+                    "camera skipped requested PTP action: expected " +
+                    std::to_string(request->expected_device_timestamp_ns) +
+                    ", received " + std::to_string(device_timestamp_ns));
+          }
+        }
+
         // Free-running preview streams can accumulate completed buffers while the
         // browser requests fewer frames than the camera produces. Discard every
         // older completed buffer and process only the newest one available now.
-        if (!software_for_request) {
+        // Scheduled-action requests are matched above and must never be drained
+        // merely by arrival order.
+        if (request->expected_device_timestamp_ns == 0 && !software_for_request) {
           for (int index = 1; index < config_.buffer_count; ++index) {
             auto * newer = arv_stream_try_pop_buffer(stream_);
             if (newer == nullptr) {break;}
@@ -1683,8 +1748,14 @@ private:
             throw_on_error(error, "restoring Action0 after metering frame");
             restore_action_trigger = false;
           }
+          capture_primed_.store(true);
           ++completed_frames_;
           --pipeline_depth_;
+          {
+            std::lock_guard<std::mutex> error_lock(error_mutex_);
+            last_error_.clear();
+            warning_active_ = false;
+          }
           continue;
         }
         cv::Mat image;
@@ -1721,6 +1792,7 @@ private:
           }
           request->completion->changed.notify_all();
         }
+        capture_primed_.store(true);
         std::lock_guard<std::mutex> error_lock(error_mutex_);
         last_error_.clear();
         warning_active_ = false;
@@ -1764,6 +1836,9 @@ private:
         }
         --pipeline_depth_;
       }
+    }
+    if (deferred_buffer != nullptr) {
+      arv_stream_push_buffer(stream_, deferred_buffer);
     }
   }
 
@@ -1866,6 +1941,7 @@ private:
   std::atomic<bool> stopping_{false};
   std::atomic<bool> streaming_{false};
   std::atomic<bool> ready_{false};
+  std::atomic<bool> capture_primed_{false};
   std::atomic<std::uint64_t> completed_frames_{0};
   std::atomic<std::uint64_t> incomplete_frames_{0};
   bool software_trigger_{false};
@@ -2253,6 +2329,9 @@ private:
 
   void preview_tick()
   {
+    std::unique_lock<std::mutex> scheduling_lock(
+      capture_scheduling_mutex_, std::try_to_lock);
+    if (!scheduling_lock.owns_lock()) {return;}
     std::lock_guard<std::mutex> lock(mutex_);
     const auto tick = std::chrono::steady_clock::now();
     const auto stamp = now();
@@ -2261,6 +2340,8 @@ private:
         item.second->request_frame(stamp);
       }
     }
+
+    if (tick < metering_blocked_until_) {return;}
 
     // Capture-mode cameras stay armed on Action0.  Switching them temporarily
     // to Software for metering is unreliable on cameras that lock transport
@@ -2342,10 +2423,9 @@ private:
         {
           continue;
         }
-        const auto session_release = session->software_trigger() ? release_at :
-          std::chrono::steady_clock::time_point{};
         session->request_frame(
-          metering_stamp, "", false, session_release, false, true);
+          metering_stamp, "", false, release_at, false, true,
+          session->ptp_action() ? action_time : 0);
       }
     }
   }
@@ -2395,6 +2475,7 @@ private:
     std::map<std::string, SyncGroup> groups;
     std::map<std::string, std::vector<std::string>> locking_members;
     std::map<std::string, std::vector<std::string>> unsupported_members;
+    std::map<std::string, std::vector<std::string>> warming_members;
     for (const auto & item : assignments_) {
       const auto & assignment = item.second;
       if (assignment.sync_group.empty()) {continue;}
@@ -2411,6 +2492,11 @@ private:
       const auto session = sessions_.find(item.first);
       if (session != sessions_.end() && session->second->ready()) {
         group.online_member_ids.push_back(item.first);
+        if (assignment.operating_mode == "capture" &&
+          !session->second->capture_primed())
+        {
+          warming_members[assignment.sync_group].push_back(item.first);
+        }
         if (session->second->ptp_action()) {
           if (session->second->ptp_locked()) {
             group.synchronized_member_ids.push_back(item.first);
@@ -2443,9 +2529,11 @@ private:
       const bool members_ready = group.operating_mode == "idle" ||
         group.missing_member_ids.empty() ||
         (group.missing_policy == "degraded" && !group.online_member_ids.empty());
-      group.ready = members_ready && group.locking_member_ids.empty();
+      const auto & warming = warming_members[group.group_id];
+      group.ready = members_ready && group.locking_member_ids.empty() && warming.empty();
       if (!group.locking_member_ids.empty() ||
-        (group.operating_mode == "capture" && !group.unsynchronized_member_ids.empty()))
+        (group.operating_mode == "capture" &&
+        (!group.unsynchronized_member_ids.empty() || !warming.empty())))
       {
         std::ostringstream notice;
         const auto & locking = locking_members[group.group_id];
@@ -2458,6 +2546,11 @@ private:
           notice << "Member(s) without usable PTP scheduled actions: ";
           notice << joined(unsupported);
           notice << "; they remain unsynchronized";
+        }
+        if (!warming.empty()) {
+          if (!locking.empty() || !unsupported.empty()) {notice << ". ";}
+          notice << "Waiting for a clean initial metering frame from: ";
+          notice << joined(warming);
         }
         group.last_error = notice.str();
       }
@@ -2604,6 +2697,12 @@ private:
       action_time = *maximum_ptp_time +
         static_cast<std::uint64_t>(config_.ptp_action_lead_time_ms) * 1000000ULL;
     }
+    // A capture frame also meters automatic exposure/gain. Keep background
+    // metering out of the same receive window; repeated sequence requests
+    // extend this deadline, while slower sequences still meter between shots.
+    metering_blocked_until_ = std::max(
+      metering_blocked_until_, release_at +
+      std::chrono::milliseconds(config_.image_timeout_ms));
     if (maximum_ptp_time) {
       RCLCPP_INFO(
         get_logger(),
@@ -2658,11 +2757,13 @@ private:
         const bool force_software = session->second->ptp_action() &&
           (!request_ptp_locked[sensor_id] ||
           failed_action_networks.count(session->second->network().id) != 0);
-        const auto session_release = session->second->software_trigger() || force_software ?
-          release_at : std::chrono::steady_clock::time_point{};
+        const auto expected_device_timestamp =
+          session->second->ptp_action() && !force_software && action_time ?
+          *action_time : 0;
         auto completion = session->second->request_frame(
           response->scheduled_time, response->capture_id,
-          !request->trigger_only, session_release, force_software);
+          !request->trigger_only, release_at, force_software, false,
+          expected_device_timestamp);
         if (completion) {
           completions.emplace_back(sensor_id, std::move(completion));
         } else {
@@ -2685,6 +2786,7 @@ private:
     std::uint64_t latest_trigger = latest_dispatch;
     std::uint64_t earliest_exposure = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t latest_exposure = 0;
+    std::vector<std::string> acquisition_errors;
     for (const auto & item : completions) {
       const auto & completion = item.second;
       std::unique_lock<std::mutex> completion_lock(completion->mutex);
@@ -2709,6 +2811,9 @@ private:
         }
       } else {
         response->missing_sensor_ids.push_back(item.first);
+        acquisition_errors.push_back(
+          item.first + ": " + (completion->done && !completion->error.empty() ?
+          completion->error : "timed out waiting for the requested frame"));
       }
     }
     if (latest_trigger != 0 && earliest_trigger != std::numeric_limits<std::uint64_t>::max()) {
@@ -2721,15 +2826,21 @@ private:
     }
     response->within_tolerance =
       response->exposure_skew_ns <= static_cast<std::uint64_t>(config_.ptp_tolerance_ns);
-    response->success = response->missing_sensor_ids.empty() ||
-      (request->missing_policy == "degraded" && !response->participating_sensor_ids.empty());
     const auto synchronized_count = std::count_if(
       response->camera_timings.begin(), response->camera_timings.end(),
       [](const auto & timing) {return timing.synchronized;});
-    response->message = response->success ?
+    const bool members_satisfied = response->missing_sensor_ids.empty() ||
+      (request->missing_policy == "degraded" && !response->participating_sensor_ids.empty());
+    const bool synchronization_satisfied = synchronized_count < 2 || response->within_tolerance;
+    response->success = members_satisfied && synchronization_satisfied;
+    response->message = !synchronization_satisfied ?
+      "PTP exposure skew " + std::to_string(response->exposure_skew_ns) +
+      " ns exceeds tolerance " + std::to_string(config_.ptp_tolerance_ns) + " ns" :
+      response->success ?
       std::to_string(synchronized_count) + " PTP-synchronized and " +
       std::to_string(response->camera_timings.size() - synchronized_count) +
-      " unsynchronized frame(s) published" : !action_errors.empty() ?
+      " unsynchronized frame(s) published" : !acquisition_errors.empty() ?
+      "camera acquisition failed: " + joined(acquisition_errors) : !action_errors.empty() ?
       "scheduled action and software fallback failed: " + action_errors.front() :
       "one or more cameras were unavailable, PTP-unlocked, busy, or failed acquisition";
   }
@@ -2769,6 +2880,7 @@ private:
   std::map<std::string, std::chrono::steady_clock::time_point> last_force_ip_attempt_;
   std::string last_system_error_;
   std::uint64_t generation_{0};
+  std::chrono::steady_clock::time_point metering_blocked_until_{};
   std::uint64_t capture_sequence_{0};
   std::size_t last_discovered_count_{0};
   bool first_discovery_{true};
