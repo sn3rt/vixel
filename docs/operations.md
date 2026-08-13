@@ -133,7 +133,8 @@ python3 examples/http_trigger_groups_periodic.py \
 
 The server accepts the request in a `preparing` state, atomically reserves both
 groups, requests capture mode with the 500 ms interval, and waits for camera,
-cadence, PTP, and automatic-metering readiness. Only then does it schedule the
+cadence, PTP, automatic-metering, pipeline-idle, and trigger-armed readiness.
+Only then does it schedule the
 first cycle. A camera that cannot bound automatic exposure or cannot meet the
 interval fails preparation before any trigger is fired. The preparation
 deadline is configured with `recording.sequence_prepare_timeout_ms`.

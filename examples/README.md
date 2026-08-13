@@ -81,7 +81,8 @@ In publish mode, the helper first requests capture mode for every named group
 and waits until the cameras are ready; `--ready-timeout` changes the default
 60-second wait. Save mode submits one server-managed sequence immediately. The
 server moves the groups to capture mode, applies an exposure ceiling derived
-from `--interval`, waits for camera/PTP/metering readiness, and only then starts
+from `--interval`, waits for camera/PTP/metering and trigger-armed readiness,
+and only then starts
 the sequence. It reports a preparation failure without firing a trigger when a
 camera cannot support that cadence.
 

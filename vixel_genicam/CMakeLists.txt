@@ -51,6 +51,8 @@ if(BUILD_TESTING)
   target_include_directories(test_frame_timestamp PRIVATE include)
   ament_add_gtest(test_capture_cadence test/test_capture_cadence.cpp)
   target_include_directories(test_capture_cadence PRIVATE include)
+  ament_add_gtest(test_capture_preparation test/test_capture_preparation.cpp)
+  target_include_directories(test_capture_preparation PRIVATE include)
 endif()
 
 ament_package()

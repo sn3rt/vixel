@@ -63,9 +63,9 @@ sequences once that many operations are active, without disturbing work that
 is already running.
 
 `sequence_prepare_timeout_ms` covers capture-mode configuration, camera
-restart, PTP relock, and the first clean automatic-metering frame. Sequence
-preparation fails without firing a trigger if the requested cadence cannot be
-configured before this timeout.
+restart, PTP relock, the first clean automatic-metering frame, and the final
+idle/`TriggerArmed` check. Sequence preparation fails without firing a trigger
+if the requested cadence cannot be configured before this timeout.
 
 `sequence_dispatch_lead_ms` controls how early a managed sequence sends its
 scheduled PTP actions. Vixel bounds that lead by the smallest reported camera
@@ -169,14 +169,17 @@ unsynchronized. Individual settings remain effective for ungrouped cameras.
 Manual exposure uses `exposure_auto: "Off"` with `exposure_us`, and manual
 gain uses `gain_auto: "Off"` with `gain_db`. With either automatic control
 enabled, `metering_rate_hz` defaults to 2 Hz and requests unsaved, unencoded
-metering frames while a capture group is idle. Saved sequence frames also
-update camera auto-exposure/gain, so metering yields whenever a sequence is
-running. A group becomes capture-ready only after every automatic camera has
-returned one clean initial metering frame. Scheduled frames are matched to their
-PTP action timestamp; an old metering frame can never be relabelled as a later
-saved capture. Static upper-limit settings remain useful as a tighter image
-quality or motion limit; the sequence-derived limit never relaxes a configured
-`exposure_auto_upper_us` ceiling.
+metering frames while a capture group has no prepared cadence. Preparing a
+sequence allows one clean initial metering frame, then quiesces background
+metering so its PTP action cannot overlap cycle one. A prepared group becomes
+capture-ready only after every automatic camera has returned that frame, its
+receive pipeline is empty, and `TriggerArmed` is true when the camera exposes
+it. Saved sequence frames continue to update camera auto-exposure/gain.
+Scheduled frames are matched to their PTP action timestamp; an old metering
+frame can never be relabelled as a later saved capture. Static upper-limit
+settings remain useful as a tighter image quality or motion limit; the
+sequence-derived limit never relaxes a configured `exposure_auto_upper_us`
+ceiling.
 
 The live feature service reports cadence-related nodes when available:
 `TriggerOverlap`, `TriggerArmed`, `ActionQueueSize`,

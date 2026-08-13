@@ -1,4 +1,5 @@
 #include "vixel_genicam/CaptureCadence.hpp"
+#include "vixel_genicam/CapturePreparation.hpp"
 #include "vixel_genicam/GenicamConfig.hpp"
 #include "vixel_genicam/FrameTimestamp.hpp"
 
@@ -941,6 +942,7 @@ public:
       arv_camera_execute_command(camera_, "TransferStart", &error);
       throw_on_error(error, "starting user-controlled image transfer");
     }
+    trigger_armed_feature_ = first_available_feature({"TriggerArmed"});
     streaming_.store(true);
     ready_.store(true);
     worker_ = std::thread(&CameraSession::worker_loop, this);
@@ -994,7 +996,8 @@ public:
   bool metering_due(const std::chrono::steady_clock::time_point tick) const
   {
     if (assignment_.operating_mode != "capture" || metering_rate_hz_ <= 0.0 ||
-      tick < next_metering_)
+      tick < next_metering_ || !vixel_genicam::background_metering_allowed(
+        assignment_.requested_capture_interval_ms, capture_primed_.load()))
     {
       return false;
     }
@@ -1040,6 +1043,28 @@ public:
 
   bool ready() const {return ready_.load();}
   bool capture_primed() const {return capture_primed_.load();}
+  bool capture_prepared()
+  {
+    const bool require_trigger_armed = ptp_action_ && !trigger_armed_feature_.empty();
+    bool trigger_armed = true;
+    if (require_trigger_armed) {
+      GError * error = nullptr;
+      {
+        std::lock_guard<std::mutex> lock(camera_control_mutex_);
+        trigger_armed = arv_camera_get_boolean(camera_, trigger_armed_feature_.c_str(), &error);
+      }
+      if (error != nullptr) {
+        RCLCPP_WARN_THROTTLE(
+          node_->get_logger(), *node_->get_clock(), 5000,
+          "Unable to read %s for %s while preparing capture: %s",
+          trigger_armed_feature_.c_str(), assignment_.sensor_id.c_str(), error->message);
+        g_error_free(error);
+        trigger_armed = false;
+      }
+    }
+    return vixel_genicam::capture_preparation_ready(
+      capture_primed_.load(), pipeline_idle(), require_trigger_armed, trigger_armed);
+  }
   bool software_trigger() const {return software_trigger_;}
   bool ptp_action() const {return ptp_action_;}
   std::uint32_t minimum_capture_interval_ms() const
@@ -2519,6 +2544,7 @@ private:
   bool software_trigger_{false};
   bool ptp_action_{false};
   bool action_trigger_armed_{false};
+  std::string trigger_armed_feature_;
   std::string ptp_enable_feature_;
   std::string ptp_status_feature_;
   std::string ptp_offset_feature_;
@@ -3067,6 +3093,7 @@ private:
     std::map<std::string, std::vector<std::string>> locking_members;
     std::map<std::string, std::vector<std::string>> unsupported_members;
     std::map<std::string, std::vector<std::string>> warming_members;
+    std::map<std::string, std::vector<std::string>> arming_members;
     std::map<std::string, std::vector<std::string>> cadence_failed_members;
     std::map<std::string, std::vector<std::string>> cadence_unconfigured_members;
     for (const auto & item : assignments_) {
@@ -3110,6 +3137,11 @@ private:
           !session->second->capture_primed())
         {
           warming_members[assignment.sync_group].push_back(item.first);
+        } else if (assignment.operating_mode == "capture" &&
+          assignment.requested_capture_interval_ms != 0 &&
+          !session->second->capture_prepared())
+        {
+          arming_members[assignment.sync_group].push_back(item.first);
         }
         if (session->second->ptp_action()) {
           if (session->second->ptp_locked()) {
@@ -3148,6 +3180,7 @@ private:
         group.missing_member_ids.empty() ||
         (group.missing_policy == "degraded" && !group.online_member_ids.empty());
       const auto & warming = warming_members[group.group_id];
+      const auto & arming = arming_members[group.group_id];
       const auto & cadence_failed = cadence_failed_members[group.group_id];
       const auto & cadence_unconfigured = cadence_unconfigured_members[group.group_id];
       group.cadence_configured = group.requested_capture_interval_ms == 0 ||
@@ -3157,10 +3190,10 @@ private:
         group.minimum_capture_interval_ms != 0 &&
         group.minimum_capture_interval_ms <= group.requested_capture_interval_ms);
       group.ready = members_ready && group.locking_member_ids.empty() && warming.empty() &&
-        group.cadence_ready;
+        arming.empty() && group.cadence_ready;
       if (!group.locking_member_ids.empty() ||
         (group.operating_mode == "capture" &&
-        (!group.unsynchronized_member_ids.empty() || !warming.empty() ||
+        (!group.unsynchronized_member_ids.empty() || !warming.empty() || !arming.empty() ||
         !cadence_failed.empty() || !cadence_unconfigured.empty())))
       {
         std::ostringstream notice;
@@ -3180,13 +3213,20 @@ private:
           notice << "Waiting for a clean initial metering frame from: ";
           notice << joined(warming);
         }
-        if (!cadence_unconfigured.empty()) {
+        if (!arming.empty()) {
           if (!locking.empty() || !unsupported.empty() || !warming.empty()) {notice << ". ";}
+          notice << "Waiting for an idle, armed capture pipeline from: ";
+          notice << joined(arming);
+        }
+        if (!cadence_unconfigured.empty()) {
+          if (!locking.empty() || !unsupported.empty() || !warming.empty() || !arming.empty()) {
+            notice << ". ";
+          }
           notice << "Waiting for cadence configuration from: ";
           notice << joined(cadence_unconfigured);
         }
         if (!cadence_failed.empty()) {
-          if (!locking.empty() || !unsupported.empty() || !warming.empty() ||
+          if (!locking.empty() || !unsupported.empty() || !warming.empty() || !arming.empty() ||
             !cadence_unconfigured.empty())
           {
             notice << ". ";
