@@ -41,6 +41,12 @@ RecorderConfig load_recorder_config(const std::string & path)
   result.recent_limit = read_or(recording, "recent_limit", result.recent_limit);
   result.max_inflight_captures = read_or(
     recording, "max_inflight_captures", result.max_inflight_captures);
+  result.operation_history_limit = read_or(
+    recording, "operation_history_limit", result.operation_history_limit);
+  result.operation_capture_id_limit = read_or(
+    recording, "operation_capture_id_limit", result.operation_capture_id_limit);
+  result.max_active_operations = read_or(
+    recording, "max_active_operations", result.max_active_operations);
 
   YAML::Node gps(YAML::NodeType::Map);
   if (recording.IsDefined() && recording.IsMap()) {
@@ -66,6 +72,18 @@ RecorderConfig load_recorder_config(const std::string & path)
   }
   if (result.max_inflight_captures == 0 || result.max_inflight_captures > 256) {
     throw std::runtime_error("recording max_inflight_captures must be between 1 and 256");
+  }
+  if (result.operation_history_limit == 0 || result.operation_history_limit > 1000) {
+    throw std::runtime_error("recording operation_history_limit must be between 1 and 1000");
+  }
+  if (result.operation_capture_id_limit == 0 ||
+    result.operation_capture_id_limit > 1000)
+  {
+    throw std::runtime_error(
+            "recording operation_capture_id_limit must be between 1 and 1000");
+  }
+  if (result.max_active_operations == 0 || result.max_active_operations > 256) {
+    throw std::runtime_error("recording max_active_operations must be between 1 and 256");
   }
   if (result.gps_enabled && (result.gps_topic.empty() || result.gps_max_age.count() < 0)) {
     throw std::runtime_error("recording GPS topic/max_age_ms is invalid");

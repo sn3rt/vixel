@@ -10,6 +10,8 @@ uint32 completed_cycles
 uint32 failed_cycles
 uint32 pending_saves
 string[] capture_ids
+uint64 capture_id_count
+bool capture_ids_truncated
 builtin_interfaces/Time first_scheduled_time
 builtin_interfaces/Time last_scheduled_time
 uint32 interval_ms

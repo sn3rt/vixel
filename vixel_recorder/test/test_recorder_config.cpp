@@ -22,6 +22,9 @@ recording:
   EXPECT_EQ(config.minimum_free_bytes, 5368709120ULL);
   EXPECT_EQ(config.sequence_dispatch_lead, std::chrono::milliseconds(175));
   EXPECT_EQ(config.sequence_prepare_timeout, std::chrono::milliseconds(45000));
+  EXPECT_EQ(config.operation_history_limit, 100U);
+  EXPECT_EQ(config.operation_capture_id_limit, 100U);
+  EXPECT_EQ(config.max_active_operations, 64U);
   EXPECT_FALSE(config.gps_enabled);
   EXPECT_EQ(config.gps_topic, "/fix");
   std::filesystem::remove(path);

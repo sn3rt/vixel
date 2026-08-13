@@ -157,6 +157,15 @@ Poll `GET /api/v1/capture-operations/<operation_id>` or subscribe to
 `POST /api/v1/capture-operations/<operation_id>/cancel`. One-shot asynchronous
 batches use `POST /api/v1/capture-operations/batch`.
 
+Operation status includes `capture_id_count`, the recent `capture_ids` list,
+and `capture_ids_truncated`. By default, Vixel keeps the newest 100 IDs per
+operation and the newest 100 terminal operations for later lookup. Active
+operations are retained until they finish, and new work is rejected when the
+configured active-operation limit is reached. These bounds affect only status
+memory and messages: capture directories and manifests stay on disk. Configure
+the limits with `recording.operation_capture_id_limit`,
+`recording.operation_history_limit`, and `recording.max_active_operations`.
+
 Successful sets are stored below
 `/var/lib/vixel/captures/YYYY/MM/DD/<capture_id>/` by default. Each directory
 contains one full-resolution lossless PNG per participating camera and a

@@ -15,6 +15,7 @@ from vixel_web.gateway import (
     health_response,
     is_routine_snapshot_request,
     known_sensor_to_dict,
+    recording_runtime_settings,
 )
 
 
@@ -103,7 +104,8 @@ def test_capture_operation_is_exposed_as_json():
         operation_id="operation_1", kind="sequence", status="running",
         message="capturing", group_ids=["front", "back"], requested_cycles=10,
         scheduled_cycles=4, completed_cycles=2, failed_cycles=0, pending_saves=4,
-        capture_ids=["run_1_front"], first_scheduled_time=stamp,
+        capture_ids=["run_1_front"], capture_id_count=8,
+        capture_ids_truncated=True, first_scheduled_time=stamp,
         last_scheduled_time=stamp, interval_ms=500, synchronize_groups=True,
         metadata_json='{"job":"test"}',
     )
@@ -112,7 +114,75 @@ def test_capture_operation_is_exposed_as_json():
 
     assert value["interval_ms"] == 500
     assert value["group_ids"] == ["front", "back"]
+    assert value["capture_id_count"] == 8
+    assert value["capture_ids_truncated"] is True
     assert value["metadata"] == {"job": "test"}
+
+
+def test_gateway_keeps_only_recent_terminal_operations():
+    node = GatewayNode.__new__(GatewayNode)
+    node.lock = threading.RLock()
+    node.changed = threading.Condition(node.lock)
+    node.generation = 0
+    node.operation_history_limit = 2
+    node.operations = {
+        "old": {"state": "succeeded"},
+        "middle": {"state": "failed"},
+        "new": {"state": "running"},
+    }
+
+    node._update_operation("new", state="succeeded")
+
+    assert list(node.operations) == ["middle", "new"]
+
+
+def test_gateway_rejects_work_above_the_active_operation_limit():
+    node = GatewayNode.__new__(GatewayNode)
+    node.lock = threading.RLock()
+    node.changed = threading.Condition(node.lock)
+    node.generation = 0
+    node.max_active_operations = 64
+    node.operations = {
+        f"operation_{index}": {"state": "running"} for index in range(64)
+    }
+
+    with pytest.raises(RuntimeError, match="active operation limit"):
+        node.start_operation("enroll", "camera", lambda _: {"success": True})
+
+
+def test_capture_deadline_tracks_supported_recorder_timeout():
+    assert recording_runtime_settings({})["capture_result_timeout_sec"] == 40.0
+    assert recording_runtime_settings({
+        "recording": {"capture_timeout_ms": 60000}
+    })["capture_result_timeout_sec"] == 140.0
+
+
+def test_capture_result_timeout_requests_goal_cancellation():
+    class PendingResult:
+        def done(self):
+            return False
+
+    result_future = PendingResult()
+    cancel_future = object()
+    handle = SimpleNamespace(
+        get_result_async=lambda: result_future,
+        cancel_goal_async=lambda: cancel_future,
+    )
+    calls = []
+    node = GatewayNode.__new__(GatewayNode)
+    node.capture_result_timeout_sec = 40.0
+
+    def wait_future(future, timeout):
+        calls.append((future, timeout))
+        if future is result_future:
+            raise TimeoutError("deadline")
+        return SimpleNamespace(goals_canceling=[object()])
+
+    node.wait_future = wait_future
+
+    with pytest.raises(TimeoutError, match="cancellation requested"):
+        node._wait_for_capture_result(handle)
+    assert calls == [(result_future, 40.0), (cancel_future, 5.0)]
 
 
 def test_health_response_tracks_manager_age_and_counts():

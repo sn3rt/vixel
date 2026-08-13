@@ -209,6 +209,9 @@ def validate_machine(data: dict[str, Any]) -> dict[str, Any]:
     recording.setdefault("minimum_free_bytes", 5 * 1024 * 1024 * 1024)
     recording.setdefault("capture_timeout_ms", 10000)
     recording.setdefault("recent_limit", 100)
+    recording.setdefault("operation_history_limit", 100)
+    recording.setdefault("operation_capture_id_limit", 100)
+    recording.setdefault("max_active_operations", 64)
     if not str(recording["root_directory"]).strip():
         raise RegistryError("recording.root_directory must not be empty")
     if int(recording["minimum_free_bytes"]) < 0:
@@ -217,6 +220,18 @@ def validate_machine(data: dict[str, Any]) -> dict[str, Any]:
         raise RegistryError("recording.capture_timeout_ms must be between 1000 and 60000")
     if not 1 <= int(recording["recent_limit"]) <= 1000:
         raise RegistryError("recording.recent_limit must be between 1 and 1000")
+    if not 1 <= int(recording["operation_history_limit"]) <= 1000:
+        raise RegistryError(
+            "recording.operation_history_limit must be between 1 and 1000"
+        )
+    if not 1 <= int(recording["operation_capture_id_limit"]) <= 1000:
+        raise RegistryError(
+            "recording.operation_capture_id_limit must be between 1 and 1000"
+        )
+    if not 1 <= int(recording["max_active_operations"]) <= 256:
+        raise RegistryError(
+            "recording.max_active_operations must be between 1 and 256"
+        )
     defaults.setdefault("preview_rate_hz", 2.0)
     defaults.setdefault("preview_width", 960)
     defaults.setdefault("jpeg_quality", 70)

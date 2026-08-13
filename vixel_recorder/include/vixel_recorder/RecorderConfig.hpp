@@ -18,6 +18,9 @@ struct RecorderConfig
   std::chrono::milliseconds sequence_prepare_timeout{60000};
   std::size_t recent_limit{100};
   std::size_t max_inflight_captures{32};
+  std::size_t operation_history_limit{100};
+  std::size_t operation_capture_id_limit{100};
+  std::size_t max_active_operations{64};
   bool gps_enabled{false};
   std::string gps_topic{"/fix"};
   std::chrono::milliseconds gps_max_age{2000};

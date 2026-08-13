@@ -1,4 +1,5 @@
 #include "vixel_recorder/RecorderConfig.hpp"
+#include "vixel_recorder/OperationHistory.hpp"
 #include "vixel_recorder/SequenceTiming.hpp"
 
 #include <nlohmann/json.hpp>
@@ -28,6 +29,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cctype>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -68,6 +70,7 @@ struct OperationState
   bool stop_scheduling{false};
   bool cancelled_by_user{false};
   bool scheduling_done{false};
+  bool terminal_recorded{false};
   std::map<std::uint32_t, std::size_t> cycle_results;
   std::map<std::uint32_t, std::size_t> cycle_failures;
 };
@@ -524,6 +527,16 @@ private:
     operation->request_prefix = request_id.empty() ? operation->value.operation_id : request_id;
     {
       std::lock_guard<std::mutex> lock(operations_mutex_);
+      const auto active_count = std::count_if(
+        operations_.begin(), operations_.end(), [](const auto & item) {
+          // A cancellation request may expose a terminal-looking status while
+          // its preparation worker is still unwinding. Count it as active until
+          // finish_operation_locked records the terminal transition.
+          return !item.second->terminal_recorded;
+        });
+      if (active_count >= static_cast<std::ptrdiff_t>(config_.max_active_operations)) {
+        return {};
+      }
       operations_[operation->value.operation_id] = operation;
       ++operations_generation_;
     }
@@ -553,6 +566,11 @@ private:
       "batch", request->group_ids, request->request_id, 1, 0,
       request->synchronize_groups, request->metadata_json,
       request->synchronize_groups ? first_message : builtin_interfaces::msg::Time{});
+    if (!operation) {
+      response->accepted = false;
+      response->message = "recorder reached the active operation limit";
+      return;
+    }
     response->accepted = true;
     response->message = "batch accepted for asynchronous capture";
     response->operation_id = operation->value.operation_id;
@@ -586,6 +604,12 @@ private:
       "sequence", request->group_ids, request->request_id, request->count,
       request->interval_ms, request->synchronize_groups, request->metadata_json,
       builtin_interfaces::msg::Time{}, operation_id);
+    if (!operation) {
+      release_groups(request->group_ids, operation_id);
+      response->accepted = false;
+      response->message = "recorder reached the active operation limit";
+      return;
+    }
     {
       std::lock_guard<std::mutex> lock(operations_mutex_);
       operation->value.status = "preparing";
@@ -613,6 +637,7 @@ private:
       operation->value.status = operation->cancelled_by_user ? "cancelled" : "failed";
       operation->value.message = message;
       operation->value.stamp = now();
+      record_terminal_operation_locked(*operation);
       ++operations_generation_;
     }
     release_groups(operation->value.group_ids, operation->value.operation_id);
@@ -789,6 +814,7 @@ private:
         operation->value.status = "failed";
         operation->value.message = "capture action server is unavailable";
         operation->value.stamp = now();
+        record_terminal_operation_locked(*operation);
         ++operations_generation_;
       }
       if (operation->value.kind == "sequence") {
@@ -866,18 +892,13 @@ private:
       operation->value.status = "running";
       operation->value.message = "capturing";
       std::size_t group_index = 0;
+      bool identifiers_valid = true;
       for (const auto & group_id : operation->value.group_ids) {
         RecordCapture::Goal goal;
         goal.group_id = group_id;
         goal.request_id = operation->request_prefix + "_" + std::to_string(cycle) + "_" + group_id;
         if (!safe_identifier(goal.request_id)) {
-          operation->value.pending_saves -= goals.size();
-          operation->value.capture_ids.resize(
-            operation->value.capture_ids.size() - goals.size());
-          goals.clear();
-          operation->stop_scheduling = true;
-          operation->value.status = "failed";
-          operation->value.message = "generated capture ID is too long or unsafe";
+          identifiers_valid = false;
           break;
         }
         goal.has_requested_time = operation->value.kind == "sequence" ||
@@ -889,12 +910,20 @@ private:
         goal.operation_id = operation->value.operation_id;
         goal.cycle = cycle;
         goal.metadata_json = operation->value.metadata_json;
-        operation->value.capture_ids.push_back(goal.request_id);
-        ++operation->value.pending_saves;
         goals.emplace_back(group_id, std::move(goal));
         ++group_index;
       }
-      if (!operation->stop_scheduling) {
+      if (!identifiers_valid) {
+        goals.clear();
+        operation->stop_scheduling = true;
+        operation->value.status = "failed";
+        operation->value.message = "generated capture ID is too long or unsafe";
+      } else {
+        for (const auto & item : goals) {
+          append_bounded_capture_id(
+            operation->value, item.second.request_id, config_.operation_capture_id_limit);
+          ++operation->value.pending_saves;
+        }
         ++operation->value.scheduled_cycles;
         if (operation->value.kind == "sequence" || operation->value.synchronize_groups) {
           operation->value.last_scheduled_time = requested_time;
@@ -945,6 +974,8 @@ private:
       if (operation->cycle_results[cycle] == operation->value.group_ids.size()) {
         if (operation->cycle_failures[cycle] == 0) {++operation->value.completed_cycles;}
         else {++operation->value.failed_cycles;}
+        operation->cycle_results.erase(cycle);
+        operation->cycle_failures.erase(cycle);
       }
       if (operation->scheduling_done && operation->value.pending_saves == 0) {
         finish_operation_locked(*operation);
@@ -972,6 +1003,26 @@ private:
     } else {
       operation.value.status = "complete";
       operation.value.message = "all capture cycles saved";
+    }
+    record_terminal_operation_locked(operation);
+  }
+
+  void record_terminal_operation_locked(OperationState & operation)
+  {
+    if (operation.terminal_recorded || !terminal_operation_status(operation.value.status)) {
+      return;
+    }
+    operation.terminal_recorded = true;
+    terminal_operation_ids_.push_back(operation.value.operation_id);
+    while (terminal_operation_ids_.size() > config_.operation_history_limit) {
+      const auto expired = terminal_operation_ids_.front();
+      terminal_operation_ids_.pop_front();
+      const auto iterator = operations_.find(expired);
+      if (iterator != operations_.end() &&
+        terminal_operation_status(iterator->second->value.status))
+      {
+        operations_.erase(iterator);
+      }
     }
   }
 
@@ -1627,6 +1678,7 @@ private:
   rclcpp_action::Client<RecordCapture>::SharedPtr operation_capture_client_;
   std::mutex operations_mutex_;
   std::map<std::string, std::shared_ptr<OperationState>> operations_;
+  std::deque<std::string> terminal_operation_ids_;
   std::uint64_t operations_generation_{0};
   rclcpp::Publisher<vixel_interfaces::msg::CaptureOperationArray>::SharedPtr
   operations_publisher_;

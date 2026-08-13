@@ -33,6 +33,9 @@ recording:
   sequence_dispatch_lead_ms: 150
   recent_limit: 100
   max_inflight_captures: 32
+  operation_history_limit: 100
+  operation_capture_id_limit: 100
+  max_active_operations: 64
   gps:
     enabled: false
     topic: /fix
@@ -49,6 +52,15 @@ sequence stops scheduling new exposures at this limit and drains everything
 already accepted. GPS is optional and never delays a capture; a recent valid
 ROS 2 `sensor_msgs/NavSatFix` is copied into the manifest when enabled. ROS 1
 GPS publishers can be exposed through `ros1_bridge`.
+
+`operation_history_limit` retains the newest completed, failed, or cancelled
+operations for status lookup; active operations are never pruned.
+`operation_capture_id_limit` retains only the newest capture IDs in each
+operation message while `capture_id_count` continues to report the total and
+`capture_ids_truncated` identifies a shortened list. Capture directories and
+manifests remain on disk. `max_active_operations` rejects new batches or
+sequences once that many operations are active, without disturbing work that
+is already running.
 
 `sequence_prepare_timeout_ms` covers capture-mode configuration, camera
 restart, PTP relock, and the first clean automatic-metering frame. Sequence

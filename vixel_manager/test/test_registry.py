@@ -233,12 +233,30 @@ def test_recording_configuration_gets_safe_defaults():
     assert machine["recording"]["root_directory"] == "/var/lib/vixel/captures"
     assert machine["recording"]["minimum_free_bytes"] == 5 * 1024 * 1024 * 1024
     assert machine["recording"]["capture_timeout_ms"] == 10000
+    assert machine["recording"]["operation_history_limit"] == 100
+    assert machine["recording"]["operation_capture_id_limit"] == 100
+    assert machine["recording"]["max_active_operations"] == 64
 
 
 def test_invalid_recording_configuration_is_rejected():
     broken = yaml.safe_load(yaml.safe_dump(MACHINE))
     broken["recording"] = {"recent_limit": 0}
     with pytest.raises(RegistryError, match="recent_limit"):
+        validate_machine(broken)
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("operation_history_limit", 0),
+        ("operation_capture_id_limit", 1001),
+        ("max_active_operations", 257),
+    ],
+)
+def test_invalid_operation_limits_are_rejected(key, value):
+    broken = yaml.safe_load(yaml.safe_dump(MACHINE))
+    broken["recording"] = {key: value}
+    with pytest.raises(RegistryError, match=key):
         validate_machine(broken)
 
 

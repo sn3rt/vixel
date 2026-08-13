@@ -61,6 +61,44 @@ STATE_QOS = QoSProfile(
 )
 
 
+def recording_runtime_settings(machine: dict[str, Any]) -> dict[str, int | float]:
+    recording = machine.get("recording") or {}
+    if not isinstance(recording, dict):
+        raise RuntimeError("recording configuration must be a mapping")
+    try:
+        capture_timeout_ms = int(recording.get("capture_timeout_ms", 10000))
+        operation_history_limit = int(recording.get("operation_history_limit", 100))
+        max_active_operations = int(recording.get("max_active_operations", 64))
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("recording limits must be integers") from error
+    if not 1000 <= capture_timeout_ms <= 60000:
+        raise RuntimeError("recording.capture_timeout_ms must be between 1000 and 60000")
+    if not 1 <= operation_history_limit <= 1000:
+        raise RuntimeError(
+            "recording.operation_history_limit must be between 1 and 1000"
+        )
+    if not 1 <= max_active_operations <= 256:
+        raise RuntimeError(
+            "recording.max_active_operations must be between 1 and 256"
+        )
+    return {
+        "capture_result_timeout_sec": (2 * capture_timeout_ms + 20000) / 1000.0,
+        "operation_history_limit": operation_history_limit,
+        "max_active_operations": max_active_operations,
+    }
+
+
+def load_recording_runtime_settings(path: str) -> dict[str, int | float]:
+    try:
+        with open(path, "r", encoding="utf-8") as stream:
+            machine = yaml.safe_load(stream) or {}
+    except (OSError, yaml.YAMLError) as error:
+        raise RuntimeError(f"cannot load machine configuration {path}: {error}") from error
+    if not isinstance(machine, dict):
+        raise RuntimeError(f"machine configuration {path} must contain a mapping")
+    return recording_runtime_settings(machine)
+
+
 def is_routine_snapshot_request(path: str, status: int | str) -> bool:
     try:
         status_code = int(status)
@@ -287,6 +325,10 @@ def capture_operation_to_dict(operation) -> dict[str, Any]:
         "failed_cycles": int(operation.failed_cycles),
         "pending_saves": int(operation.pending_saves),
         "capture_ids": list(operation.capture_ids),
+        "capture_id_count": int(getattr(operation, "capture_id_count", 0)),
+        "capture_ids_truncated": bool(
+            getattr(operation, "capture_ids_truncated", False)
+        ),
         "first_scheduled_time": {
             "sec": operation.first_scheduled_time.sec,
             "nanosec": operation.first_scheduled_time.nanosec,
@@ -316,6 +358,10 @@ class GatewayNode(Node):
         self.machine_file = str(
             self.declare_parameter("machine_file", "/etc/vixel/machine.yaml").value
         )
+        recording_settings = load_recording_runtime_settings(self.machine_file)
+        self.capture_result_timeout_sec = float(
+            recording_settings["capture_result_timeout_sec"]
+        )
         requested_inventory = str(
             self.declare_parameter("inventory_file", "/var/lib/vixel/inventory.yaml").value
         )
@@ -330,6 +376,10 @@ class GatewayNode(Node):
         self.groups: dict[str, dict[str, Any]] = {}
         self.ports: dict[str, dict[str, Any]] = {}
         self.operations: dict[str, dict[str, Any]] = {}
+        self.operation_history_limit = int(
+            recording_settings["operation_history_limit"]
+        )
+        self.max_active_operations = int(recording_settings["max_active_operations"])
         self.capture_operations: dict[str, dict[str, Any]] = {}
         self.capture_records: list[dict[str, Any]] = []
         self.frames: dict[
@@ -664,6 +714,24 @@ class GatewayNode(Node):
             "missing_sensor_ids": list(wrapped.result.missing_sensor_ids),
         }
 
+    def _wait_for_capture_result(self, handle):
+        result_future = handle.get_result_async()
+        try:
+            return self.wait_future(result_future, self.capture_result_timeout_sec)
+        except TimeoutError as error:
+            if result_future.done():
+                return result_future.result()
+            try:
+                self.wait_future(handle.cancel_goal_async(), 5.0)
+            except (RuntimeError, TimeoutError):
+                pass
+            if result_future.done():
+                return result_future.result()
+            raise TimeoutError(
+                f"Capture exceeded the {self.capture_result_timeout_sec:.0f}s deadline; "
+                "cancellation requested"
+            ) from error
+
     @staticmethod
     def _capture_operation_request(body: dict[str, Any]) -> tuple[list[str], str, bool, str]:
         group_ids = body.get("group_ids", [])
@@ -802,6 +870,12 @@ class GatewayNode(Node):
             "message": "",
         }
         with self.changed:
+            active_count = sum(
+                item.get("state") not in {"succeeded", "failed", "cancelled"}
+                for item in self.operations.values()
+            )
+            if active_count >= self.max_active_operations:
+                raise RuntimeError("gateway reached the active operation limit")
             self.operations[operation_id] = operation
             self.generation += 1
             self.changed.notify_all()
@@ -844,6 +918,12 @@ class GatewayNode(Node):
             if not operation:
                 return
             operation.update(values)
+            terminal_ids = [
+                identity for identity, item in self.operations.items()
+                if item.get("state") in {"succeeded", "failed", "cancelled"}
+            ]
+            for identity in terminal_ids[:-self.operation_history_limit]:
+                self.operations.pop(identity, None)
             self.generation += 1
             self.changed.notify_all()
 

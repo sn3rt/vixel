@@ -83,6 +83,9 @@ recording:
   sequence_dispatch_lead_ms: 150
   recent_limit: 100
   max_inflight_captures: 32
+  operation_history_limit: 100
+  operation_capture_id_limit: 100
+  max_active_operations: 64
   gps:
     enabled: false
     topic: /fix
