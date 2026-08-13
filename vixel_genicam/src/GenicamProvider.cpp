@@ -1045,6 +1045,7 @@ public:
   bool capture_primed() const {return capture_primed_.load();}
   bool capture_prepared()
   {
+    if (capture_preparation_latched_.load()) {return true;}
     const bool require_trigger_armed = ptp_action_ && !trigger_armed_feature_.empty();
     bool trigger_armed = true;
     if (require_trigger_armed) {
@@ -1062,8 +1063,10 @@ public:
         trigger_armed = false;
       }
     }
-    return vixel_genicam::capture_preparation_ready(
-      capture_primed_.load(), pipeline_idle(), require_trigger_armed, trigger_armed);
+    const bool prepared = vixel_genicam::capture_preparation_ready(
+      false, capture_primed_.load(), pipeline_idle(), require_trigger_armed, trigger_armed);
+    if (prepared) {capture_preparation_latched_.store(true);}
+    return prepared;
   }
   bool software_trigger() const {return software_trigger_;}
   bool ptp_action() const {return ptp_action_;}
@@ -2539,6 +2542,7 @@ private:
   std::atomic<bool> streaming_{false};
   std::atomic<bool> ready_{false};
   std::atomic<bool> capture_primed_{false};
+  std::atomic<bool> capture_preparation_latched_{false};
   std::atomic<std::uint64_t> completed_frames_{0};
   std::atomic<std::uint64_t> incomplete_frames_{0};
   bool software_trigger_{false};

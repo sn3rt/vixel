@@ -174,7 +174,9 @@ sequence allows one clean initial metering frame, then quiesces background
 metering so its PTP action cannot overlap cycle one. A prepared group becomes
 capture-ready only after every automatic camera has returned that frame, its
 receive pipeline is empty, and `TriggerArmed` is true when the camera exposes
-it. Saved sequence frames continue to update camera auto-exposure/gain.
+it. That preparation result is latched for the lifetime of the configured
+camera session, so an in-flight sequence frame does not temporarily revoke the
+group's readiness. Saved sequence frames continue to update camera auto-exposure/gain.
 Scheduled frames are matched to their PTP action timestamp; an old metering
 frame can never be relabelled as a later saved capture. Static upper-limit
 settings remain useful as a tighter image quality or motion limit; the

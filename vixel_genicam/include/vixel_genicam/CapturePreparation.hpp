@@ -15,11 +15,11 @@ inline bool background_metering_allowed(
 }
 
 inline bool capture_preparation_ready(
-  bool capture_primed, bool pipeline_idle, bool trigger_armed_required,
-  bool trigger_armed)
+  bool preparation_latched, bool capture_primed, bool pipeline_idle,
+  bool trigger_armed_required, bool trigger_armed)
 {
-  return capture_primed && pipeline_idle &&
-         (!trigger_armed_required || trigger_armed);
+  return preparation_latched || (capture_primed && pipeline_idle &&
+         (!trigger_armed_required || trigger_armed));
 }
 
 }  // namespace vixel_genicam

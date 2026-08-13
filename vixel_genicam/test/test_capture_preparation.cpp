@@ -16,13 +16,18 @@ TEST(CapturePreparation, UnreservedCaptureModeContinuesBackgroundMetering)
 
 TEST(CapturePreparation, PreparedCameraMustBePrimedIdleAndArmed)
 {
-  EXPECT_FALSE(vixel_genicam::capture_preparation_ready(false, true, true, true));
-  EXPECT_FALSE(vixel_genicam::capture_preparation_ready(true, false, true, true));
-  EXPECT_FALSE(vixel_genicam::capture_preparation_ready(true, true, true, false));
-  EXPECT_TRUE(vixel_genicam::capture_preparation_ready(true, true, true, true));
+  EXPECT_FALSE(vixel_genicam::capture_preparation_ready(false, false, true, true, true));
+  EXPECT_FALSE(vixel_genicam::capture_preparation_ready(false, true, false, true, true));
+  EXPECT_FALSE(vixel_genicam::capture_preparation_ready(false, true, true, true, false));
+  EXPECT_TRUE(vixel_genicam::capture_preparation_ready(false, true, true, true, true));
 }
 
 TEST(CapturePreparation, MissingTriggerArmedFeatureUsesPrimedIdleFallback)
 {
-  EXPECT_TRUE(vixel_genicam::capture_preparation_ready(true, true, false, false));
+  EXPECT_TRUE(vixel_genicam::capture_preparation_ready(false, true, true, false, false));
+}
+
+TEST(CapturePreparation, InFlightCaptureDoesNotRevokeLatchedReadiness)
+{
+  EXPECT_TRUE(vixel_genicam::capture_preparation_ready(true, true, false, true, false));
 }
