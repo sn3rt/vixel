@@ -6,7 +6,9 @@
 #include <limits>
 
 using vixel_genicam::FrameTimestampRelation;
+using vixel_genicam::action_times_conflict;
 using vixel_genicam::classify_frame_timestamp;
+using vixel_genicam::median_clock_offset;
 
 TEST(FrameTimestamp, TreatsMissingTimestampsAsUnknown)
 {
@@ -39,4 +41,28 @@ TEST(FrameTimestamp, AvoidsUnsignedOverflowAtClockLimits)
   EXPECT_EQ(classify_frame_timestamp(
       50, std::numeric_limits<std::uint64_t>::max() - 50, 100),
     FrameTimestampRelation::stale);
+}
+
+TEST(FrameTimestamp, UsesOneDomainOffsetAcrossEverySelection)
+{
+  EXPECT_EQ(median_clock_offset({120, 80, 100}), 100);
+  EXPECT_EQ(median_clock_offset({140, 80, 100, 120}), 110);
+}
+
+TEST(FrameTimestamp, RejectsAnEmptySynchronizationDomain)
+{
+  EXPECT_THROW(median_clock_offset({}), std::invalid_argument);
+}
+
+TEST(FrameTimestamp, MergesExactActionTargetsAndRejectsOnlyTooCloseTargets)
+{
+  EXPECT_FALSE(action_times_conflict(1'000'000, 1'000'000, 250'000));
+  EXPECT_TRUE(action_times_conflict(1'000'000, 1'249'999, 250'000));
+  EXPECT_FALSE(action_times_conflict(1'000'000, 1'250'000, 250'000));
+}
+
+TEST(FrameTimestamp, ComparesActionTargetsWithoutUnsignedOverflow)
+{
+  EXPECT_FALSE(action_times_conflict(
+      0, std::numeric_limits<std::uint64_t>::max(), 250'000));
 }

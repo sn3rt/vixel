@@ -457,6 +457,19 @@ std::uint32_t action_group_key(const std::string & group_id)
 
 constexpr std::uint32_t action_group_mask = 0xffffffffU;
 
+std::vector<std::string> capture_group_ids(const Assignment & assignment)
+{
+  if (!assignment.capture_group_ids.empty()) {return assignment.capture_group_ids;}
+  return assignment.sync_group.empty() ? std::vector<std::string>{} :
+         std::vector<std::string>{assignment.sync_group};
+}
+
+std::string capture_group_missing_policy(const Assignment & assignment, std::size_t index)
+{
+  return index < assignment.capture_group_missing_policies.size() ?
+         assignment.capture_group_missing_policies[index] : assignment.group_missing_policy;
+}
+
 void gvcp_scheduled_action(
   const NetworkConfig & network, std::uint32_t device_key,
   std::uint32_t group_key, std::uint64_t action_time)
@@ -868,6 +881,15 @@ public:
     bool metering{false};
     std::uint64_t expected_device_timestamp_ns{0};
     std::shared_ptr<FrameCompletion> completion;
+    struct Alias
+    {
+      builtin_interfaces::msg::Time stamp;
+      std::string capture_id;
+      bool publish_capture_chunks{false};
+      std::shared_ptr<FrameCompletion> completion;
+    };
+    std::vector<Alias> aliases;
+    bool armed{false};
   };
 
   struct EncodeJob
@@ -955,16 +977,22 @@ public:
     {
       std::lock_guard<std::mutex> request_lock(request_mutex_);
       for (const auto & request : pending_requests_) {
-        if (!request.completion) {continue;}
-        auto completion = request.completion;
-        {
-          std::lock_guard<std::mutex> completion_lock(completion->mutex);
-          completion->error = "camera session stopped";
-          completion->done = true;
+        std::vector<std::shared_ptr<FrameCompletion>> completions;
+        if (request->completion) {completions.push_back(request->completion);}
+        for (const auto & alias : request->aliases) {
+          if (alias.completion) {completions.push_back(alias.completion);}
         }
-        completion->changed.notify_all();
+        for (const auto & completion : completions) {
+          {
+            std::lock_guard<std::mutex> completion_lock(completion->mutex);
+            completion->error = "camera session stopped";
+            completion->done = true;
+          }
+          completion->changed.notify_all();
+        }
       }
       pending_requests_.clear();
+      scheduled_requests_.clear();
     }
     request_cv_.notify_all();
     encode_cv_.notify_all();
@@ -1033,9 +1061,32 @@ public:
     if (!capture_id.empty()) {
       completion = std::make_shared<FrameCompletion>();
     }
-    pending_requests_.push_back(FrameRequest{
+    if (expected_device_timestamp_ns != 0 && !metering) {
+      const auto existing = scheduled_requests_.find(expected_device_timestamp_ns);
+      if (existing != scheduled_requests_.end()) {
+        if (const auto shared = existing->second.lock()) {
+          shared->aliases.push_back(FrameRequest::Alias{
+            stamp, capture_id, publish_capture_chunks, completion});
+          if (completion && shared->armed) {
+            {
+              std::lock_guard<std::mutex> completion_lock(completion->mutex);
+              completion->armed = true;
+            }
+            completion->changed.notify_all();
+          }
+          ++pipeline_depth_;
+          return completion;
+        }
+        scheduled_requests_.erase(existing);
+      }
+    }
+    auto request = std::make_shared<FrameRequest>(FrameRequest{
       stamp, capture_id, publish_capture_chunks, release_at, force_software_trigger,
-      metering, expected_device_timestamp_ns, completion});
+      metering, expected_device_timestamp_ns, completion, {}, false});
+    pending_requests_.push_back(request);
+    if (expected_device_timestamp_ns != 0 && !metering) {
+      scheduled_requests_[expected_device_timestamp_ns] = request;
+    }
     ++pipeline_depth_;
     request_cv_.notify_one();
     return completion;
@@ -1104,6 +1155,11 @@ public:
     return static_cast<std::uint64_t>(
       static_cast<std::int64_t>(system_ns) + cached_ptp_clock_offset_ns_.load());
   }
+  std::int64_t ptp_clock_offset_ns()
+  {
+    ensure_ptp_cache();
+    return cached_ptp_clock_offset_ns_.load();
+  }
 
   std::uint64_t read_ptp_time_ns()
   {
@@ -1139,6 +1195,7 @@ public:
     result.current_address = record_.address;
     result.interface_name = record_.interface_name;
     result.sync_group = assignment_.sync_group;
+    result.capture_group_ids = capture_group_ids(assignment_);
     result.operating_mode = assignment_.operating_mode;
     result.capabilities = {
       "image", "compressed_preview", "genicam", "camera_settings",
@@ -1191,9 +1248,12 @@ private:
     const bool locked = lower(state.status) == "slave" &&
       (!state.offset_exposed || std::llabs(state.offset_ns) <= config_.ptp_tolerance_ns);
     if (locked) {
-      const auto camera_ns = read_ptp_time_ns();
-      const auto system_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      const auto system_before_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
+      const auto camera_ns = read_ptp_time_ns();
+      const auto system_after_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+      const auto system_ns = system_before_ns + (system_after_ns - system_before_ns) / 2;
       cached_ptp_clock_offset_ns_.store(
         static_cast<std::int64_t>(camera_ns) - system_ns);
     }
@@ -1947,7 +2007,7 @@ private:
           camera_, "ActionDeviceKey", config_.action_device_key, &error);
         throw_on_error(error, "setting ActionDeviceKey");
         arv_camera_set_integer(
-          camera_, "ActionGroupKey", action_group_key(assignment_.sync_group), &error);
+          camera_, "ActionGroupKey", action_group_key(assignment_.sensor_id), &error);
         throw_on_error(error, "setting ActionGroupKey");
         arv_camera_set_integer(camera_, "ActionGroupMask", action_group_mask, &error);
         throw_on_error(error, "setting ActionGroupMask");
@@ -1969,7 +2029,7 @@ private:
           assignment_.sensor_id.c_str(),
           assignment_.operating_mode == "preview" ? "Software" : "Action0",
           static_cast<long long>(config_.action_device_key),
-          static_cast<long long>(action_group_key(assignment_.sync_group)),
+          static_cast<long long>(action_group_key(assignment_.sensor_id)),
           static_cast<unsigned long long>(action_group_mask),
           config_.ptp_action_lead_time_ms);
         ptp_capability_detail_ = "PTP supported; waiting for lock";
@@ -2138,7 +2198,7 @@ private:
   {
     ArvBuffer * deferred_buffer = nullptr;
     while (!stopping_.load()) {
-      std::optional<FrameRequest> request;
+      std::shared_ptr<FrameRequest> request;
       {
         std::unique_lock<std::mutex> lock(request_mutex_);
         request_cv_.wait_for(lock, 200ms, [this]() {
@@ -2146,17 +2206,47 @@ private:
         });
         if (stopping_.load()) {break;}
         if (!pending_requests_.empty()) {
-          request = std::move(pending_requests_.front());
+          request = pending_requests_.front();
           pending_requests_.pop_front();
         }
       }
       if (!request) {continue;}
-      if (request->completion) {
-        {
-          std::lock_guard<std::mutex> completion_lock(request->completion->mutex);
-          request->completion->armed = true;
+      std::vector<FrameRequest::Alias> deliveries;
+      const auto close_deliveries = [this, &request, &deliveries]() {
+          std::lock_guard<std::mutex> lock(request_mutex_);
+          if (!deliveries.empty()) {return;}
+          deliveries.push_back(FrameRequest::Alias{
+            request->stamp, request->capture_id,
+            request->publish_capture_chunks, request->completion});
+          deliveries.insert(
+            deliveries.end(),
+            std::make_move_iterator(request->aliases.begin()),
+            std::make_move_iterator(request->aliases.end()));
+          request->aliases.clear();
+          if (request->expected_device_timestamp_ns != 0) {
+            const auto scheduled = scheduled_requests_.find(
+              request->expected_device_timestamp_ns);
+            if (scheduled != scheduled_requests_.end()) {
+              const auto shared = scheduled->second.lock();
+              if (!shared || shared == request) {scheduled_requests_.erase(scheduled);}
+            }
+          }
+        };
+      {
+        std::lock_guard<std::mutex> lock(request_mutex_);
+        request->armed = true;
+        std::vector<std::shared_ptr<FrameCompletion>> completions;
+        if (request->completion) {completions.push_back(request->completion);}
+        for (const auto & alias : request->aliases) {
+          if (alias.completion) {completions.push_back(alias.completion);}
         }
-        request->completion->changed.notify_all();
+        for (const auto & completion : completions) {
+          {
+            std::lock_guard<std::mutex> completion_lock(completion->mutex);
+            completion->armed = true;
+          }
+          completion->changed.notify_all();
+        }
       }
       bool restore_action_trigger = false;
       try {
@@ -2266,11 +2356,15 @@ private:
                   "incomplete image buffer: " + buffer_status_name(status) + " (status " +
                   std::to_string(status) + ")");
         }
-        if (request->completion) {
-          request->completion->device_timestamp_ns = arv_buffer_get_timestamp(buffer);
-          request->completion->synchronized = ptp_action_ && !request->force_software_trigger;
-          request->completion->ptp_offset_ns = request->completion->synchronized ?
-            ptp_offset_ns() : 0;
+        close_deliveries();
+        const auto device_timestamp_ns = arv_buffer_get_timestamp(buffer);
+        const bool synchronized = ptp_action_ && !request->force_software_trigger;
+        const auto ptp_offset = synchronized ? ptp_offset_ns() : 0;
+        for (const auto & delivery : deliveries) {
+          if (!delivery.completion) {continue;}
+          delivery.completion->device_timestamp_ns = device_timestamp_ns;
+          delivery.completion->synchronized = synchronized;
+          delivery.completion->ptp_offset_ns = ptp_offset;
         }
         if (request->metering) {
           arv_stream_push_buffer(stream_, buffer);
@@ -2304,32 +2398,35 @@ private:
           throw_on_error(error, "restoring Action0 after temporary software-triggered frame");
           restore_action_trigger = false;
         }
-        if (request->publish_capture_chunks) {
-          {
-            std::lock_guard<std::mutex> lock(encode_mutex_);
-            encode_jobs_.push_back(EncodeJob{
-              std::move(image), request->stamp, request->capture_id, true});
+        for (const auto & delivery : deliveries) {
+          if (delivery.publish_capture_chunks) {
+            {
+              std::lock_guard<std::mutex> lock(encode_mutex_);
+              encode_jobs_.push_back(EncodeJob{
+                image, delivery.stamp, delivery.capture_id, true});
+            }
+            encode_cv_.notify_one();
+          } else {
+            endpoint_->publish(
+              image, delivery.stamp, delivery.capture_id, false, capture_png_compression_);
+            ++completed_frames_;
+            --pipeline_depth_;
           }
-          encode_cv_.notify_one();
-        } else {
-          endpoint_->publish(
-            image, request->stamp, request->capture_id, false, capture_png_compression_);
-          ++completed_frames_;
-          --pipeline_depth_;
-        }
-        if (request->completion) {
-          {
-            std::lock_guard<std::mutex> completion_lock(request->completion->mutex);
-            request->completion->success = true;
-            request->completion->done = true;
+          if (delivery.completion) {
+            {
+              std::lock_guard<std::mutex> completion_lock(delivery.completion->mutex);
+              delivery.completion->success = true;
+              delivery.completion->done = true;
+            }
+            delivery.completion->changed.notify_all();
           }
-          request->completion->changed.notify_all();
         }
         capture_primed_.store(true);
         std::lock_guard<std::mutex> error_lock(error_mutex_);
         last_error_.clear();
         warning_active_ = false;
       } catch (const std::exception & error) {
+        close_deliveries();
         if (restore_action_trigger) {
           GError * restore_error = nullptr;
           {
@@ -2343,13 +2440,14 @@ private:
             g_error_free(restore_error);
           }
         }
-        if (request->completion) {
+        for (const auto & delivery : deliveries) {
+          if (!delivery.completion) {continue;}
           {
-            std::lock_guard<std::mutex> completion_lock(request->completion->mutex);
-            request->completion->error = error.what();
-            request->completion->done = true;
+            std::lock_guard<std::mutex> completion_lock(delivery.completion->mutex);
+            delivery.completion->error = error.what();
+            delivery.completion->done = true;
           }
-          request->completion->changed.notify_all();
+          delivery.completion->changed.notify_all();
         }
         const auto now = std::chrono::steady_clock::now();
         bool should_log = false;
@@ -2367,7 +2465,7 @@ private:
             node_->get_logger(), "Acquisition failed for %s: %s",
             assignment_.sensor_id.c_str(), error.what());
         }
-        --pipeline_depth_;
+        pipeline_depth_.fetch_sub(deliveries.size());
       }
     }
     if (deferred_buffer != nullptr) {
@@ -2573,7 +2671,8 @@ private:
   bool transfer_start_required_{false};
   std::mutex request_mutex_;
   std::condition_variable request_cv_;
-  std::deque<FrameRequest> pending_requests_;
+  std::deque<std::shared_ptr<FrameRequest>> pending_requests_;
+  std::map<std::uint64_t, std::weak_ptr<FrameRequest>> scheduled_requests_;
   std::mutex encode_mutex_;
   std::condition_variable encode_cv_;
   std::deque<EncodeJob> encode_jobs_;
@@ -2865,7 +2964,6 @@ private:
       const bool keep = assignment != assignments_.end() && assignment->second.enabled &&
         config_.networks.count(assignment->second.network_id) != 0 &&
         config_.networks.at(assignment->second.network_id).approved &&
-        assignment->second.operating_mode != "idle" &&
         assignment->second.operating_mode == iterator->second->assignment().operating_mode &&
         assignment->second.provider_settings_json ==
         iterator->second->assignment().provider_settings_json &&
@@ -2881,8 +2979,7 @@ private:
     }
     for (const auto & item : assignments_) {
       const auto & assignment = item.second;
-      if (!assignment.enabled || assignment.operating_mode == "idle" ||
-        sessions_.count(item.first) != 0)
+      if (!assignment.enabled || sessions_.count(item.first) != 0)
       {
         continue;
       }
@@ -3000,7 +3097,7 @@ private:
 
       bool triggerable = true;
       std::uint64_t action_time = 0;
-      std::map<std::string, NetworkConfig> action_networks;
+      bool has_ptp_members = false;
       for (auto * session : members) {
         if (session->ptp_action()) {
           if (!session->ptp_locked()) {
@@ -3008,7 +3105,7 @@ private:
             break;
           }
           action_time = std::max(action_time, session->ptp_time_ns());
-          action_networks[session->network().id] = session->network();
+          has_ptp_members = true;
         } else if (!session->software_trigger()) {
           triggerable = false;
           break;
@@ -3016,31 +3113,33 @@ private:
       }
       if (!triggerable) {continue;}
 
-      const auto lead = action_networks.empty() ? 0ms :
+      const auto lead = !has_ptp_members ? 0ms :
         std::chrono::milliseconds(config_.ptp_action_lead_time_ms);
       action_time += static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(lead).count());
       const auto release_at = tick + lead;
       const auto metering_stamp = now() + rclcpp::Duration::from_nanoseconds(
         std::chrono::duration_cast<std::chrono::nanoseconds>(lead).count());
-      std::set<std::string> failed_networks;
-      for (const auto & network : action_networks) {
+      std::set<std::string> failed_sensors;
+      for (auto * session : members) {
+        if (!session->ptp_action()) {continue;}
+        const auto & sensor_id = session->assignment().sensor_id;
         try {
           gvcp_scheduled_action(
-            network.second, config_.action_device_key,
-            action_group_key(group.first), action_time);
+            session->network(), config_.action_device_key,
+            action_group_key(sensor_id), action_time);
         } catch (const std::exception & error) {
-          failed_networks.insert(network.first);
+          failed_sensors.insert(sensor_id);
           RCLCPP_WARN_THROTTLE(
             get_logger(), *get_clock(), 5000,
-            "Metering action failed for group %s on %s: %s",
-            group.first.c_str(), network.second.interface.c_str(), error.what());
+            "Metering action failed for %s on %s: %s", sensor_id.c_str(),
+            session->network().interface.c_str(), error.what());
         }
       }
       for (auto * session : members) {
         session->mark_metering_scheduled(tick);
         if (session->ptp_action() &&
-          failed_networks.count(session->network().id) != 0)
+          failed_sensors.count(session->assignment().sensor_id) != 0)
         {
           continue;
         }
@@ -3079,6 +3178,7 @@ private:
       sensor.network_id = item.second.network_id;
       sensor.assigned_address = item.second.assigned_address;
       sensor.sync_group = item.second.sync_group;
+      sensor.capture_group_ids = capture_group_ids(item.second);
       sensor.operating_mode = item.second.operating_mode;
       sensor.capabilities = {
         "image", "compressed_preview", "genicam", "camera_settings",
@@ -3102,68 +3202,82 @@ private:
     std::map<std::string, std::vector<std::string>> cadence_unconfigured_members;
     for (const auto & item : assignments_) {
       const auto & assignment = item.second;
-      if (assignment.sync_group.empty()) {continue;}
-      auto & group = groups[assignment.sync_group];
-      group.stamp = stamp;
-      group.group_id = assignment.sync_group;
-      group.provider = "genicam";
-      group.missing_policy = assignment.group_missing_policy;
-      group.trigger_source = assignment.group_trigger_source;
-      group.operating_mode = assignment.operating_mode;
-      group.preview_rate_hz = assignment.preview_rate_hz;
-      group.requested_capture_interval_ms = assignment.requested_capture_interval_ms;
-      group.preferred_master_id = assignment.preferred_master_id;
-      group.member_ids.push_back(item.first);
-      const auto session = sessions_.find(item.first);
-      if (session != sessions_.end() && session->second->ready()) {
-        group.online_member_ids.push_back(item.first);
-        const auto minimum_interval = session->second->minimum_capture_interval_ms();
-        if (minimum_interval > group.minimum_capture_interval_ms) {
-          group.minimum_capture_interval_ms = minimum_interval;
-          group.cadence_limit_reason = item.first + ": " +
-            session->second->cadence_limit_reason();
+      const auto assignment_group_ids = capture_group_ids(assignment);
+      for (std::size_t group_index = 0; group_index < assignment_group_ids.size(); ++group_index) {
+        const auto & group_id = assignment_group_ids[group_index];
+        auto & group = groups[group_id];
+        const bool first_member = group.member_ids.empty();
+        group.stamp = stamp;
+        group.group_id = group_id;
+        group.provider = "genicam";
+        const auto missing_policy = capture_group_missing_policy(assignment, group_index);
+        group.missing_policy = first_member ? missing_policy :
+          (group.missing_policy == "strict" || missing_policy == "strict" ?
+          "strict" : "degraded");
+        group.trigger_source = assignment.group_trigger_source;
+        if (first_member) {
+          group.operating_mode = assignment.operating_mode;
+          group.preview_rate_hz = assignment.preview_rate_hz;
+          group.requested_capture_interval_ms = assignment.requested_capture_interval_ms;
+        } else {
+          if (group.operating_mode != assignment.operating_mode) {
+            group.operating_mode = "mixed";
+          }
+          group.preview_rate_hz = std::max(group.preview_rate_hz, assignment.preview_rate_hz);
+          group.requested_capture_interval_ms = std::max(
+            group.requested_capture_interval_ms, assignment.requested_capture_interval_ms);
         }
-        const auto action_queue_size = session->second->action_queue_size();
-        group.action_queue_size = group.action_queue_size == 0 ? action_queue_size :
-          std::min(group.action_queue_size, action_queue_size);
-        if (!session->second->cadence_configured()) {
-          cadence_unconfigured_members[assignment.sync_group].push_back(item.first);
-        } else if (assignment.requested_capture_interval_ms != 0 &&
-          !session->second->cadence_ready())
-        {
-          cadence_failed_members[assignment.sync_group].push_back(item.first);
-          // A hard negotiation failure is more useful than the ordinary
-          // slowest-member explanation selected above.
-          group.cadence_limit_reason = item.first + ": " +
-            session->second->cadence_limit_reason();
-        }
-        if (assignment.operating_mode == "capture" &&
-          !session->second->capture_primed())
-        {
-          warming_members[assignment.sync_group].push_back(item.first);
-        } else if (assignment.operating_mode == "capture" &&
-          assignment.requested_capture_interval_ms != 0 &&
-          !session->second->capture_prepared())
-        {
-          arming_members[assignment.sync_group].push_back(item.first);
-        }
-        if (session->second->ptp_action()) {
-          if (session->second->ptp_locked()) {
-            group.synchronized_member_ids.push_back(item.first);
-            const auto offset = static_cast<std::int64_t>(
-              std::llabs(session->second->ptp_offset_ns()));
-            group.max_ptp_offset_ns = std::max<std::int64_t>(
-              group.max_ptp_offset_ns, offset);
+        group.preferred_master_id = assignment.preferred_master_id;
+        group.member_ids.push_back(item.first);
+        const auto session = sessions_.find(item.first);
+        if (session != sessions_.end() && session->second->ready()) {
+          group.online_member_ids.push_back(item.first);
+          const auto minimum_interval = session->second->minimum_capture_interval_ms();
+          if (minimum_interval > group.minimum_capture_interval_ms) {
+            group.minimum_capture_interval_ms = minimum_interval;
+            group.cadence_limit_reason = item.first + ": " +
+              session->second->cadence_limit_reason();
+          }
+          const auto action_queue_size = session->second->action_queue_size();
+          group.action_queue_size = group.action_queue_size == 0 ? action_queue_size :
+            std::min(group.action_queue_size, action_queue_size);
+          if (!session->second->cadence_configured()) {
+            cadence_unconfigured_members[group_id].push_back(item.first);
+          } else if (assignment.requested_capture_interval_ms != 0 &&
+            !session->second->cadence_ready())
+          {
+            cadence_failed_members[group_id].push_back(item.first);
+            group.cadence_limit_reason = item.first + ": " +
+              session->second->cadence_limit_reason();
+          }
+          if (assignment.operating_mode == "capture" &&
+            !session->second->capture_primed())
+          {
+            warming_members[group_id].push_back(item.first);
+          } else if (assignment.operating_mode == "capture" &&
+            assignment.requested_capture_interval_ms != 0 &&
+            !session->second->capture_prepared())
+          {
+            arming_members[group_id].push_back(item.first);
+          }
+          if (session->second->ptp_action()) {
+            if (session->second->ptp_locked()) {
+              group.synchronized_member_ids.push_back(item.first);
+              const auto offset = static_cast<std::int64_t>(
+                std::llabs(session->second->ptp_offset_ns()));
+              group.max_ptp_offset_ns = std::max<std::int64_t>(
+                group.max_ptp_offset_ns, offset);
+            } else {
+              group.locking_member_ids.push_back(item.first);
+              locking_members[group_id].push_back(item.first);
+            }
           } else {
-            group.locking_member_ids.push_back(item.first);
-            locking_members[assignment.sync_group].push_back(item.first);
+            group.unsynchronized_member_ids.push_back(item.first);
+            unsupported_members[group_id].push_back(item.first);
           }
         } else {
-          group.unsynchronized_member_ids.push_back(item.first);
-          unsupported_members[assignment.sync_group].push_back(item.first);
+          group.missing_member_ids.push_back(item.first);
         }
-      } else {
-        group.missing_member_ids.push_back(item.first);
       }
     }
     vixel_interfaces::msg::SyncGroupArray result;
@@ -3298,6 +3412,38 @@ private:
     arv_gv_interface_set_discovery_interface_name(nullptr);
   }
 
+  std::uint64_t common_ptp_action_time(std::uint64_t requested_system_ns)
+  {
+    const auto existing = scheduled_action_times_.find(requested_system_ns);
+    if (existing != scheduled_action_times_.end()) {return existing->second;}
+
+    std::vector<std::int64_t> offsets;
+    for (const auto & item : sessions_) {
+      if (item.second->ready() && item.second->ptp_action() && item.second->ptp_locked()) {
+        offsets.push_back(item.second->ptp_clock_offset_ns());
+      }
+    }
+    if (offsets.empty()) {
+      throw std::runtime_error("no PTP-locked camera is available for clock conversion");
+    }
+    const auto offset = vixel_genicam::median_clock_offset(std::move(offsets));
+    const auto target = static_cast<std::int64_t>(requested_system_ns) + offset;
+    if (target <= 0) {throw std::runtime_error("converted PTP action time is invalid");}
+    const auto action_time = static_cast<std::uint64_t>(target);
+    scheduled_action_times_[requested_system_ns] = action_time;
+
+    const auto system_now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+    for (auto iterator = scheduled_action_times_.begin(); iterator != scheduled_action_times_.end();) {
+      if (static_cast<std::int64_t>(iterator->first) < system_now_ns - 1'000'000'000LL) {
+        iterator = scheduled_action_times_.erase(iterator);
+      } else {
+        ++iterator;
+      }
+    }
+    return action_time;
+  }
+
   void capture_callback(
     const std::shared_ptr<vixel_interfaces::srv::ProviderCapture::Request> request,
     std::shared_ptr<vixel_interfaces::srv::ProviderCapture::Response> response)
@@ -3316,13 +3462,11 @@ private:
       "group_" + std::to_string(++capture_sequence_) : request->request_id;
     std::vector<std::pair<
       std::string, std::shared_ptr<CameraSession::FrameCompletion>>> completions;
-    std::map<std::string, NetworkConfig> action_networks;
+    std::map<std::string, NetworkConfig> action_targets;
     std::map<std::string, bool> request_ptp_locked;
     std::optional<std::uint64_t> action_time;
     std::optional<std::uint64_t> minimum_ptp_time;
     std::optional<std::uint64_t> maximum_ptp_time;
-    std::optional<std::uint64_t> minimum_requested_ptp_time;
-    std::optional<std::uint64_t> maximum_requested_ptp_time;
     if (request->has_requested_time && request->requested_time.sec < 0) {
       response->success = false;
       response->message = "requested capture time is invalid";
@@ -3346,15 +3490,7 @@ private:
         std::min(*minimum_ptp_time, current_ptp_time) : current_ptp_time;
       maximum_ptp_time = maximum_ptp_time ?
         std::max(*maximum_ptp_time, current_ptp_time) : current_ptp_time;
-      if (request->has_requested_time) {
-        const auto requested_ptp_time =
-          session->second->ptp_time_for_system_ns(requested_ns);
-        minimum_requested_ptp_time = minimum_requested_ptp_time ?
-          std::min(*minimum_requested_ptp_time, requested_ptp_time) : requested_ptp_time;
-        maximum_requested_ptp_time = maximum_requested_ptp_time ?
-          std::max(*maximum_requested_ptp_time, requested_ptp_time) : requested_ptp_time;
-      }
-      action_networks[session->second->network().id] = session->second->network();
+      action_targets[sensor_id] = session->second->network();
     }
     if (!locking_member_ids.empty()) {
       response->success = false;
@@ -3375,9 +3511,14 @@ private:
         return;
       }
       release_at = std::chrono::steady_clock::now() + std::chrono::nanoseconds(delay_ns);
-      if (minimum_requested_ptp_time && maximum_requested_ptp_time) {
-        action_time = *minimum_requested_ptp_time +
-          (*maximum_requested_ptp_time - *minimum_requested_ptp_time) / 2U;
+      if (!action_targets.empty()) {
+        try {
+          action_time = common_ptp_action_time(requested_ns);
+        } catch (const std::exception & error) {
+          response->success = false;
+          response->message = error.what();
+          return;
+        }
         if (maximum_ptp_time && *action_time < *maximum_ptp_time + 20'000'000ULL) {
           response->success = false;
           response->message = "requested PTP action lacks 20 ms camera-clock margin";
@@ -3387,6 +3528,31 @@ private:
     } else if (maximum_ptp_time) {
       action_time = *maximum_ptp_time +
         static_cast<std::uint64_t>(config_.ptp_action_lead_time_ms) * 1000000ULL;
+    }
+    if (action_time) {
+      for (const auto & item : action_targets) {
+        const auto session = sessions_.find(item.first);
+        if (session == sessions_.end()) {continue;}
+        const auto minimum_separation_ns = static_cast<std::uint64_t>(
+          std::max(1U, session->second->minimum_capture_interval_ms())) * 1'000'000ULL;
+        for (const auto & scheduled : scheduled_sensor_actions_) {
+          if (scheduled.first == *action_time || scheduled.second.count(item.first) == 0) {
+            continue;
+          }
+          const auto separation = scheduled.first > *action_time ?
+            scheduled.first - *action_time : *action_time - scheduled.first;
+          if (vixel_genicam::action_times_conflict(
+              *action_time, scheduled.first, minimum_separation_ns))
+          {
+            response->success = false;
+            response->message = "camera timing conflict for " + item.first +
+              ": requested action is " + std::to_string(separation) +
+              " ns from an existing action; minimum is " +
+              std::to_string(minimum_separation_ns) + " ns";
+            return;
+          }
+        }
+      }
     }
     // A capture frame also meters automatic exposure/gain. Keep background
     // metering out of the same receive window; repeated sequence requests
@@ -3416,9 +3582,11 @@ private:
     std::uint64_t earliest_dispatch = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t latest_dispatch = 0;
     std::vector<std::string> action_errors;
-    std::set<std::string> failed_action_networks;
+    std::set<std::string> failed_action_sensors;
     if (action_time) {
-      for (const auto & item : action_networks) {
+      for (const auto & item : action_targets) {
+        auto & scheduled_sensors = scheduled_sensor_actions_[*action_time];
+        if (scheduled_sensors.count(item.first) != 0) {continue;}
         const auto dispatch = static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -3426,14 +3594,24 @@ private:
         try {
           gvcp_scheduled_action(
             item.second, config_.action_device_key,
-            action_group_key(request->group_id), *action_time);
+            action_group_key(item.first), *action_time);
+          scheduled_sensors.insert(item.first);
           latest_dispatch = dispatch;
         } catch (const std::exception & error) {
-          failed_action_networks.insert(item.first);
+          failed_action_sensors.insert(item.first);
           action_errors.push_back(item.second.interface + ": " + error.what());
           RCLCPP_WARN(
             get_logger(), "Scheduled action failed on %s; using software fallback: %s",
             item.second.interface.c_str(), error.what());
+        }
+      }
+      for (auto iterator = scheduled_sensor_actions_.begin();
+        iterator != scheduled_sensor_actions_.end();)
+      {
+        if (iterator->first + 1'000'000'000ULL < *action_time) {
+          iterator = scheduled_sensor_actions_.erase(iterator);
+        } else {
+          ++iterator;
         }
       }
     }
@@ -3447,7 +3625,7 @@ private:
       } else {
         const bool force_software = session->second->ptp_action() &&
           (!request_ptp_locked[sensor_id] ||
-          failed_action_networks.count(session->second->network().id) != 0);
+          failed_action_sensors.count(sensor_id) != 0);
         const auto expected_device_timestamp =
           session->second->ptp_action() && !force_software && action_time ?
           *action_time : 0;
@@ -3562,6 +3740,8 @@ private:
 
   GenicamConfig config_;
   std::mutex capture_scheduling_mutex_;
+  std::map<std::uint64_t, std::uint64_t> scheduled_action_times_;
+  std::map<std::uint64_t, std::set<std::string>> scheduled_sensor_actions_;
   std::mutex mutex_;
   std::mutex aravis_mutex_;
   std::map<std::string, DeviceRecord> records_;
