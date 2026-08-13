@@ -9,7 +9,10 @@
   <url type="repository">https://github.com/sn3rt/vixel</url>
   <buildtool_depend>ament_cmake</buildtool_depend>
   <build_depend>git</build_depend>
+  <build_depend>libglib-dev</build_depend>
   <build_depend>libxml2</build_depend>
   <build_depend>meson</build_depend>
+  <build_depend>pkg-config</build_depend>
+  <build_depend>zlib</build_depend>
   <export><build_type>ament_cmake</build_type></export>
 </package>

@@ -15,7 +15,6 @@
   <exec_depend>rclpy</exec_depend>
   <exec_depend>tf2_ros</exec_depend>
   <exec_depend>vixel_interfaces</exec_depend>
-  <test_depend>ament_pytest</test_depend>
   <test_depend>python3-pytest</test_depend>
 
   <export>

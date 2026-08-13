@@ -38,31 +38,54 @@ jobs:
 
       - name: Install ROS and development tools
         run: |
-          apt-get install -y gjs linuxptp ros-lyrical-ros-base ros-dev-tools
+          apt-get install -y linuxptp ros-lyrical-ros-base ros-dev-tools
 
       - uses: actions/checkout@v4
 
       - name: Install workspace dependencies
         shell: bash
         run: |
-          set -euo pipefail
           source /opt/ros/lyrical/setup.bash
+          set -euo pipefail
           rosdep update
-          rosdep install --from-paths . --ignore-src -r -y --rosdistro lyrical \
-            --skip-keys "ament_pytest gjs"
+          rosdep install --from-paths . --ignore-src -r -y --rosdistro lyrical
+
+      - name: Check manifests and Python packages
+        shell: bash
+        run: |
+          source /opt/ros/lyrical/setup.bash
+          set -euo pipefail
+          rosdep check --from-paths . --ignore-src --rosdistro lyrical
+          python3 -m compileall -q -f vixel_manager vixel_network vixel_web examples
+          python3 -m flake8 --jobs=1 --select=E9,F63,F7,F82 \
+            vixel_manager vixel_network vixel_web examples
+          for package in vixel_manager vixel_network vixel_web; do
+            (cd "$package" && python3 setup.py check --strict)
+          done
+
+      - name: Verify bundled Aravis fallback
+        shell: bash
+        run: |
+          source /opt/ros/lyrical/setup.bash
+          set -euo pipefail
+          colcon build --packages-select vixel_aravis_vendor \
+            --build-base build-bundled-aravis \
+            --install-base install-bundled-aravis \
+            --cmake-args -DVIXEL_FORCE_BUNDLED_ARAVIS=ON \
+            --event-handlers console_direct+
 
       - name: Build
         shell: bash
         run: |
-          set -euo pipefail
           source /opt/ros/lyrical/setup.bash
+          set -euo pipefail
           colcon build --event-handlers console_direct+
 
       - name: Test
         shell: bash
         run: |
-          set -euo pipefail
           source /opt/ros/lyrical/setup.bash
+          set -euo pipefail
           source install/setup.bash
           colcon test --event-handlers console_direct+
           colcon test-result --verbose

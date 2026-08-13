@@ -28,14 +28,15 @@ def test_dashboard_is_dynamic_and_uses_gateway_endpoints():
 
 
 def test_dashboard_javascript_parses():
-    gjs = shutil.which("gjs")
-    assert gjs is not None, "gjs is required to validate dashboard JavaScript"
+    node = shutil.which("node")
+    assert node is not None, "nodejs is required to validate dashboard JavaScript"
     page = PAGE.read_text()
     script = page.split("<script>", 1)[1].split("</script>", 1)[0]
     result = subprocess.run(
-        [gjs, "-c", f"if (false) {{\n{script}\n}}"],
+        [node, "--check"],
         check=False,
         capture_output=True,
+        input=script,
         text=True,
     )
     assert result.returncode == 0, result.stderr

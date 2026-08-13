@@ -13,8 +13,7 @@ sudo apt update
 sudo apt install -y linuxptp
 git clone https://github.com/sn3rt/vixel.git
 cd vixel
-rosdep install --from-paths . --ignore-src -r -y --rosdistro lyrical \
-  --skip-keys "ament_pytest gjs"
+rosdep install --from-paths . --ignore-src -r -y --rosdistro lyrical
 source /opt/ros/lyrical/setup.bash
 colcon build --symlink-install
 source install/setup.bash

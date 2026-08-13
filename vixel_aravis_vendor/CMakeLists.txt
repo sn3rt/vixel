@@ -4,7 +4,13 @@ project(vixel_aravis_vendor)
 find_package(ament_cmake REQUIRED)
 include(ExternalProject)
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(ARAVIS QUIET aravis-0.8>=0.8.34)
+option(
+  VIXEL_FORCE_BUNDLED_ARAVIS
+  "Build the pinned Aravis source even when a compatible system package exists"
+  OFF)
+if(NOT VIXEL_FORCE_BUNDLED_ARAVIS)
+  pkg_check_modules(ARAVIS QUIET aravis-0.8>=0.8.34)
+endif()
 
 add_library(vixel_aravis_vendor INTERFACE)
 if(ARAVIS_FOUND)
@@ -21,14 +27,14 @@ else()
   file(MAKE_DIRECTORY "${_aravis_prefix}/include/aravis-0.8")
   ExternalProject_Add(aravis_external
     GIT_REPOSITORY https://github.com/AravisProject/aravis.git
-    GIT_TAG 0.8.36
+    GIT_TAG 97ff5e330919d7a44b871df4eda669feeafdf342
     GIT_SHALLOW TRUE
     UPDATE_DISCONNECTED TRUE
     CONFIGURE_COMMAND
       ${MESON_EXECUTABLE} setup <BINARY_DIR> <SOURCE_DIR>
         --prefix=${_aravis_prefix} --libdir=lib --buildtype=release
         -Dviewer=disabled -Dgst-plugin=disabled -Dintrospection=disabled
-        -Ddocumentation=disabled
+        -Ddocumentation=disabled -Dusb=disabled -Dtests=false
     BUILD_COMMAND ${MESON_EXECUTABLE} compile -C <BINARY_DIR>
     INSTALL_COMMAND ${MESON_EXECUTABLE} install -C <BINARY_DIR>
     BUILD_BYPRODUCTS "${_aravis_library}")
