@@ -9,7 +9,11 @@ string frame_id
 string calibration_url
 string network_id
 string assigned_address
+# Legacy primary selection retained for older providers. New providers use
+# capture_group_ids for logical selections and route Action0 per sensor.
 string sync_group
+string[] capture_group_ids
+string[] capture_group_missing_policies
 string group_missing_policy
 string group_trigger_source
 string preferred_master_id

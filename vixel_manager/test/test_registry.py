@@ -118,7 +118,7 @@ def test_replacement_transfers_slot_metadata_and_group_membership(tmp_path):
     assert retired["replaced_by"] == replacement
 
 
-def test_sensor_can_belong_to_only_one_sync_group(tmp_path):
+def test_sensor_can_belong_to_multiple_capture_groups(tmp_path):
     registry, _ = make_registry(tmp_path)
     sensor_id = registry.enroll(
         observation(), registry.allocate("switch"), "Camera", "unknown"
@@ -126,11 +126,12 @@ def test_sensor_can_belong_to_only_one_sync_group(tmp_path):
     registry.upsert_group(
         "group_a", "lucid", [sensor_id], "strict", "Software", 2.0, ""
     )
-    with pytest.raises(RegistryError, match="multiple sync groups"):
-        registry.upsert_group(
-            "group_b", "lucid", [sensor_id], "degraded", "Software", 1.0, ""
-        )
-    assert "group_b" not in registry.inventory["sync_groups"]
+    registry.upsert_group(
+        "group_b", "lucid", [sensor_id], "degraded", "Software", 1.0, ""
+    )
+
+    assert registry.inventory["sync_groups"]["group_a"]["members"] == [sensor_id]
+    assert registry.inventory["sync_groups"]["group_b"]["members"] == [sensor_id]
 
 
 def test_pc_is_always_group_ptp_master(tmp_path):

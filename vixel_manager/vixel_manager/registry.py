@@ -426,7 +426,6 @@ def validate_inventory(data: dict[str, Any], machine: dict[str, Any]) -> dict[st
             f"enrolled sensors missing from known_sensors: {', '.join(missing_known)}"
         )
 
-    member_to_group: dict[str, str] = {}
     for group_id, group in groups.items():
         if not re.fullmatch(r"[a-z][a-z0-9_]*", group_id):
             raise RegistryError(f"sync group ID {group_id} is not ROS-safe")
@@ -451,9 +450,6 @@ def validate_inventory(data: dict[str, Any], machine: dict[str, Any]) -> dict[st
         for member in members:
             if member not in sensors:
                 raise RegistryError(f"sync group {group_id} references unknown sensor {member}")
-            if member in member_to_group:
-                raise RegistryError(f"sensor {member} belongs to multiple sync groups")
-            member_to_group[member] = group_id
         group.setdefault("missing_policy", "strict")
         group["trigger_source"] = "Action0"
         group.setdefault("preview_rate_hz", machine["defaults"]["preview_rate_hz"])

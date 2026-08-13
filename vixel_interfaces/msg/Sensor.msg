@@ -21,7 +21,9 @@ string network_id
 string assigned_address
 string current_address
 string interface_name
+# The first capture selection is retained in sync_group for API compatibility.
 string sync_group
+string[] capture_group_ids
 string operating_mode
 string[] capabilities
 string last_error

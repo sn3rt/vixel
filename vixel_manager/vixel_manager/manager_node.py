@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import ipaddress
 import json
 import os
@@ -69,11 +70,22 @@ def _provider_group_is_current(
     provider_message: SyncGroup | None, members: list[str], requested_mode: str,
     requested_capture_interval_ms: int = 0,
 ) -> bool:
+    provider_interval = int(
+        getattr(provider_message, "requested_capture_interval_ms", 0)
+    ) if provider_message else 0
+    cadence_is_current = (
+        requested_capture_interval_ms == 0
+        or 0 < provider_interval <= requested_capture_interval_ms
+    )
+    mode_is_current = (
+        requested_mode == "idle"
+        or provider_message is not None
+        and provider_message.operating_mode == requested_mode
+    )
     return bool(
         provider_message
-        and provider_message.operating_mode == requested_mode
-        and int(getattr(provider_message, "requested_capture_interval_ms", 0))
-        == requested_capture_interval_ms
+        and mode_is_current
+        and cadence_is_current
         and set(provider_message.member_ids) == set(members)
     )
 
@@ -520,7 +532,8 @@ class InventoryManager(Node):
         message.managed = bool(network.get("approved", False))
         message.pending_action = ""
         message.status_detail = ""
-        message.sync_group = self._group_for_sensor(sensor_id)
+        message.capture_group_ids = self._groups_for_sensor(sensor_id)
+        message.sync_group = message.capture_group_ids[0] if message.capture_group_ids else ""
         message.operating_mode = self._mode_for_sensor(sensor_id)
         runtime = self.runtime.get(sensor_id)
         if runtime:
@@ -723,7 +736,18 @@ class InventoryManager(Node):
         if _provider_group_is_current(
             provider_message, list(record["members"]), requested_mode, requested_interval
         ):
-            return provider_message
+            result = copy.deepcopy(provider_message)
+            # Logical selection policy remains manager-owned. A provider reports
+            # effective camera state, which overlapping selections can share.
+            result.group_id = group_id
+            result.provider = self._runtime_group_provider(record)
+            result.member_ids = list(record["members"])
+            result.missing_policy = record["missing_policy"]
+            result.trigger_source = "Action0"
+            result.operating_mode = requested_mode
+            result.preview_rate_hz = float(record["preview_rate_hz"])
+            result.requested_capture_interval_ms = requested_interval
+            return result
         result = SyncGroup()
         result.stamp = self.get_clock().now().to_msg()
         result.group_id = group_id
@@ -897,11 +921,10 @@ class InventoryManager(Node):
             self.static_tf_broadcaster.sendTransform(transforms)
 
     def _publish_assignments(self, snapshot: dict[str, Any]) -> None:
-        groups_for_member = {
-            member: (group_id, group)
-            for group_id, group in snapshot["sync_groups"].items()
-            for member in group["members"]
-        }
+        groups_for_member: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+        for group_id, group in sorted(snapshot["sync_groups"].items()):
+            for member in group["members"]:
+                groups_for_member.setdefault(member, []).append((group_id, group))
         by_provider: dict[str, list[ProviderAssignment]] = {
             provider: [] for provider in self.assignment_publishers
         }
@@ -924,21 +947,50 @@ class InventoryManager(Node):
             assignment.calibration_url = sensor.get("calibration_url", "")
             assignment.network_id = sensor.get("network_id", "")
             assignment.assigned_address = sensor.get("assigned_address", "")
-            group_id, group = groups_for_member.get(sensor_id, ("", {}))
-            assignment.sync_group = group_id
-            assignment.group_missing_policy = group.get("missing_policy", "")
-            assignment.group_trigger_source = "Action0" if group_id else ""
+            member_groups = groups_for_member.get(sensor_id, [])
+            group_ids = [group_id for group_id, _ in member_groups]
+            assignment.capture_group_ids = group_ids
+            assignment.capture_group_missing_policies = [
+                group.get("missing_policy", "strict") for _, group in member_groups
+            ]
+            assignment.sync_group = group_ids[0] if group_ids else ""
+            assignment.group_missing_policy = (
+                "strict" if any(
+                    group.get("missing_policy", "strict") == "strict"
+                    for _, group in member_groups
+                ) else "degraded" if member_groups else ""
+            )
+            assignment.group_trigger_source = "Action0" if member_groups else ""
             assignment.preferred_master_id = ""
+            modes = [
+                self.group_modes.get(group_id, self.default_group_mode)
+                for group_id in group_ids
+            ]
             assignment.operating_mode = (
-                self.group_modes.get(group_id, self.default_group_mode) if group_id
-                else self.sensor_modes.get(sensor_id, self.default_sensor_mode)
+                "capture" if "capture" in modes else
+                "preview" if "preview" in modes else
+                "idle" if member_groups else
+                self.sensor_modes.get(sensor_id, self.default_sensor_mode)
             )
-            assignment.preview_rate_hz = float(
-                group.get("preview_rate_hz", self.registry.machine["defaults"]["preview_rate_hz"])
+            assignment.preview_rate_hz = max(
+                (
+                    float(group.get(
+                        "preview_rate_hz",
+                        self.registry.machine["defaults"]["preview_rate_hz"],
+                    ))
+                    for _, group in member_groups
+                ),
+                default=float(self.registry.machine["defaults"]["preview_rate_hz"]),
             )
+            capture_intervals = [
+                int(self.group_capture_intervals.get(group_id, 0))
+                for group_id in group_ids
+                if self.group_modes.get(group_id, self.default_group_mode) == "capture"
+                and int(self.group_capture_intervals.get(group_id, 0)) > 0
+            ]
             assignment.requested_capture_interval_ms = (
-                self.group_capture_intervals.get(group_id, 0)
-                if group_id and assignment.operating_mode == "capture" else 0
+                min(capture_intervals)
+                if assignment.operating_mode == "capture" and capture_intervals else 0
             )
             known = snapshot["known_sensors"].get(sensor_id, {})
             provider_config = self.registry.machine["providers"].get(runtime_provider, {})
@@ -959,7 +1011,7 @@ class InventoryManager(Node):
                 dict(known.get("provider_settings", {})),
             )
             effective_settings["camera_profile"] = str(known.get("camera_profile", ""))
-            if group_id:
+            if runtime_provider == "genicam" and sensor.get("kind") == "camera":
                 effective_settings["trigger_source"] = "Action0"
             assignment.provider_settings_json = json.dumps(
                 effective_settings,
@@ -974,17 +1026,26 @@ class InventoryManager(Node):
             publisher.publish(message)
 
     def _group_for_sensor(self, sensor_id: str) -> str:
-        for group_id, group in self.registry.inventory["sync_groups"].items():
-            if sensor_id in group["members"]:
-                return group_id
-        return ""
+        groups = self._groups_for_sensor(sensor_id)
+        return groups[0] if groups else ""
+
+    def _groups_for_sensor(self, sensor_id: str) -> list[str]:
+        return sorted(
+            group_id
+            for group_id, group in self.registry.inventory["sync_groups"].items()
+            if sensor_id in group["members"]
+        )
 
     def _mode_for_sensor(self, sensor_id: str) -> str:
-        group_id = self._group_for_sensor(sensor_id)
-        return (
-            self.group_modes.get(group_id, self.default_group_mode) if group_id
-            else self.sensor_modes.get(sensor_id, self.default_sensor_mode)
-        )
+        groups = self._groups_for_sensor(sensor_id)
+        if not groups:
+            return self.sensor_modes.get(sensor_id, self.default_sensor_mode)
+        modes = [self.group_modes.get(group_id, self.default_group_mode) for group_id in groups]
+        if "capture" in modes:
+            return "capture"
+        if "preview" in modes:
+            return "preview"
+        return "idle"
 
     def _reconcile_automation(self) -> None:
         now = time.monotonic()
@@ -1401,8 +1462,8 @@ class InventoryManager(Node):
             elif request.target_kind == "sensor":
                 if request.target_id not in self.registry.inventory["sensors"]:
                     raise RegistryError(f"unknown sensor {request.target_id}")
-                if self._group_for_sensor(request.target_id):
-                    raise RegistryError("set the mode on the sensor's synchronization group")
+                if self._groups_for_sensor(request.target_id):
+                    raise RegistryError("set the mode on one of the sensor's capture groups")
                 if request.mode == "capture":
                     raise RegistryError("capture mode requires a synchronization group")
                 self.sensor_modes[request.target_id] = request.mode
