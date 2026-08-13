@@ -32,6 +32,15 @@ Providers apply supported settings when opening a session and report the
 effective document in `Sensor.applied_settings_json`. Invalid requested settings
 must fail visibly instead of being silently accepted.
 
+`ProviderAssignment.capture_group_ids` lists every logical capture selection
+containing the sensor. `sync_group` remains the deterministic first selection
+for compatibility with older providers; `capture_group_missing_policies` is the
+parallel policy list. A provider must not use a logical selection name as
+exclusive hardware membership: capable cameras share one PTP clock domain, and
+each requested capture supplies the member list and one target time. The generic
+provider addresses scheduled actions per sensor so selections may overlap
+safely.
+
 Providers must accept arbitrary assignment counts, remove endpoints for removed
 assignments, and avoid changing the persistent inventory themselves.
 Enrollment-time network provisioning should be reversible by default. The

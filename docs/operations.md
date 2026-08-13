@@ -36,17 +36,20 @@ curl --max-time 5 -o camera.jpg \
   http://127.0.0.1:8080/api/v1/sensors/acme_cam_test0001/snapshot
 ```
 
-## Modes and groups
+## Modes and capture selections
 
 Sensors use `idle`, `preview`, or `capture` modes. Preview publishes compressed
 frames for the dashboard at the configured rate while retaining full-resolution
-ROS image topics. Capture belongs to a named sync group.
+ROS image topics. Capture targets a named camera selection. The existing ROS
+and HTTP APIs retain the `group` and `SyncGroup` names for compatibility.
 
-A `strict` group requires every member. A `degraded` group captures ready
-members when another member is unavailable. Group membership automatically
-selects `Action0`: cameras with PTP scheduled-action support synchronize to the
-PC grandmaster, while unsupported cameras remain in the capture using the
-software barrier and are reported as unsynchronized.
+A camera may belong to multiple selections, such as `front`, `back`, and `all`.
+A `strict` selection requires every member. A `degraded` selection captures
+ready members when another member is unavailable. Enrolled GenICam cameras use
+`Action0` so capable cameras remain synchronized to the PC grandmaster even
+while unselected or idle. Selecting cameras does not make them fire; the capture
+operation supplies the target time and only its selected cameras receive an
+action.
 Capability detection follows GenICam/SFNC features rather than camera brand. It
 accepts current `Ptp*` nodes and legacy `GevIEEE1588*` timestamp aliases used by
 some vendors. Capture requests for a capable camera that is still acquiring
@@ -59,10 +62,35 @@ exposure skew. Some cameras expose the optional offset node only after reaching
 `Slave`; Vixel re-probes the node after lock so a hotplug does not require a mode
 change or session restart.
 
-Grouped cameras keep PTP enabled in every active mode. Preview mode uses a
+Enrolled GenICam cameras on approved networks keep PTP enabled, including while
+they are unselected or every containing selection is idle. Preview mode uses a
 software trigger so the dashboard can fetch independent frames; changing the
-group to capture mode rebuilds the session with `Action0` armed for synchronized
-group requests.
+selection to capture mode rebuilds the session with `Action0` armed for scheduled
+requests.
+
+For example, these selections may coexist:
+
+```text
+front = front_left, front_right
+back  = back_left, back_right
+all   = front_left, front_right, back_left, back_right
+```
+
+Create or replace `all` through the HTTP API:
+
+```bash
+curl -X PUT -H 'Content-Type: application/json' \
+  -d '{"member_ids":["front_left","front_right","back_left","back_right"],"missing_policy":"strict"}' \
+  http://127.0.0.1:8080/api/v1/groups/all
+```
+
+Disjoint selections can run independently, for example periodic `front` and
+machine-position-triggered `back`. Selections with shared cameras and the same
+requested timestamp are deduplicated into one physical exposure and fanned out
+to each logical capture. Different timestamps are accepted when they satisfy
+the camera's negotiated minimum interval; a request that is too close is
+rejected rather than silently shifted. Disjoint selections given the same
+requested timestamp also use the same camera-clock action time.
 
 Results include per-camera timing records, `exposure_skew_ns` for synchronized
 members, and `within_tolerance`. `trigger_span_ns` remains command-dispatch
@@ -105,8 +133,10 @@ ros2 action send_goal /vixel/record_capture \
 ```
 
 An empty request ID generates one. A supplied ID may contain letters, numbers,
-`.`, `_`, and `-`. Recordings for disjoint groups and successive recordings on
-the same cameras may overlap. Acquisition, PNG encoding, chunk transport, and
+`.`, `_`, and `-`. Recordings for disjoint selections may overlap. Captures
+selecting the same cameras share an exposure at an identical target or are
+accepted only when their distinct targets meet the negotiated interval.
+Acquisition, PNG encoding, chunk transport, and
 disk persistence are separate pipeline stages bounded by configured limits.
 
 The example clients expose both operations with the same mode names:

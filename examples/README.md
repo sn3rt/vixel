@@ -64,11 +64,10 @@ python3 examples/http_trigger_groups_periodic.py front back --interval 2
 ```
 
 Use `--count 10` for a finite run; the default continues until Ctrl-C. Each
-group gets one PTP scheduled action, so cameras within `front` are synchronized
-and cameras within `back` are synchronized. The two API requests currently
-choose their future timestamps independently: all four cameras fire roughly
-together, but cross-group synchronization is not guaranteed. The script prints
-the scheduled-time difference between groups on every cycle. This example is
+disjoint selection receives the same requested timestamp and the provider
+converts it to one shared PTP action time, so synchronization also spans `front`
+and `back`. The script prints the scheduled-time difference between selections
+on every cycle. This example is
 publish-only unless `--mode save` is supplied. To persist separate front and
 back capture directories on every cycle:
 

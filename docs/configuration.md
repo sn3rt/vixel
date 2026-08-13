@@ -1,7 +1,7 @@
 # Configuration and GenICam features
 
 Static host and provider settings live in `/etc/vixel/machine.yaml`. Dynamic
-sensor identity, enrollment, location, groups, notes, and camera settings live
+sensor identity, enrollment, location, capture selections, notes, and camera settings live
 in `/var/lib/vixel/inventory.yaml` and should normally be changed through the
 dashboard or ROS interfaces.
 
@@ -83,8 +83,8 @@ exceeded.
 Reusable administrator-managed profiles are loaded from
 `/etc/vixel/camera-profiles/*.yaml` by default. A camera selects a profile in
 **Known sensor details** and may add per-camera JSON overrides. Resolution is
-machine defaults, then profile settings, then per-camera overrides; grouped
-capture finally enforces `Action0` and PTP.
+machine defaults, then profile settings, then per-camera overrides; the GenICam
+runtime finally enforces `Action0` and PTP.
 
 Portable constrained-auto and fixed manual examples are installed under
 `share/vixel/config/camera-profiles/`. Copy the profiles you approve into the

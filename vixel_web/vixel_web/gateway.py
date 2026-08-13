@@ -173,6 +173,7 @@ def sensor_to_dict(sensor) -> dict[str, Any]:
         "current_address": sensor.current_address,
         "interface_name": sensor.interface_name,
         "sync_group": sensor.sync_group,
+        "capture_group_ids": list(getattr(sensor, "capture_group_ids", [])),
         "operating_mode": sensor.operating_mode,
         "capabilities": list(sensor.capabilities),
         "last_error": sensor.last_error,
