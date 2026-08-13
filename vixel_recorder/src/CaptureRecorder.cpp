@@ -1,3 +1,4 @@
+#include "vixel_recorder/ManagedWorkers.hpp"
 #include "vixel_recorder/RecorderConfig.hpp"
 #include "vixel_recorder/OperationHistory.hpp"
 #include "vixel_recorder/SequenceTiming.hpp"
@@ -32,6 +33,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <iomanip>
 #include <iterator>
@@ -347,7 +349,83 @@ public:
       static_cast<double>(config_.minimum_free_bytes) / (1024.0 * 1024.0 * 1024.0));
   }
 
+  ~CaptureRecorder() override
+  {
+    shutting_down_.store(true, std::memory_order_release);
+    workers_.request_stop();
+    action_server_.reset();
+    submit_batch_service_.reset();
+    start_sequence_service_.reset();
+    get_operation_service_.reset();
+    cancel_operation_service_.reset();
+    {
+      std::lock_guard<std::mutex> lock(operations_mutex_);
+      for (auto & item : operations_) {
+        if (terminal_operation_status(item.second->value.status)) {continue;}
+        item.second->stop_scheduling = true;
+        item.second->cancelled_by_user = true;
+        item.second->value.message = "recorder is shutting down";
+      }
+    }
+    state_changed_.notify_all();
+    capture_frames_->changed.notify_all();
+    cancel_operation_goals();
+    workers_.stop_and_join();
+  }
+
 private:
+  bool shutdown_requested() const
+  {
+    return shutting_down_.load(std::memory_order_acquire);
+  }
+
+  bool start_worker(std::function<void()> task)
+  {
+    workers_.reap();
+    return workers_.start([this, task = std::move(task)]() mutable {
+        try {
+          task();
+        } catch (const std::exception & error) {
+          RCLCPP_ERROR(get_logger(), "Recorder worker failed: %s", error.what());
+        } catch (...) {
+          RCLCPP_ERROR(get_logger(), "Recorder worker failed with an unknown exception");
+        }
+      });
+  }
+
+  void remember_operation_goal(const ClientGoalHandle::SharedPtr & handle)
+  {
+    if (!handle) {return;}
+    std::lock_guard<std::mutex> lock(operation_goals_mutex_);
+    operation_goals_.erase(
+      std::remove_if(
+        operation_goals_.begin(), operation_goals_.end(),
+        [](const auto & weak) {return weak.expired();}),
+      operation_goals_.end());
+    operation_goals_.push_back(handle);
+  }
+
+  void cancel_operation_goals()
+  {
+    std::vector<ClientGoalHandle::SharedPtr> handles;
+    {
+      std::lock_guard<std::mutex> lock(operation_goals_mutex_);
+      for (const auto & weak : operation_goals_) {
+        if (const auto handle = weak.lock()) {handles.push_back(handle);}
+      }
+      operation_goals_.clear();
+    }
+    if (!operation_capture_client_) {return;}
+    for (const auto & handle : handles) {
+      try {
+        operation_capture_client_->async_cancel_goal(handle);
+      } catch (const std::exception &) {
+        // The ROS context may already be shutting down. Worker stop checks are
+        // the authoritative local cancellation path.
+      }
+    }
+  }
+
   nlohmann::json gps_for_capture(const builtin_interfaces::msg::Time & capture_time)
   {
     sensor_msgs::msg::NavSatFix::ConstSharedPtr fix;
@@ -575,7 +653,13 @@ private:
     response->message = "batch accepted for asynchronous capture";
     response->operation_id = operation->value.operation_id;
     if (request->synchronize_groups) {response->scheduled_time = first_message;}
-    std::thread([this, operation, first]() {schedule_operation(operation, first, 1);}).detach();
+    if (!start_worker(
+        [this, operation, first]() {schedule_operation(operation, first, 1);}))
+    {
+      fail_sequence_preparation(operation, "recorder is shutting down");
+      response->accepted = false;
+      response->message = "recorder is shutting down";
+    }
   }
 
   void start_capture_sequence(
@@ -621,10 +705,15 @@ private:
     response->accepted = true;
     response->message = "sequence accepted; preparing capture cadence";
     response->operation_id = operation->value.operation_id;
-    std::thread(
-      [this, operation, count = request->count]() {
-        prepare_and_schedule_sequence(operation, count);
-      }).detach();
+    if (!start_worker(
+        [this, operation, count = request->count]() {
+          prepare_and_schedule_sequence(operation, count);
+        }))
+    {
+      fail_sequence_preparation(operation, "recorder is shutting down");
+      response->accepted = false;
+      response->message = "recorder is shutting down";
+    }
   }
 
   void fail_sequence_preparation(
@@ -655,8 +744,15 @@ private:
     request->group_ids = operation->value.group_ids;
     request->interval_ms = operation->value.interval_ms;
     auto future = prepare_capture_groups_client_->async_send_request(request);
-    if (future.wait_for(5s) != std::future_status::ready) {
-      fail_sequence_preparation(operation, "timed out requesting capture group preparation");
+    const auto response_deadline = std::chrono::steady_clock::now() + 5s;
+    while (future.wait_for(100ms) != std::future_status::ready &&
+      !shutdown_requested() && std::chrono::steady_clock::now() < response_deadline)
+    {
+    }
+    if (future.wait_for(0ms) != std::future_status::ready) {
+      fail_sequence_preparation(
+        operation, shutdown_requested() ? "recorder is shutting down" :
+        "timed out requesting capture group preparation");
       return;
     }
     const auto response = future.get();
@@ -667,7 +763,9 @@ private:
 
     const auto deadline = std::chrono::steady_clock::now() + config_.sequence_prepare_timeout;
     std::string last_status{"waiting for capture group status"};
-    while (rclcpp::ok() && std::chrono::steady_clock::now() < deadline) {
+    while (rclcpp::ok() && !shutdown_requested() &&
+      std::chrono::steady_clock::now() < deadline)
+    {
       bool stopped = false;
       bool cancelled = false;
       std::string stopped_message;
@@ -829,10 +927,12 @@ private:
       sequence_dispatch_lead(config_.sequence_dispatch_lead, interval, action_queue_size) :
       config_.sequence_dispatch_lead;
     std::uint32_t cycle = 1;
-    while (rclcpp::ok() && (count == 0 || cycle <= count)) {
+    while (rclcpp::ok() && !shutdown_requested() && (count == 0 || cycle <= count)) {
       const auto target = first_time + interval * (cycle - 1);
       const auto dispatch = target - dispatch_lead;
-      while (rclcpp::ok() && std::chrono::system_clock::now() < dispatch) {
+      while (rclcpp::ok() && !shutdown_requested() &&
+        std::chrono::system_clock::now() < dispatch)
+      {
         {
           std::lock_guard<std::mutex> lock(operations_mutex_);
           if (operation->stop_scheduling) {break;}
@@ -940,6 +1040,14 @@ private:
         [this, operation, cycle](const ClientGoalHandle::SharedPtr & handle) {
           if (!handle) {
             capture_finished(operation, cycle, false, "capture action rejected");
+          } else {
+            remember_operation_goal(handle);
+            if (shutdown_requested()) {
+              try {
+                operation_capture_client_->async_cancel_goal(handle);
+              } catch (const std::exception &) {
+              }
+            }
           }
         };
       options.result_callback =
@@ -1028,7 +1136,7 @@ private:
 
   void publish_operations()
   {
-    if (!operations_publisher_) {return;}
+    if (shutdown_requested() || !operations_publisher_) {return;}
     vixel_interfaces::msg::CaptureOperationArray message;
     message.header.stamp = now();
     {
@@ -1044,6 +1152,7 @@ private:
   rclcpp_action::GoalResponse handle_goal(
     const rclcpp_action::GoalUUID &, std::shared_ptr<const RecordCapture::Goal> goal)
   {
+    if (shutdown_requested()) {return rclcpp_action::GoalResponse::REJECT;}
     if (goal->group_id.empty()) {return rclcpp_action::GoalResponse::REJECT;}
     if (!goal->request_id.empty() && !safe_identifier(goal->request_id)) {
       return rclcpp_action::GoalResponse::REJECT;
@@ -1108,7 +1217,9 @@ private:
 
   void handle_accepted(const std::shared_ptr<GoalHandle> handle)
   {
-    std::thread([this, handle]() {execute(handle);}).detach();
+    if (!start_worker([this, handle]() {execute(handle);})) {
+      execute(handle);
+    }
   }
 
   void feedback(
@@ -1117,6 +1228,7 @@ private:
     const std::vector<std::string> & received = {},
     const std::vector<std::string> & pending = {})
   {
+    if (shutdown_requested()) {return;}
     auto value = std::make_shared<RecordCapture::Feedback>();
     value->stage = stage;
     value->detail = detail;
@@ -1223,6 +1335,7 @@ private:
     record.started_at = utc_now();
     std::filesystem::path staging;
     try {
+      if (shutdown_requested()) {throw std::runtime_error("recorder is shutting down");}
       vixel_interfaces::msg::SyncGroup group;
       std::map<std::string, vixel_interfaces::msg::Sensor> sensor_snapshot;
       {
@@ -1256,7 +1369,10 @@ private:
       auto subscriptions = subscribe(group.member_ids);
       const auto match_deadline = std::chrono::steady_clock::now() + 2s;
       while (std::chrono::steady_clock::now() < match_deadline) {
-        if (handle->is_canceling()) {throw std::runtime_error("capture cancelled");}
+        if (handle->is_canceling() || shutdown_requested()) {
+          throw std::runtime_error(
+                  shutdown_requested() ? "recorder is shutting down" : "capture cancelled");
+        }
         const bool matched = std::all_of(
           subscriptions.image_subscriptions.begin(), subscriptions.image_subscriptions.end(),
           [](const auto & subscription) {
@@ -1284,7 +1400,16 @@ private:
       request->has_requested_time = handle->get_goal()->has_requested_time;
       request->requested_time = handle->get_goal()->requested_time;
       auto response_future = capture_client_->async_send_request(request);
-      if (response_future.wait_for(config_.capture_timeout + 5s) != std::future_status::ready) {
+      const auto response_deadline = std::chrono::steady_clock::now() +
+        config_.capture_timeout + 5s;
+      while (response_future.wait_for(100ms) != std::future_status::ready &&
+        !handle->is_canceling() && !shutdown_requested() &&
+        std::chrono::steady_clock::now() < response_deadline)
+      {
+      }
+      if (response_future.wait_for(0ms) != std::future_status::ready) {
+        if (shutdown_requested()) {throw std::runtime_error("recorder is shutting down");}
+        if (handle->is_canceling()) {throw std::runtime_error("capture cancelled");}
         throw std::runtime_error("capture group service timed out");
       }
       const auto response = response_future.get();
@@ -1315,7 +1440,7 @@ private:
       std::map<std::string, sensor_msgs::msg::CameraInfo::ConstSharedPtr> captured_info;
       std::size_t reported_count = 0;
       const auto deadline = std::chrono::steady_clock::now() + config_.capture_timeout;
-      while (std::chrono::steady_clock::now() < deadline) {
+      while (!shutdown_requested() && std::chrono::steady_clock::now() < deadline) {
         {
           std::unique_lock<std::mutex> lock(subscriptions.frames->mutex);
           subscriptions.frames->changed.wait_for(lock, 100ms);
@@ -1346,6 +1471,7 @@ private:
         }
         if (handle->is_canceling()) {throw std::runtime_error("capture cancelled");}
       }
+      if (shutdown_requested()) {throw std::runtime_error("recorder is shutting down");}
       if (captured.size() != record.participating_sensor_ids.size()) {
         for (const auto & sensor_id : record.participating_sensor_ids) {
           if (captured.count(sensor_id) == 0 &&
@@ -1443,8 +1569,10 @@ private:
       result->directory = record.directory;
       result->saved_sensor_ids = record.saved_sensor_ids;
       result->missing_sensor_ids = record.missing_sensor_ids;
-      feedback(handle, "complete", "Capture set saved", 100, record.saved_sensor_ids, {});
-      handle->succeed(result);
+      if (!shutdown_requested()) {
+        feedback(handle, "complete", "Capture set saved", 100, record.saved_sensor_ids, {});
+        handle->succeed(result);
+      }
       return;
     } catch (const std::exception & error) {
       if (!record.capture_id.empty()) {
@@ -1454,7 +1582,8 @@ private:
           capture_frames_->assemblies[sensor_id].erase(record.capture_id);
         }
       }
-      record.status = handle->is_canceling() ? "cancelled" : "failed";
+      const bool interrupted = handle->is_canceling() || shutdown_requested();
+      record.status = interrupted ? "cancelled" : "failed";
       record.completed_at = utc_now();
       record.message = error.what();
       preserve_failure(staging, record);
@@ -1465,6 +1594,9 @@ private:
       result->directory = record.directory;
       result->saved_sensor_ids = record.saved_sensor_ids;
       result->missing_sensor_ids = record.missing_sensor_ids;
+      if (shutdown_requested()) {
+        return;
+      }
       if (handle->is_canceling()) {
         handle->canceled(result);
       } else {
@@ -1566,7 +1698,7 @@ private:
 
   void publish_records()
   {
-    if (!records_publisher_) {return;}
+    if (shutdown_requested() || !records_publisher_) {return;}
     vixel_interfaces::msg::CaptureRecordArray message;
     message.header.stamp = now();
     {
@@ -1642,6 +1774,8 @@ private:
   }
 
   RecorderConfig config_;
+  std::atomic_bool shutting_down_{false};
+  ManagedWorkers workers_;
   std::atomic<std::uint64_t> capture_sequence_{0};
   std::atomic<std::uint64_t> operation_sequence_{0};
   std::mutex active_captures_mutex_;
@@ -1676,6 +1810,8 @@ private:
   rclcpp::Publisher<vixel_interfaces::msg::CaptureRecordArray>::SharedPtr records_publisher_;
   rclcpp_action::Server<RecordCapture>::SharedPtr action_server_;
   rclcpp_action::Client<RecordCapture>::SharedPtr operation_capture_client_;
+  std::mutex operation_goals_mutex_;
+  std::vector<std::weak_ptr<ClientGoalHandle>> operation_goals_;
   std::mutex operations_mutex_;
   std::map<std::string, std::shared_ptr<OperationState>> operations_;
   std::deque<std::string> terminal_operation_ids_;
