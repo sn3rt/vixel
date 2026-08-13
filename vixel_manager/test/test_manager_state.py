@@ -53,6 +53,26 @@ def test_runtime_sensor_from_previous_mode_is_not_ready():
     assert not _runtime_sensor_is_ready(None, "capture")
 
 
+def test_unapproved_network_is_visible_but_not_managed():
+    manager = InventoryManager.__new__(InventoryManager)
+    manager.registry = SimpleNamespace(machine={
+        "managed_networks": {
+            "spare": {
+                "interface": "enp8s0",
+                "host_cidr": "192.168.8.1/24",
+                "approved": False,
+            }
+        }
+    })
+    observation = {
+        "interface_name": "enp8s0",
+        "current_address": "192.168.8.20",
+    }
+
+    assert manager._configured_network_for_observation(observation) == "spare"
+    assert manager._network_for_observation(observation) == ""
+
+
 def test_group_capture_proxy_awaits_provider_without_blocking_executor_thread():
     provider_response = SimpleNamespace(success=True)
     captured = {}

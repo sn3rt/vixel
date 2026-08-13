@@ -13,6 +13,7 @@ struct NetworkConfig
   std::string id;
   std::string interface;
   std::string host_cidr;
+  bool approved{false};
   std::string gateway{"0.0.0.0"};
   std::int64_t packet_size{9000};
   std::int64_t packet_delay{100000};

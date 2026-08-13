@@ -15,6 +15,23 @@ T read_or(const YAML::Node & node, const char * key, T fallback)
 {
   return node && node[key] ? node[key].as<T>() : fallback;
 }
+
+bool required_boolean(
+  const YAML::Node & node, const char * key, const std::string & context)
+{
+  const auto value = node[key];
+  // yaml-cpp marks quoted scalars with the non-specific "!" tag. Reject those
+  // before conversion so values such as approved: "false" cannot become truthy
+  // in another configuration consumer.
+  if (!value || !value.IsScalar() || value.Tag() == "!") {
+    throw std::runtime_error(context + "." + key + " must be an explicit boolean");
+  }
+  try {
+    return value.as<bool>();
+  } catch (const YAML::Exception &) {
+    throw std::runtime_error(context + "." + key + " must be an explicit boolean");
+  }
+}
 }  // namespace
 
 GenicamConfig load_genicam_config(const std::string & path)
@@ -45,6 +62,8 @@ GenicamConfig load_genicam_config(const std::string & path)
     const auto value = item.second;
     network.interface = value["interface"].as<std::string>();
     network.host_cidr = value["host_cidr"].as<std::string>();
+    network.approved = required_boolean(
+      value, "approved", "managed_networks." + network.id);
     network.gateway = read_or(value, "gateway", network.gateway);
     network.packet_size = read_or(value, "packet_size", network.packet_size);
     network.packet_delay = read_or(value, "packet_delay", network.packet_delay);

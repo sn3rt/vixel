@@ -79,12 +79,22 @@ def load_networks(path: str) -> list[ManagedNetwork]:
     seen_subnets: list[ipaddress.IPv4Network] = []
     for network_id, value in raw_networks.items():
         try:
+            if "approved" not in value or type(value["approved"]) is not bool:
+                raise NetworkSetupError(
+                    f"managed network {network_id} approved must be an explicit boolean"
+                )
+            if "auto_enroll" in value and type(value["auto_enroll"]) is not bool:
+                raise NetworkSetupError(
+                    f"managed network {network_id} auto_enroll must be a boolean"
+                )
             interface = str(value["interface"])
             interface_mac = str(value.get("interface_mac", "")).lower()
             host = ipaddress.ip_interface(str(value["host_cidr"]))
             mtu = int(value.get("mtu", 9000))
             rp_filter = int(value.get("rp_filter", 0))
             rx_ring_size = int(value.get("rx_ring_size", 4096))
+        except NetworkSetupError:
+            raise
         except (KeyError, TypeError, ValueError) as error:
             raise NetworkSetupError(f"invalid managed network {network_id}") from error
         if not isinstance(host, ipaddress.IPv4Interface):

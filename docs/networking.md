@@ -15,12 +15,31 @@ network settings to the wrong NIC.
 - Root privileges are needed for host network and PTP clock services, not
   normal ROS nodes.
 
+`approved` is required for every configured entry and must be the YAML boolean
+`true` or `false`; quoted strings such as `"false"` are rejected. Start a new
+or changed link with `approved: false`. Cameras on that configured link remain
+visible for inventory and diagnostics, but Vixel does not treat them as
+managed, assign addresses, enroll them, or open capture sessions. Set
+`auto_enroll: true` only as a separate, deliberate choice after approving the
+link.
+
 Always inspect the commands first:
 
 ```bash
 ros2 run vixel_network vixel-network-setup -- \
   --machine-file /etc/vixel/machine.yaml apply --dry-run
 ```
+
+For a new or changed link, use this order:
+
+1. Keep `approved: false`, set the expected interface MAC and subnet, and run
+   both `vixel -- config validate` and the network setup dry run.
+2. Confirm the interface, MAC, subnet, address pool, mode, and printed host
+   commands against the physical port.
+3. Change `approved` to `true`; enable `auto_enroll` only if unattended
+   enrollment is intended.
+4. Validate again, apply the host network configuration, and restart the Vixel
+   stack. Static configuration is not hot-reloaded consistently across nodes.
 
 Apply them using the installed executable's absolute path so `sudo` does not
 depend on a development shell's `PATH`:
@@ -75,5 +94,6 @@ The command creates, enables, and immediately starts
 `vixel-network-setup.service` and `vixel-ptp.service`. Systemd starts them on
 every later boot, so no manual PTP start is required.
 
-Re-run `apply` after tuning or interface changes. The example configuration is
-documentation only; never apply it without replacing its synthetic values.
+Re-run validation, `apply`, and the Vixel stack restart after tuning or
+interface changes. The example configuration is documentation only; never
+apply it without replacing its synthetic values.

@@ -12,6 +12,7 @@ TEST(GenicamConfig, LoadsProviderAndNetworks)
   link:
     interface: enp1s0
     host_cidr: 192.168.2.1/24
+    approved: true
     packet_size: 8192
 providers:
   genicam:
@@ -29,6 +30,7 @@ defaults:
 )";
   const auto config = vixel_genicam::load_genicam_config(path.string());
   EXPECT_EQ(config.networks.at("link").interface, "enp1s0");
+  EXPECT_TRUE(config.networks.at("link").approved);
   EXPECT_EQ(config.networks.at("link").packet_size, 8192);
   EXPECT_EQ(config.networks.at("link").packet_delay, 100000);
   EXPECT_EQ(config.buffer_count, 20);
@@ -73,5 +75,28 @@ providers: {}
 )";
 
   EXPECT_THROW(vixel_genicam::load_genicam_config(path.string()), std::runtime_error);
+  std::filesystem::remove(path);
+}
+
+TEST(GenicamConfig, RequiresExplicitBooleanNetworkApproval)
+{
+  const auto path = std::filesystem::temp_directory_path() /
+    "vixel-genicam-approval-config.yaml";
+  const auto write_config = [&path](const std::string & approval) {
+      std::ofstream(path) << "managed_networks:\n"
+        "  link:\n"
+        "    interface: enp1s0\n"
+        "    host_cidr: 192.168.2.1/24\n" + approval +
+        "providers:\n"
+        "  genicam: {}\n";
+    };
+
+  write_config("");
+  EXPECT_THROW(vixel_genicam::load_genicam_config(path.string()), std::runtime_error);
+  write_config("    approved: \"false\"\n");
+  EXPECT_THROW(vixel_genicam::load_genicam_config(path.string()), std::runtime_error);
+  write_config("    approved: false\n");
+  const auto config = vixel_genicam::load_genicam_config(path.string());
+  EXPECT_FALSE(config.networks.at("link").approved);
   std::filesystem::remove(path);
 }

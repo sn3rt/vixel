@@ -2815,7 +2815,14 @@ private:
     std::lock_guard<std::mutex> lock(mutex_);
     std::map<std::string, Assignment> updated;
     for (const auto & assignment : message->assignments) {
-      updated[assignment.sensor_id] = assignment;
+      const auto network = config_.networks.find(assignment.network_id);
+      if (network != config_.networks.end() && network->second.approved) {
+        updated[assignment.sensor_id] = assignment;
+      } else {
+        RCLCPP_WARN(
+          get_logger(), "Ignoring assignment for %s on unapproved network %s",
+          assignment.sensor_id.c_str(), assignment.network_id.c_str());
+      }
     }
     assignments_ = std::move(updated);
     reconcile_sessions();
@@ -2826,6 +2833,8 @@ private:
     for (auto iterator = sessions_.begin(); iterator != sessions_.end();) {
       const auto assignment = assignments_.find(iterator->first);
       const bool keep = assignment != assignments_.end() && assignment->second.enabled &&
+        config_.networks.count(assignment->second.network_id) != 0 &&
+        config_.networks.at(assignment->second.network_id).approved &&
         assignment->second.operating_mode != "idle" &&
         assignment->second.operating_mode == iterator->second->assignment().operating_mode &&
         assignment->second.provider_settings_json ==
@@ -2849,7 +2858,7 @@ private:
       }
       const auto record = records_.find(assignment.serial);
       const auto network = config_.networks.find(assignment.network_id);
-      if (network == config_.networks.end()) {continue;}
+      if (network == config_.networks.end() || !network->second.approved) {continue;}
       const bool address_mismatch = record == records_.end() ||
         (!assignment.assigned_address.empty() &&
         record->second.address != assignment.assigned_address) ||
@@ -3207,6 +3216,9 @@ private:
       }
       if (network == config_.networks.end()) {
         throw std::runtime_error("unknown managed network " + request->network_id);
+      }
+      if (!network->second.approved) {
+        throw std::runtime_error("managed network " + request->network_id + " is not approved");
       }
       auto record = record_iterator->second;
       std::lock_guard<std::mutex> aravis_lock(aravis_mutex_);

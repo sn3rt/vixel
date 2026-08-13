@@ -447,7 +447,7 @@ class InventoryManager(Node):
                 checkpoint = (
                     now - self.known_checkpoint_at.get(candidate_id, 0.0) >= 60.0
                 )
-                network_id = self._network_for_observation(observation)
+                network_id = self._configured_network_for_observation(observation)
                 network = self.registry.machine["managed_networks"].get(network_id, {})
                 if self.registry.record_observation(
                     observation,
@@ -541,10 +541,20 @@ class InventoryManager(Node):
         observed = self.observations.get(sensor_id)
         if observed:
             observation = observed[0]
+            configured_network = self._configured_network_for_observation(observation)
             observed_network = self._network_for_observation(observation)
             message.current_address = observation.get("current_address", "")
             message.interface_name = observation.get("interface_name", "")
-            if observed_network and observed_network != message.network_id:
+            if configured_network and not self.registry.machine["managed_networks"][
+                configured_network
+            ]["approved"]:
+                message.online = False
+                message.lifecycle_state = "unapproved"
+                message.pending_action = "external"
+                message.status_detail = (
+                    f"Camera is visible on unapproved network {configured_network}"
+                )
+            elif observed_network and observed_network != message.network_id:
                 message.online = False
                 message.lifecycle_state = "placement_conflict"
                 message.pending_action = "move"
@@ -552,6 +562,13 @@ class InventoryManager(Node):
                     f"Camera is connected through {observed_network}; "
                     f"assigned to {message.network_id}"
                 )
+        if network and not network["approved"]:
+            message.online = False
+            message.lifecycle_state = "unapproved"
+            message.pending_action = "external"
+            message.status_detail = (
+                f"Assigned network {message.network_id} is not approved"
+            )
         return message
 
     def _unknown_message(self, candidate_id: str, observation: dict[str, Any]) -> Sensor:
@@ -575,7 +592,7 @@ class InventoryManager(Node):
         message.interface_name = observation.get("interface_name", "")
         message.capabilities = list(observation.get("capabilities", []))
         message.operating_mode = "idle"
-        network_id = self._network_for_observation(observation)
+        network_id = self._configured_network_for_observation(observation)
         message.network_id = network_id
         network = self.registry.machine["managed_networks"].get(network_id, {})
         message.managed = bool(network.get("approved", False))
@@ -632,7 +649,7 @@ class InventoryManager(Node):
         message.online = bool(observation) or bool(runtime and runtime.online)
         latest = dict(record.get("latest_observation", {}))
         if observation:
-            network_id = self._network_for_observation(observation)
+            network_id = self._configured_network_for_observation(observation)
             network = self.registry.machine["managed_networks"].get(network_id, {})
             latest = {
                 "transport": str(observation.get("transport", "")),
@@ -674,21 +691,26 @@ class InventoryManager(Node):
         message.replaced_by = str(record.get("replaced_by", ""))
         return message
 
-    def _network_for_observation(self, observation: dict[str, Any]) -> str:
+    def _configured_network_for_observation(self, observation: dict[str, Any]) -> str:
         interface = str(observation.get("interface_name", ""))
         for network_id, network in self.registry.machine["managed_networks"].items():
-            if network.get("approved", False) and network["interface"] == interface:
+            if network["interface"] == interface:
                 return network_id
         try:
             address = ipaddress.ip_address(str(observation.get("current_address", "")))
         except ValueError:
             return ""
         for network_id, network in self.registry.machine["managed_networks"].items():
-            if network.get("approved", False) and address in ipaddress.ip_interface(
-                network["host_cidr"]
-            ).network:
+            if address in ipaddress.ip_interface(network["host_cidr"]).network:
                 return network_id
         return ""
+
+    def _network_for_observation(self, observation: dict[str, Any]) -> str:
+        network_id = self._configured_network_for_observation(observation)
+        if not network_id:
+            return ""
+        network = self.registry.machine["managed_networks"][network_id]
+        return network_id if network["approved"] else ""
 
     def _sync_group_message(self, group_id: str, record: dict[str, Any]) -> SyncGroup:
         provider_message = self.provider_groups.get(group_id)
@@ -810,7 +832,7 @@ class InventoryManager(Node):
         )
         message.discovered_candidate_ids = sorted(
             candidate_id for candidate_id, (observation, _) in self.observations.items()
-            if self._network_for_observation(observation) == network_id
+            if self._configured_network_for_observation(observation) == network_id
         )
         if port_status is None:
             message.lifecycle_state = "probing"
@@ -884,6 +906,11 @@ class InventoryManager(Node):
             provider: [] for provider in self.assignment_publishers
         }
         for sensor_id, sensor in snapshot["sensors"].items():
+            network = self.registry.machine["managed_networks"].get(
+                sensor.get("network_id", "")
+            )
+            if not network or not network["approved"]:
+                continue
             assignment = ProviderAssignment()
             assignment.stamp = self.get_clock().now().to_msg()
             assignment.sensor_id = sensor_id

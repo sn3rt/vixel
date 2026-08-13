@@ -1,4 +1,5 @@
 import pathlib
+import threading
 
 import pytest
 import yaml
@@ -29,6 +30,7 @@ MACHINE = {
         "switch": {
             "interface": "enp10s0",
             "interface_mac": "02:00:00:00:00:03",
+            "approved": True,
             "mode": "switched",
             "host_cidr": "192.168.3.1/24",
             "address_pool": {"start": "192.168.3.10", "end": "192.168.3.20"},
@@ -194,6 +196,29 @@ def test_overlapping_managed_networks_are_rejected():
     }
     with pytest.raises(RegistryError, match="overlaps"):
         validate_machine(broken)
+
+
+@pytest.mark.parametrize("approved", [None, "false", 0, 1, [], {}])
+def test_managed_network_approval_must_be_an_explicit_boolean(approved):
+    broken = yaml.safe_load(yaml.safe_dump(MACHINE))
+    if approved is None:
+        broken["managed_networks"]["left"].pop("approved")
+    else:
+        broken["managed_networks"]["left"]["approved"] = approved
+    with pytest.raises(RegistryError, match="approved must be an explicit boolean"):
+        validate_machine(broken)
+
+
+def test_unapproved_network_cannot_allocate_camera_addresses():
+    machine = validate_machine(MACHINE)
+    machine["managed_networks"]["left"]["approved"] = False
+    registry = Registry.__new__(Registry)
+    registry.lock = threading.RLock()
+    registry.machine = machine
+    registry.inventory = {"sensors": {}, "port_modes": {}}
+
+    with pytest.raises(RegistryError, match="is not approved"):
+        registry.allocate("left")
 
 
 def test_legacy_lucid_provider_is_migrated_in_memory():

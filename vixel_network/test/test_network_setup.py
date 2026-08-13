@@ -15,7 +15,9 @@ from vixel_network.network_setup import (
 def write_machine(path: pathlib.Path, networks):
     path.write_text(yaml.safe_dump({
         "schema_version": 1,
-        "managed_networks": networks,
+        "managed_networks": {
+            key: {"approved": True, **value} for key, value in networks.items()
+        },
     }), encoding="utf-8")
 
 
@@ -85,6 +87,24 @@ def test_overlapping_subnet_is_rejected(tmp_path):
         "two": {"interface": "enp10s0", "host_cidr": "192.168.2.2/24"},
     })
     with pytest.raises(NetworkSetupError, match="overlaps"):
+        load_networks(str(machine))
+
+
+@pytest.mark.parametrize("approved", ["false", 0, 1, None])
+def test_approval_must_be_an_explicit_boolean(tmp_path, approved):
+    machine = tmp_path / "machine.yaml"
+    value = {
+        "interface": "enp7s0",
+        "host_cidr": "192.168.2.1/24",
+    }
+    if approved is not None:
+        value["approved"] = approved
+    machine.write_text(yaml.safe_dump({
+        "schema_version": 1,
+        "managed_networks": {"front": value},
+    }), encoding="utf-8")
+
+    with pytest.raises(NetworkSetupError, match="approved must be an explicit boolean"):
         load_networks(str(machine))
 
 

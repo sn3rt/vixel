@@ -242,9 +242,16 @@ def validate_machine(data: dict[str, Any]) -> dict[str, Any]:
             raise RegistryError(f"managed network {network_id} has an empty or duplicate interface")
         if mode not in VALID_NETWORK_MODES:
             raise RegistryError(f"managed network {network_id} mode must be direct or switched")
+        if "approved" not in network or type(network["approved"]) is not bool:
+            raise RegistryError(
+                f"managed network {network_id} approved must be an explicit boolean"
+            )
+        if "auto_enroll" in network and type(network["auto_enroll"]) is not bool:
+            raise RegistryError(
+                f"managed network {network_id} auto_enroll must be a boolean"
+            )
         interfaces.add(interface)
         network.setdefault("interface_mac", interface_mac)
-        network.setdefault("approved", True)
         network.setdefault("auto_enroll", False)
         try:
             host = ipaddress.ip_interface(str(network["host_cidr"]))
@@ -514,6 +521,8 @@ class Registry:
             if network_id not in self.machine["managed_networks"]:
                 raise RegistryError(f"unknown managed network {network_id}")
             network = self.machine["managed_networks"][network_id]
+            if not network["approved"]:
+                raise RegistryError(f"managed network {network_id} is not approved")
             host = ipaddress.ip_interface(network["host_cidr"])
             start = ipaddress.ip_address(network["address_pool"]["start"])
             end = ipaddress.ip_address(network["address_pool"]["end"])
