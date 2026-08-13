@@ -534,55 +534,6 @@ private:
     return value;
   }
 
-  std::optional<std::string> reserve_groups(
-    const std::vector<std::string> & group_ids, const std::string & operation_id)
-  {
-    std::lock_guard<std::mutex> lock(group_reservations_mutex_);
-    for (const auto & group_id : group_ids) {
-      const auto reserved = group_reservations_.find(group_id);
-      if (reserved != group_reservations_.end()) {
-        return "synchronization group " + group_id +
-               " is reserved by operation " + reserved->second;
-      }
-      const auto active = active_group_captures_.find(group_id);
-      if (active != active_group_captures_.end() && active->second != 0) {
-        return "synchronization group " + group_id + " already has an active capture";
-      }
-    }
-    for (const auto & group_id : group_ids) {group_reservations_[group_id] = operation_id;}
-    return std::nullopt;
-  }
-
-  std::optional<std::string> group_reservation_conflict(
-    const std::vector<std::string> & group_ids)
-  {
-    std::lock_guard<std::mutex> lock(group_reservations_mutex_);
-    for (const auto & group_id : group_ids) {
-      const auto reserved = group_reservations_.find(group_id);
-      if (reserved != group_reservations_.end()) {
-        return "synchronization group " + group_id +
-               " is reserved by operation " + reserved->second;
-      }
-      const auto active = active_group_captures_.find(group_id);
-      if (active != active_group_captures_.end() && active->second != 0) {
-        return "synchronization group " + group_id + " already has an active capture";
-      }
-    }
-    return std::nullopt;
-  }
-
-  void release_groups(
-    const std::vector<std::string> & group_ids, const std::string & operation_id)
-  {
-    std::lock_guard<std::mutex> lock(group_reservations_mutex_);
-    for (const auto & group_id : group_ids) {
-      const auto reserved = group_reservations_.find(group_id);
-      if (reserved != group_reservations_.end() && reserved->second == operation_id) {
-        group_reservations_.erase(reserved);
-      }
-    }
-  }
-
   std::shared_ptr<OperationState> create_operation(
     const std::string & kind, const std::vector<std::string> & group_ids,
     const std::string & request_id, std::uint32_t count, std::uint32_t interval_ms,
@@ -633,11 +584,6 @@ private:
       response->message = *error;
       return;
     }
-    if (const auto error = group_reservation_conflict(request->group_ids)) {
-      response->accepted = false;
-      response->message = *error;
-      return;
-    }
     const auto first = std::chrono::system_clock::now() + 750ms;
     const auto first_message = system_time_message(first);
     auto operation = create_operation(
@@ -678,18 +624,11 @@ private:
       response->message = "interval_ms must be between 100 and 86400000";
       return;
     }
-    const auto operation_id = make_operation_id();
-    if (const auto error = reserve_groups(request->group_ids, operation_id)) {
-      response->accepted = false;
-      response->message = *error;
-      return;
-    }
     auto operation = create_operation(
       "sequence", request->group_ids, request->request_id, request->count,
       request->interval_ms, request->synchronize_groups, request->metadata_json,
-      builtin_interfaces::msg::Time{}, operation_id);
+      builtin_interfaces::msg::Time{});
     if (!operation) {
-      release_groups(request->group_ids, operation_id);
       response->accepted = false;
       response->message = "recorder reached the active operation limit";
       return;
@@ -729,7 +668,6 @@ private:
       record_terminal_operation_locked(*operation);
       ++operations_generation_;
     }
-    release_groups(operation->value.group_ids, operation->value.operation_id);
     publish_operations();
   }
 
@@ -915,9 +853,6 @@ private:
         record_terminal_operation_locked(*operation);
         ++operations_generation_;
       }
-      if (operation->value.kind == "sequence") {
-        release_groups(operation->value.group_ids, operation->value.operation_id);
-      }
       publish_operations();
       return;
     }
@@ -960,13 +895,11 @@ private:
       dispatch_cycle(operation, cycle, target);
       ++cycle;
     }
-    bool release_reservation = false;
     {
       std::lock_guard<std::mutex> lock(operations_mutex_);
       operation->scheduling_done = true;
       if (operation->value.pending_saves == 0) {
         finish_operation_locked(*operation);
-        release_reservation = operation->value.kind == "sequence";
       }
       else if (!operation->stop_scheduling) {
         operation->value.status = "draining";
@@ -974,9 +907,6 @@ private:
       }
       operation->value.stamp = now();
       ++operations_generation_;
-    }
-    if (release_reservation) {
-      release_groups(operation->value.group_ids, operation->value.operation_id);
     }
     publish_operations();
   }
@@ -1069,7 +999,6 @@ private:
     const std::shared_ptr<OperationState> & operation, std::uint32_t cycle,
     bool success, const std::string & message)
   {
-    bool release_reservation = false;
     {
       std::lock_guard<std::mutex> lock(operations_mutex_);
       if (operation->value.pending_saves != 0) {--operation->value.pending_saves;}
@@ -1087,13 +1016,9 @@ private:
       }
       if (operation->scheduling_done && operation->value.pending_saves == 0) {
         finish_operation_locked(*operation);
-        release_reservation = operation->value.kind == "sequence";
       }
       operation->value.stamp = now();
       ++operations_generation_;
-    }
-    if (release_reservation) {
-      release_groups(operation->value.group_ids, operation->value.operation_id);
     }
     publish_operations();
   }
@@ -1150,7 +1075,8 @@ private:
   }
 
   rclcpp_action::GoalResponse handle_goal(
-    const rclcpp_action::GoalUUID &, std::shared_ptr<const RecordCapture::Goal> goal)
+    const rclcpp_action::GoalUUID & goal_id,
+    std::shared_ptr<const RecordCapture::Goal> goal)
   {
     if (shutdown_requested()) {return rclcpp_action::GoalResponse::REJECT;}
     if (goal->group_id.empty()) {return rclcpp_action::GoalResponse::REJECT;}
@@ -1169,43 +1095,51 @@ private:
         return rclcpp_action::GoalResponse::REJECT;
       }
     }
+    std::vector<std::string> selected_sensor_ids;
     {
       std::lock_guard<std::mutex> lock(state_mutex_);
       const auto group = groups_.find(goal->group_id);
       if (group == groups_.end() || group->second.member_ids.empty()) {
         return rclcpp_action::GoalResponse::REJECT;
       }
+      selected_sensor_ids = group->second.member_ids;
     }
-    {
-      std::lock_guard<std::mutex> lock(group_reservations_mutex_);
-      const auto reserved = group_reservations_.find(goal->group_id);
-      if (reserved != group_reservations_.end() &&
-        (goal->operation_id.empty() || goal->operation_id != reserved->second))
-      {
-        return rclcpp_action::GoalResponse::REJECT;
+    const bool track_active_sensors = !goal->has_requested_time;
+    if (track_active_sensors) {
+      std::lock_guard<std::mutex> lock(sensor_activity_mutex_);
+      for (const auto & sensor_id : selected_sensor_ids) {
+        const auto active = active_sensor_captures_.find(sensor_id);
+        if (active != active_sensor_captures_.end() && active->second != 0)
+        {
+          return rclcpp_action::GoalResponse::REJECT;
+        }
       }
-      const auto active = active_group_captures_.find(goal->group_id);
-      if (reserved == group_reservations_.end() &&
-        active != active_group_captures_.end() && active->second != 0)
-      {
-        return rclcpp_action::GoalResponse::REJECT;
+      for (const auto & sensor_id : selected_sensor_ids) {
+        ++active_sensor_captures_[sensor_id];
       }
-      ++active_group_captures_[goal->group_id];
     }
     {
       std::lock_guard<std::mutex> lock(active_captures_mutex_);
       if (active_capture_count_ >= config_.max_inflight_captures ||
         (!goal->request_id.empty() && active_capture_ids_.count(goal->request_id) != 0))
       {
-        std::lock_guard<std::mutex> group_lock(group_reservations_mutex_);
-        auto active = active_group_captures_.find(goal->group_id);
-        if (active != active_group_captures_.end() && --active->second == 0) {
-          active_group_captures_.erase(active);
+        if (track_active_sensors) {
+          std::lock_guard<std::mutex> sensor_lock(sensor_activity_mutex_);
+          for (const auto & sensor_id : selected_sensor_ids) {
+            auto active = active_sensor_captures_.find(sensor_id);
+            if (active != active_sensor_captures_.end() && --active->second == 0) {
+              active_sensor_captures_.erase(active);
+            }
+          }
         }
         return rclcpp_action::GoalResponse::REJECT;
       }
       ++active_capture_count_;
       if (!goal->request_id.empty()) {active_capture_ids_.insert(goal->request_id);}
+      if (track_active_sensors) {
+        std::lock_guard<std::mutex> sensor_lock(sensor_activity_mutex_);
+        accepted_goal_sensors_[goal_id] = std::move(selected_sensor_ids);
+      }
     }
     return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
   }
@@ -1289,15 +1223,25 @@ private:
   {
     const auto execution_started = std::chrono::steady_clock::now();
     auto acquisition_finished = execution_started;
+    std::vector<std::string> selected_sensor_ids;
+    if (!handle->get_goal()->has_requested_time) {
+      std::lock_guard<std::mutex> lock(sensor_activity_mutex_);
+      const auto accepted = accepted_goal_sensors_.find(handle->get_goal_id());
+      if (accepted != accepted_goal_sensors_.end()) {
+        selected_sensor_ids = std::move(accepted->second);
+        accepted_goal_sensors_.erase(accepted);
+      }
+    }
     struct ActiveGuard
     {
       std::mutex & mutex;
       std::size_t & count;
       std::set<std::string> & capture_ids;
       std::string capture_id;
-      std::mutex & group_mutex;
-      std::map<std::string, std::size_t> & active_groups;
-      std::string group_id;
+      std::mutex & sensor_mutex;
+      std::map<std::string, std::size_t> & active_sensors;
+      std::vector<std::string> sensor_ids;
+      bool track_sensors;
       bool released{false};
 
       void release()
@@ -1306,11 +1250,13 @@ private:
         if (released) {return;}
         if (count != 0) {--count;}
         if (!capture_id.empty()) {capture_ids.erase(capture_id);}
-        {
-          std::lock_guard<std::mutex> group_lock(group_mutex);
-          auto active = active_groups.find(group_id);
-          if (active != active_groups.end() && --active->second == 0) {
-            active_groups.erase(active);
+        if (track_sensors) {
+          std::lock_guard<std::mutex> sensor_lock(sensor_mutex);
+          for (const auto & sensor_id : sensor_ids) {
+            auto active = active_sensors.find(sensor_id);
+            if (active != active_sensors.end() && --active->second == 0) {
+              active_sensors.erase(active);
+            }
           }
         }
         released = true;
@@ -1322,8 +1268,9 @@ private:
       }
     } guard{
       active_captures_mutex_, active_capture_count_, active_capture_ids_,
-      handle->get_goal()->request_id, group_reservations_mutex_,
-      active_group_captures_, handle->get_goal()->group_id};
+      handle->get_goal()->request_id, sensor_activity_mutex_,
+      active_sensor_captures_, selected_sensor_ids,
+      !handle->get_goal()->has_requested_time};
 
     auto result = std::make_shared<RecordCapture::Result>();
     CaptureRecord record;
@@ -1781,9 +1728,9 @@ private:
   std::mutex active_captures_mutex_;
   std::size_t active_capture_count_{0};
   std::set<std::string> active_capture_ids_;
-  std::mutex group_reservations_mutex_;
-  std::map<std::string, std::string> group_reservations_;
-  std::map<std::string, std::size_t> active_group_captures_;
+  std::mutex sensor_activity_mutex_;
+  std::map<std::string, std::size_t> active_sensor_captures_;
+  std::map<rclcpp_action::GoalUUID, std::vector<std::string>> accepted_goal_sensors_;
   std::mutex state_mutex_;
   std::condition_variable state_changed_;
   std::map<std::string, vixel_interfaces::msg::Sensor> sensors_;
