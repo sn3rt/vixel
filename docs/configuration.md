@@ -71,6 +71,13 @@ configured before this timeout.
 scheduled PTP actions. Vixel bounds that lead by the smallest reported camera
 action queue, assuming one entry when `ActionQueueSize` is unavailable.
 
+All recording values are static configuration. After editing `machine.yaml`,
+run `ros2 run vixel_manager vixel -- config validate` and restart the Vixel
+stack so the manager, recorder, and web gateway use the same limits. The web
+gateway derives its synchronous capture deadline from `capture_timeout_ms` and
+requests action cancellation before returning HTTP 504 when that deadline is
+exceeded.
+
 ## Portable camera settings
 
 Reusable administrator-managed profiles are loaded from

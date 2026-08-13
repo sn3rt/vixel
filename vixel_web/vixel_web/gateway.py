@@ -704,7 +704,7 @@ class GatewayNode(Node):
             raise RuntimeError(
                 "Capture was rejected; check the group or whether one of its cameras is busy"
             )
-        wrapped = self.wait_future(handle.get_result_async(), 35.0)
+        wrapped = self._wait_for_capture_result(handle)
         return {
             "success": wrapped.result.success,
             "message": wrapped.result.message,
@@ -1279,7 +1279,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, node.cancel_capture_operation(parts[3]))
             else:
                 self._error(HTTPStatus.NOT_FOUND, "not found")
-        except (ValueError, KeyError, RuntimeError, TimeoutError, json.JSONDecodeError) as error:
+        except TimeoutError as error:
+            self._error(HTTPStatus.GATEWAY_TIMEOUT, str(error))
+        except (ValueError, KeyError, RuntimeError, json.JSONDecodeError) as error:
             self._error(HTTPStatus.BAD_REQUEST, str(error))
 
     def _snapshot(self, sensor_id: str):

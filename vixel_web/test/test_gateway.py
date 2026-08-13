@@ -267,6 +267,26 @@ def test_finite_http_response_closes_connection_immediately():
     assert connection.timeout == 40.0
 
 
+def test_capture_timeout_returns_gateway_timeout_status():
+    node = SimpleNamespace(
+        record_capture=lambda _group, _body: (_ for _ in ()).throw(
+            TimeoutError("cancellation requested")
+        ),
+        get_logger=lambda: _Logger(),
+    )
+    body = b"{}"
+    request = (
+        b"POST /api/v1/groups/front/capture HTTP/1.1\r\n"
+        b"Host: localhost\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n"
+        + body
+    )
+    connection = _HTTPConnection(request)
+
+    Handler(connection, ("127.0.0.1", 12345), SimpleNamespace(node=node))
+
+    assert bytes(connection.response).startswith(b"HTTP/1.1 504 Gateway Timeout\r\n")
+
+
 def test_http_connection_limit_returns_503_without_starting_handler_thread():
     server = VixelHTTPServer.__new__(VixelHTTPServer)
     server._connection_slots = threading.BoundedSemaphore(1)
