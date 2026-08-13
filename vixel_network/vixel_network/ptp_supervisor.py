@@ -15,7 +15,6 @@ from .network_setup import (
     ManagedNetwork,
     NetworkSetupError,
     load_networks,
-    render_ptp4l_config,
 )
 
 

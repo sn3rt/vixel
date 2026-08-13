@@ -1,14 +1,15 @@
-import pathlib
-
 import pytest
 
-from vixel_network.network_setup import ManagedNetwork, NetworkSetupError
+from vixel_network.network_setup import (
+    ManagedNetwork,
+    NetworkSetupError,
+    render_ptp4l_config,
+)
 from vixel_network.ptp_supervisor import (
     PtpPort,
     discover_ptp_ports,
     phc2sys_command,
     ptp4l_command,
-    render_ptp4l_config,
 )
 
 

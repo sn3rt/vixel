@@ -92,7 +92,7 @@
     <h3>Configure sync group</h3><label>Group ID<input name="group_id" pattern="[a-z][a-z0-9_]*" required></label>
     <label>Runtime backend<select name="provider"></select></label><label>Missing member policy<select name="missing_policy"><option value="strict">strict — require all members</option><option value="degraded">degraded — use online members</option></select></label>
     <div class="muted">Grouped cameras use PC-mastered PTP scheduled actions when supported. Other cameras remain included with an unsynchronized software trigger.</div>
-    <label>Preview rate (Hz)<input type="number" min="0.05" max="30" step="0.05" name="preview_rate_hz" value="2"></label>
+    <label>Preview rate (Hz)<input type="number" min="0.05" max="10" step="0.05" name="preview_rate_hz" value="2"></label>
     <label>Members<div class="members" id="group-members"></div></label><div class="actions"><button value="cancel">Cancel</button><button class="primary" value="save">Save group</button></div>
   </form></dialog>
   <div id="toast"></div>
