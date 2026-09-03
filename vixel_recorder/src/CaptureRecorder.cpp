@@ -578,7 +578,7 @@ private:
       const auto sensor = sensors_.find(target_id);
       if (sensor == sensors_.end()) {return false;}
       if (selected) {*selected = {target_id};}
-      return sensor->second.online && sensor->second.operating_mode == "preview";
+      return sensor->second.online && sensor->second.operating_mode == "capture";
     }
     const auto group = groups_.find(target_id);
     if (group == groups_.end()) {return false;}

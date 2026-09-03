@@ -1195,14 +1195,14 @@ class InventoryManager(Node):
             assignment.group_trigger_source = "Action0" if member_groups else ""
             assignment.preferred_master_id = ""
             modes = [self._requested_group_mode(group_id) for group_id in group_ids]
-            directly_tested = any(
+            directly_owned = any(
                 session["target_kind"] == "sensor" and sensor_id in session["sensor_ids"]
                 for session in getattr(self, "capture_sessions", {}).values()
             )
             assignment.operating_mode = (
                 "capture" if "capture" in modes else
+                "capture" if directly_owned else
                 "preview" if "preview" in modes else
-                "preview" if directly_tested else
                 "idle" if member_groups else
                 self.sensor_modes.get(sensor_id, self.default_sensor_mode)
             )
@@ -1278,12 +1278,14 @@ class InventoryManager(Node):
         )
         if not groups:
             if directly_owned:
-                return "preview"
+                return "capture"
             return self.sensor_modes.get(sensor_id, self.default_sensor_mode)
         modes = [self._requested_group_mode(group_id) for group_id in groups]
         if "capture" in modes:
             return "capture"
-        if directly_owned or "preview" in modes:
+        if directly_owned:
+            return "capture"
+        if "preview" in modes:
             return "preview"
         return "idle"
 
@@ -1825,7 +1827,7 @@ class InventoryManager(Node):
                         return
                 else:
                     sensor = self.runtime.get(target_id)
-                    if sensor and sensor.online and sensor.operating_mode == "preview":
+                    if sensor and sensor.online and sensor.operating_mode == "capture":
                         return
             await asyncio.sleep(0.1)
         raise RegistryError(f"timed out preparing {target_kind} {target_id}")

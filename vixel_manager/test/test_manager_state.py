@@ -165,7 +165,7 @@ def test_prepare_capture_groups_acquires_a_session_without_mutating_baseline_mod
     assert manager._requested_group_mode("back") == "preview"
 
 
-def test_direct_sensor_session_temporarily_requests_preview_mode():
+def test_direct_sensor_session_temporarily_requests_capture_mode():
     manager = InventoryManager.__new__(InventoryManager)
     manager.registry = SimpleNamespace(inventory={"sync_groups": {}})
     manager.sensor_modes = {}
@@ -179,7 +179,7 @@ def test_direct_sensor_session_temporarily_requests_preview_mode():
         }
     }
 
-    assert manager._mode_for_sensor("camera_a") == "preview"
+    assert manager._mode_for_sensor("camera_a") == "capture"
     manager.capture_sessions.clear()
     assert manager._mode_for_sensor("camera_a") == "idle"
 
