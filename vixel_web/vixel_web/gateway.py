@@ -1225,6 +1225,7 @@ class Handler(BaseHTTPRequestHandler):
             parsed.path == "/"
             or parsed.path == "/index.html"
             or (len(parts) == 2 and parts[0] == "sensors")
+            or (len(parts) == 2 and parts[0] == "test-shots")
         ):
             body = self.server.node.static_file.read_bytes()
             self.send_response(HTTPStatus.OK)
@@ -1292,6 +1293,13 @@ class Handler(BaseHTTPRequestHandler):
                 "generation": snapshot["generation"],
                 "capture_records": snapshot["capture_records"],
             })
+        elif (
+            len(parts) == 6 and parts[:3] == ["api", "v1", "captures"]
+            and parts[4] == "images"
+        ):
+            self._capture_image(
+                urllib.parse.unquote(parts[3]), urllib.parse.unquote(parts[5])
+            )
         elif parsed.path == "/api/v1/system/config":
             self._json(HTTPStatus.OK, self.server.node.system_info())
         elif parsed.path == "/api/v1/health":
@@ -1441,6 +1449,52 @@ class Handler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.GATEWAY_TIMEOUT, str(error))
         except (ValueError, KeyError, RuntimeError, json.JSONDecodeError) as error:
             self._error(HTTPStatus.BAD_REQUEST, str(error))
+
+    def _capture_image(self, capture_id: str, sensor_id: str):
+        if (
+            not capture_id or not sensor_id
+            or pathlib.PurePath(sensor_id).name != sensor_id
+            or sensor_id in {".", ".."}
+        ):
+            self._error(HTTPStatus.BAD_REQUEST, "invalid capture image path")
+            return
+        with self.server.node.lock:
+            record = next(
+                (
+                    dict(value) for value in self.server.node.capture_records
+                    if value.get("capture_id") == capture_id
+                ),
+                None,
+            )
+        if record is None or record.get("status") != "complete":
+            self._error(HTTPStatus.NOT_FOUND, f"completed capture {capture_id} was not found")
+            return
+        if sensor_id not in record.get("saved_sensor_ids", []):
+            self._error(
+                HTTPStatus.NOT_FOUND,
+                f"capture {capture_id} has no saved image for {sensor_id}",
+            )
+            return
+        try:
+            directory = pathlib.Path(record["directory"]).resolve(strict=True)
+            image_path = (directory / f"{sensor_id}.png").resolve(strict=True)
+            if image_path.parent != directory or not image_path.is_file():
+                raise FileNotFoundError(image_path)
+            data = image_path.read_bytes()
+        except (KeyError, OSError):
+            self._error(
+                HTTPStatus.NOT_FOUND,
+                f"saved image for {sensor_id} is unavailable on disk",
+            )
+            return
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "private, max-age=31536000, immutable")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(data)
 
     def _snapshot(self, sensor_id: str):
         with self.server.node.lock:

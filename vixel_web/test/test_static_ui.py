@@ -77,6 +77,16 @@ def test_dashboard_links_previews_to_a_focused_camera_view():
     assert "Showing the last received frame when available." in page
 
 
+def test_completed_test_shot_opens_a_saved_image_result_view():
+    page = PAGE.read_text()
+    assert 'id="capture-view"' in page
+    assert "detailCaptureId" in page
+    assert "location.assign(`/test-shots/" in page
+    assert "captureResult(capture)" in page
+    assert "/api/v1/captures/${encodeURIComponent(c.capture_id)}/images/" in page
+    assert "View images" in page
+
+
 def test_dashboard_hides_manual_modes_and_separates_test_shot_history():
     page = PAGE.read_text()
     assert "controls('sensor'" not in page
