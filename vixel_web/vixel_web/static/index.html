@@ -22,8 +22,8 @@
     .preview { width:100%; aspect-ratio:4/3; display:block; object-fit:contain; background:#05080c }
     .preview-link { display:block; border-bottom:1px solid transparent }
     .preview-link:hover { border-color:var(--accent) }
-    .detail-layout { display:grid; grid-template-columns:minmax(0,2fr) minmax(320px,1fr); gap:14px; margin-top:24px; align-items:start }
-    .detail-preview { max-height:calc(100vh - 145px); aspect-ratio:auto; min-height:360px }
+    .detail-layout { display:grid; grid-template-columns:minmax(0,1fr); gap:14px; margin-top:24px }
+    .detail-preview { width:100%; max-height:none; min-height:0; aspect-ratio:4/3 }
     .detail-caption { padding:9px 12px; border-top:1px solid var(--line) }
     .preview-empty { aspect-ratio:4/3; display:grid; place-items:center; background:#05080c; color:var(--muted) }
     dl { display:grid; grid-template-columns:max-content 1fr; gap:4px 12px; margin:9px 0 }
@@ -53,7 +53,6 @@
     th { color:var(--muted); font-weight:600 } tbody tr:last-child td { border-bottom:0 }
     pre { overflow:auto; max-height:220px; padding:9px; background:#091018; border-radius:6px }
     [hidden] { display:none!important }
-    @media(max-width:900px){.detail-layout{grid-template-columns:1fr}.detail-preview{min-height:0;max-height:none;aspect-ratio:4/3}}
     @media(max-width:600px){ header,main{padding-left:12px;padding-right:12px}.grid{grid-template-columns:1fr} }
   </style>
 </head>

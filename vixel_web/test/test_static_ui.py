@@ -60,6 +60,8 @@ def test_dashboard_links_previews_to_a_focused_camera_view():
     page = PAGE.read_text()
     assert 'href="/sensors/${encodeURIComponent(s.sensor_id)}"' in page
     assert 'id="sensor-view"' in page
+    assert ".detail-layout { display:grid; grid-template-columns:minmax(0,1fr)" in page
+    assert ".detail-preview { width:100%; max-height:none" in page
     assert "detailSensorId" in page
     assert "sensorDetail(sensor)" in page
     assert "Preview inactive — showing the last received frame when available." in page
