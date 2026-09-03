@@ -16,7 +16,8 @@ from typing import Any, Callable
 
 
 def request_group(
-    base_url: str, group_id: str, request_id: str, timeout: float, mode: str
+    base_url: str, group_id: str, request_id: str, timeout: float, mode: str,
+    session_id: str = "",
 ) -> dict[str, Any]:
     if mode not in {"publish", "save"}:
         raise ValueError(f"unsupported mode: {mode}")
@@ -25,7 +26,10 @@ def request_group(
     url = f"{base_url.rstrip('/')}/api/v1/groups/{group}/{operation}"
     request = urllib.request.Request(
         url,
-        data=json.dumps({"request_id": request_id}).encode("utf-8"),
+        data=json.dumps({
+            "request_id": request_id,
+            **({"session_id": session_id} if session_id else {}),
+        }).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
@@ -67,16 +71,18 @@ def scheduled_ns(result: dict[str, Any]) -> int:
 def trigger_cycle(
     groups: list[str], base_url: str, timeout: float, sequence: int,
     mode: str = "publish",
-    request: Callable[[str, str, str, float, str], dict[str, Any]] = request_group,
+    request: Callable[..., dict[str, Any]] = request_group,
     request_prefix: str = "periodic",
+    session_id: str = "",
 ) -> dict[str, dict[str, Any]]:
     barrier = threading.Barrier(len(groups))
 
     def invoke(group_id: str) -> dict[str, Any]:
         barrier.wait()
-        return request(
+        arguments = (
             base_url, group_id, f"{request_prefix}_{sequence}_{group_id}", timeout, mode
         )
+        return request(*arguments, session_id) if session_id else request(*arguments)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(groups)) as executor:
         futures = {group: executor.submit(invoke, group) for group in groups}
@@ -84,13 +90,14 @@ def trigger_cycle(
 
 
 def api_request(
-    base_url: str, path: str, timeout: float, body: dict[str, Any] | None = None
+    base_url: str, path: str, timeout: float, body: dict[str, Any] | None = None,
+    method: str | None = None,
 ) -> dict[str, Any]:
     request = urllib.request.Request(
         f"{base_url.rstrip('/')}{path}",
         data=None if body is None else json.dumps(body).encode("utf-8"),
         headers={"Content-Type": "application/json"},
-        method="GET" if body is None else "POST",
+        method=method or ("GET" if body is None else "POST"),
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -108,15 +115,37 @@ def api_request(
     return result
 
 
-def set_group_capture_mode(
-    base_url: str, group_id: str, timeout: float, interval: float,
-) -> dict[str, Any]:
-    return api_request(
-        base_url, "/api/v1/mode", timeout,
+def acquire_capture_session(
+    base_url: str, groups: list[str], timeout: float, interval: float,
+    owner_id: str,
+) -> str:
+    result = api_request(
+        base_url, "/api/v1/capture-sessions", timeout,
         {
-            "target_kind": "group", "target_id": group_id, "mode": "capture",
-            "capture_interval_ms": round(interval * 1000),
+            "owner_id": owner_id,
+            "target_kind": "group",
+            "target_ids": groups,
+            "requested_interval_ms": round(interval * 1000),
+            "exclusive": False,
         },
+    )
+    session_id = str(result.get("session", {}).get("session_id", ""))
+    if not session_id:
+        raise RuntimeError("Vixel API did not return a capture session ID")
+    return session_id
+
+
+def renew_capture_session(base_url: str, session_id: str, timeout: float) -> None:
+    encoded = urllib.parse.quote(session_id, safe="")
+    api_request(
+        base_url, f"/api/v1/capture-sessions/{encoded}", timeout, {}, method="PATCH"
+    )
+
+
+def release_capture_session(base_url: str, session_id: str, timeout: float) -> None:
+    encoded = urllib.parse.quote(session_id, safe="")
+    api_request(
+        base_url, f"/api/v1/capture-sessions/{encoded}", timeout, {}, method="DELETE"
     )
 
 
@@ -144,12 +173,26 @@ def group_readiness(group: dict[str, Any] | None) -> str:
 
 def prepare_capture_groups(
     base_url: str, groups: list[str], timeout: float, ready_timeout: float,
-    interval: float,
-) -> None:
-    for group_id in groups:
-        set_group_capture_mode(base_url, group_id, timeout, interval)
-    print(f"capture mode requested for: {','.join(groups)}")
+    interval: float, owner_id: str = "http-periodic",
+) -> str:
+    session_id = acquire_capture_session(
+        base_url, groups, timeout, interval, owner_id
+    )
+    print(f"capture session {session_id} acquired for: {','.join(groups)}")
+    try:
+        wait_for_capture_groups_ready(base_url, groups, timeout, ready_timeout)
+    except BaseException:
+        try:
+            release_capture_session(base_url, session_id, timeout)
+        except RuntimeError:
+            pass
+        raise
+    return session_id
 
+
+def wait_for_capture_groups_ready(
+    base_url: str, groups: list[str], timeout: float, ready_timeout: float,
+) -> None:
     deadline = time.monotonic() + ready_timeout
     last_status = ""
     consecutive_ready_polls = 0
@@ -247,7 +290,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--timeout", type=float, default=35.0)
     value.add_argument(
         "--ready-timeout", type=float, default=60.0,
-        help="Seconds to wait for cameras and PTP synchronization after requesting capture mode",
+        help="Seconds to wait for cameras and PTP synchronization after acquiring the session",
     )
     value.add_argument(
         "--request-prefix",
@@ -269,15 +312,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     sequence = 0
-    next_deadline = time.monotonic()
     request_prefix = args.request_prefix or time.strftime(
         "periodic_%Y%m%dT%H%M%SZ", time.gmtime()
     )
+    publish_session_id = ""
     if args.mode == "publish":
         try:
-            prepare_capture_groups(
+            publish_session_id = prepare_capture_groups(
                 args.base_url, args.group_ids, args.timeout, args.ready_timeout,
-                args.interval,
+                args.interval, request_prefix,
             )
         except KeyboardInterrupt:
             return 0
@@ -309,12 +352,14 @@ def main(argv: list[str] | None = None) -> int:
         except (RuntimeError, ValueError, KeyError) as error:
             print(f"Periodic trigger-and-save failed: {error}", file=sys.stderr)
             return 1
+    next_deadline = time.monotonic()
+    renew_deadline = next_deadline + 2.0
     try:
         while args.count == 0 or sequence < args.count:
             sequence += 1
             results = trigger_cycle(
                 args.group_ids, args.base_url, args.timeout, sequence, args.mode,
-                request_group, request_prefix,
+                request_group, request_prefix, publish_session_id,
             )
             if args.mode == "save":
                 print(f"cycle {sequence}: saved {len(results)} group(s)")
@@ -340,7 +385,19 @@ def main(argv: list[str] | None = None) -> int:
             next_deadline += args.interval
             remaining = next_deadline - time.monotonic()
             if remaining > 0:
-                time.sleep(remaining)
+                while remaining > 0:
+                    now = time.monotonic()
+                    if publish_session_id and now >= renew_deadline:
+                        renew_capture_session(
+                            args.base_url, publish_session_id, args.timeout
+                        )
+                        renew_deadline = time.monotonic() + 2.0
+                        now = time.monotonic()
+                    sleep_for = remaining
+                    if publish_session_id:
+                        sleep_for = min(sleep_for, max(0.01, renew_deadline - now))
+                    time.sleep(sleep_for)
+                    remaining = next_deadline - time.monotonic()
             else:
                 print(
                     f"cycle {sequence}: interval overrun={-remaining:.3f} s",
@@ -351,6 +408,13 @@ def main(argv: list[str] | None = None) -> int:
     except (RuntimeError, ValueError) as error:
         print(f"Periodic trigger-and-{args.mode} failed: {error}", file=sys.stderr)
         return 1
+    finally:
+        if publish_session_id:
+            try:
+                release_capture_session(args.base_url, publish_session_id, args.timeout)
+                print(f"capture session {publish_session_id} released")
+            except RuntimeError as error:
+                print(f"could not release capture session: {error}", file=sys.stderr)
     return 0
 
 

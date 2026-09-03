@@ -1,6 +1,9 @@
 builtin_interfaces/Time stamp
 string capture_id
 string group_id
+string capture_kind
+string target_kind
+string target_id
 string status
 string directory
 string message

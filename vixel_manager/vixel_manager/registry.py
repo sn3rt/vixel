@@ -212,6 +212,7 @@ def validate_machine(data: dict[str, Any]) -> dict[str, Any]:
     recording.setdefault("operation_history_limit", 100)
     recording.setdefault("operation_capture_id_limit", 100)
     recording.setdefault("max_active_operations", 64)
+    recording.setdefault("capture_session_ttl_ms", 15000)
     if not str(recording["root_directory"]).strip():
         raise RegistryError("recording.root_directory must not be empty")
     if int(recording["minimum_free_bytes"]) < 0:
@@ -231,6 +232,10 @@ def validate_machine(data: dict[str, Any]) -> dict[str, Any]:
     if not 1 <= int(recording["max_active_operations"]) <= 256:
         raise RegistryError(
             "recording.max_active_operations must be between 1 and 256"
+        )
+    if not 5000 <= int(recording["capture_session_ttl_ms"]) <= 300000:
+        raise RegistryError(
+            "recording.capture_session_ttl_ms must be between 5000 and 300000"
         )
     defaults.setdefault("preview_rate_hz", 2.0)
     defaults.setdefault("preview_width", 960)
@@ -861,16 +866,21 @@ class Registry:
             previous = copy.deepcopy(self.inventory)
             if sensor_id not in self.inventory["sensors"]:
                 raise RegistryError(f"unknown enrolled sensor {sensor_id}")
+            memberships = sorted(
+                group_id
+                for group_id, group in self.inventory["sync_groups"].items()
+                if sensor_id in group["members"]
+            )
+            if memberships:
+                raise RegistryError(
+                    f"sensor {sensor_id} belongs to sync group(s): "
+                    f"{', '.join(memberships)}; remove it from those groups before archiving"
+                )
             sensor = copy.deepcopy(self.inventory["sensors"].pop(sensor_id))
             known = self._ensure_known(sensor_id, sensor)
             known["catalog_state"] = "archived"
             known["archived_at"] = self._timestamp()
             known["last_configuration"] = sensor
-            for group_id in list(self.inventory["sync_groups"]):
-                group = self.inventory["sync_groups"][group_id]
-                group["members"] = [member for member in group["members"] if member != sensor_id]
-                if not group["members"]:
-                    del self.inventory["sync_groups"][group_id]
             self._append_history("archive", sensor_id, {
                 "network_id": sensor.get("network_id", ""),
                 "assigned_address": sensor.get("assigned_address", ""),

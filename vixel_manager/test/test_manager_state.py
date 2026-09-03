@@ -3,6 +3,7 @@ import json
 import threading
 from types import SimpleNamespace
 
+import pytest
 from rclpy.clock import Clock
 
 from vixel_manager.manager_node import (
@@ -10,6 +11,7 @@ from vixel_manager.manager_node import (
     _provider_group_is_current,
     _runtime_sensor_is_ready,
 )
+from vixel_manager.registry import RegistryError
 
 
 def test_provider_group_status_must_match_requested_mode():
@@ -94,6 +96,7 @@ def test_overlapping_groups_aggregate_sensor_mode_and_cadence():
     manager.default_group_mode = "idle"
     manager.default_sensor_mode = "idle"
     manager.sensor_modes = {}
+    manager.lock = threading.RLock()
     manager.camera_profiles = {}
     manager.generation = 4
     manager._clock = Clock()
@@ -120,27 +123,87 @@ def test_overlapping_groups_aggregate_sensor_mode_and_cadence():
     assert json.loads(assignments["spare"].provider_settings_json)["trigger_source"] == "Action0"
 
 
-def test_prepare_capture_groups_sets_mode_and_requested_interval_atomically():
+def test_prepare_capture_groups_acquires_a_session_without_mutating_baseline_modes():
     manager = InventoryManager.__new__(InventoryManager)
     manager.registry = SimpleNamespace(inventory={
-        "sync_groups": {"front": {}, "back": {}}
+        "sync_groups": {
+            "front": {"members": ["left"]},
+            "back": {"members": ["right"]},
+        },
+        "sensors": {"left": {}, "right": {}},
     })
     manager.group_modes = {"front": "idle", "back": "preview"}
     manager.group_capture_intervals = {"front": 0, "back": 0}
+    manager.default_group_mode = "idle"
     manager.generation = 7
     manager.lock = threading.RLock()
+    manager.capture_sessions = {}
+    manager.capture_session_generation = 1
+    manager.capture_session_ttl_sec = 15.0
     published = []
     manager._publish_state = lambda: published.append(True)
-    request = SimpleNamespace(group_ids=["front", "back"], interval_ms=200)
-    response = SimpleNamespace(accepted=False, message="")
+    request = SimpleNamespace(
+        group_ids=["front", "back"], interval_ms=200, owner_id="operation_1"
+    )
+    response = SimpleNamespace(accepted=False, message="", session_id="")
 
     result = manager._prepare_capture_groups(request, response)
 
     assert result.accepted is True
-    assert manager.group_modes == {"front": "capture", "back": "capture"}
-    assert manager.group_capture_intervals == {"front": 200, "back": 200}
+    assert manager.group_modes == {"front": "idle", "back": "preview"}
+    assert manager.group_capture_intervals == {"front": 0, "back": 0}
+    session = manager.capture_sessions[result.session_id]
+    assert session["owner_id"] == "operation_1"
+    assert session["group_ids"] == ["front", "back"]
+    assert session["sensor_ids"] == ["left", "right"]
+    assert manager._requested_group_mode("front") == "capture"
+    assert manager._requested_group_interval("front") == 200
     assert manager.generation == 8
     assert published == [True]
+    manager._drop_capture_session(result.session_id)
+    assert manager._requested_group_mode("front") == "idle"
+    assert manager._requested_group_mode("back") == "preview"
+
+
+def test_direct_sensor_session_temporarily_requests_preview_mode():
+    manager = InventoryManager.__new__(InventoryManager)
+    manager.registry = SimpleNamespace(inventory={"sync_groups": {}})
+    manager.sensor_modes = {}
+    manager.default_sensor_mode = "idle"
+    manager.lock = threading.RLock()
+    manager.capture_sessions = {
+        "session_test": {
+            "target_kind": "sensor",
+            "sensor_ids": ["camera_a"],
+            "group_ids": [],
+        }
+    }
+
+    assert manager._mode_for_sensor("camera_a") == "preview"
+    manager.capture_sessions.clear()
+    assert manager._mode_for_sensor("camera_a") == "idle"
+
+
+def test_exclusive_test_session_rejects_overlapping_capture_owners():
+    manager = InventoryManager.__new__(InventoryManager)
+    manager.registry = SimpleNamespace(inventory={
+        "sync_groups": {
+            "front": {"members": ["left", "right"]},
+            "all": {"members": ["left", "right", "rear"]},
+        },
+        "sensors": {"left": {}, "right": {}, "rear": {}},
+    })
+    manager.lock = threading.RLock()
+    manager.capture_sessions = {}
+    manager.capture_session_generation = 1
+    manager.capture_session_ttl_sec = 15.0
+    manager.generation = 1
+
+    manager._create_capture_session("front-controller", "group", ["front"], 250, False)
+    manager._create_capture_session("all-controller", "group", ["all"], 500, False)
+
+    with pytest.raises(RegistryError, match="cameras are busy"):
+        manager._create_capture_session("dashboard-test", "group", ["front"], 0, True)
 
 
 def test_runtime_sensor_from_previous_mode_is_not_ready():
@@ -194,13 +257,19 @@ def test_group_capture_proxy_awaits_provider_without_blocking_executor_thread():
             }
         }
     })
-    manager.group_modes = {"front": "capture"}
-    manager.default_group_mode = "idle"
+    manager.capture_sessions = {
+        "session_1": {
+            "session_id": "session_1", "group_ids": ["front"],
+            "sensor_ids": ["left", "right"], "expires_monotonic": 9999999999.0,
+        }
+    }
+    manager.capture_session_ttl_sec = 15.0
+    manager.lock = threading.RLock()
     manager.capture_clients = {"genicam": client}
     manager._runtime_group_provider = lambda _group: "genicam"
 
-    result = asyncio.run(manager._request_group_capture(
-        "front", "capture_1", trigger_only=False
+    result = asyncio.run(manager._request_capture(
+        "group", "front", "capture_1", session_id="session_1", trigger_only=False
     ))
 
     assert result is provider_response

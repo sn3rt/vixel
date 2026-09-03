@@ -7,8 +7,10 @@ source /opt/ros/lyrical/setup.bash
 source install/setup.bash
 ```
 
-The target group must be online and in `capture` mode. Grouped cameras use PTP
-scheduled actions when supported and software fallback otherwise.
+The target group must be online. One-shot clients acquire a temporary capture
+session automatically; long-running clients should hold and renew their own.
+Grouped cameras use PTP scheduled actions when supported and software fallback
+otherwise.
 
 ## Trigger through HTTP: publish or save
 
@@ -76,12 +78,12 @@ python3 examples/http_trigger_groups_periodic.py \
   front back --interval 2 --mode save
 ```
 
-In publish mode, the helper first requests capture mode for every named group
-and waits until the cameras are ready; `--ready-timeout` changes the default
-60-second wait. Save mode submits one server-managed sequence immediately. The
-server moves the groups to capture mode, applies an exposure ceiling derived
-from `--interval`, waits for camera/PTP/metering and trigger-armed readiness,
-and only then starts
+In publish mode, the helper acquires one capture session for every named group,
+renews it while the script runs, releases it on exit, and waits until the cameras
+are ready; `--ready-timeout` changes the default 60-second wait. Save mode
+submits one server-managed sequence immediately. The server owns its capture
+session, applies an exposure ceiling derived from `--interval`, waits for
+camera/PTP/metering and trigger-armed readiness, and only then starts
 the sequence. It reports a preparation failure without firing a trigger when a
 camera cannot support that cadence.
 
@@ -134,6 +136,7 @@ ros2 topic echo --once \
 Start the topic subscriber before sending the trigger. Trigger-only frames are
 not retained for subscribers that connect afterward.
 
-Use **Capture and save** in the dashboard, `ros_trigger.py --mode save`, or
-`http_trigger.py --mode save` when Vixel itself should persist PNGs and a full
-capture manifest under its configured recording directory.
+Use `ros_trigger.py --mode save` or `http_trigger.py --mode save` when Vixel
+itself should persist production PNGs and a full capture manifest under its
+configured recording directory. The dashboard's **Test shot** control is for
+setup validation and stores its results separately under `test-shots/`.

@@ -1,5 +1,7 @@
 string[] group_ids
 uint32 interval_ms
+string owner_id
 ---
 bool accepted
 string message
+string session_id

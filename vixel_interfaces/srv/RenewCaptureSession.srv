@@ -1,0 +1,5 @@
+string session_id
+---
+bool success
+string message
+CaptureSession session

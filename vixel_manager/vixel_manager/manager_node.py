@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import ipaddress
 import json
@@ -8,6 +9,7 @@ import pathlib
 import re
 import threading
 import time
+import uuid
 from typing import Any
 
 import rclpy
@@ -15,6 +17,7 @@ from geometry_msgs.msg import Pose, TransformStamped
 from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
+from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
@@ -30,11 +33,14 @@ from vixel_interfaces.msg import (
     Sensor,
     SensorArray,
     SensorObservationArray,
+    CaptureSession,
+    CaptureSessionArray,
     SyncGroup,
     SyncGroupArray,
 )
 from vixel_interfaces.srv import (
     CaptureGroup,
+    AcquireCaptureSession,
     DeleteSyncGroup,
     ForgetSensor,
     PrepareCaptureGroups,
@@ -42,6 +48,8 @@ from vixel_interfaces.srv import (
     ProviderCapture,
     ProvisionSensor,
     ReloadCameraProfiles,
+    ReleaseCaptureSession,
+    RenewCaptureSession,
     SetOperatingMode,
     SetPortMode,
     UpdateSensorMetadata,
@@ -173,12 +181,9 @@ class InventoryManager(Node):
             raise RegistryError(
                 f"camera backend {self.camera_backend} is absent from machine providers"
             )
-        configured_startup = str(self.registry.machine["defaults"].get("startup_mode", "idle"))
         start_preview = bool(self.declare_parameter("start_preview", False).value)
-        self.default_group_mode = "preview" if start_preview else configured_startup
-        self.default_sensor_mode = (
-            self.default_group_mode if self.default_group_mode != "capture" else "idle"
-        )
+        self.default_group_mode = "preview" if start_preview else "idle"
+        self.default_sensor_mode = self.default_group_mode
         self.get_logger().info(f"Machine configuration: {machine_file}")
         self.get_logger().info(f"Inventory state: {inventory_file}")
 
@@ -190,6 +195,11 @@ class InventoryManager(Node):
         self.sensor_modes: dict[str, str] = {}
         self.group_modes: dict[str, str] = {}
         self.group_capture_intervals: dict[str, int] = {}
+        self.capture_sessions: dict[str, dict[str, Any]] = {}
+        self.capture_session_generation = 1
+        self.capture_session_ttl_sec = (
+            int(self.registry.machine["recording"]["capture_session_ttl_ms"]) / 1000.0
+        )
         self.provider_subscriptions = []
         self.assignment_publishers = {}
         self.provision_clients = {}
@@ -208,6 +218,9 @@ class InventoryManager(Node):
         )
         self.group_publisher = self.create_publisher(SyncGroupArray, "sync_groups", STATE_QOS)
         self.port_publisher = self.create_publisher(ManagedPortArray, "ports", STATE_QOS)
+        self.capture_session_publisher = self.create_publisher(
+            CaptureSessionArray, "capture_sessions", STATE_QOS
+        )
         providers = set(self.registry.machine.get("providers", {}).keys())
         providers.update(
             sensor["provider"] for sensor in self.registry.inventory["sensors"].values()
@@ -256,6 +269,24 @@ class InventoryManager(Node):
             PrepareCaptureGroups,
             "prepare_capture_groups",
             self._prepare_capture_groups,
+            callback_group=self.callback_group,
+        )
+        self.acquire_capture_session_service = self.create_service(
+            AcquireCaptureSession,
+            "acquire_capture_session",
+            self._acquire_capture_session,
+            callback_group=self.callback_group,
+        )
+        self.renew_capture_session_service = self.create_service(
+            RenewCaptureSession,
+            "renew_capture_session",
+            self._renew_capture_session,
+            callback_group=self.callback_group,
+        )
+        self.release_capture_session_service = self.create_service(
+            ReleaseCaptureSession,
+            "release_capture_session",
+            self._release_capture_session,
             callback_group=self.callback_group,
         )
         self.upsert_group_service = self.create_service(
@@ -323,6 +354,9 @@ class InventoryManager(Node):
         )
         self.automation_timer = self.create_timer(
             1.0, self._reconcile_automation, callback_group=self.callback_group
+        )
+        self.capture_session_timer = self.create_timer(
+            1.0, self._expire_capture_sessions, callback_group=self.callback_group
         )
         self.catalog_flush_timer = self.create_timer(
             5.0, self._flush_catalog, callback_group=self.callback_group
@@ -725,10 +759,207 @@ class InventoryManager(Node):
         network = self.registry.machine["managed_networks"][network_id]
         return network_id if network["approved"] else ""
 
+    def _capture_session_message(self, record: dict[str, Any]) -> CaptureSession:
+        message = CaptureSession()
+        message.stamp = self.get_clock().now().to_msg()
+        message.session_id = record["session_id"]
+        message.owner_id = record["owner_id"]
+        message.target_kind = record["target_kind"]
+        message.target_ids = list(record["target_ids"])
+        message.group_ids = list(record["group_ids"])
+        message.sensor_ids = list(record["sensor_ids"])
+        message.requested_interval_ms = int(record["requested_interval_ms"])
+        message.exclusive = bool(record["exclusive"])
+        message.status = record.get("status", "active")
+        message.message = record.get("message", "capture session active")
+        remaining = max(0.0, record["expires_monotonic"] - time.monotonic())
+        message.expires_at = (
+            self.get_clock().now() + Duration(seconds=remaining)
+        ).to_msg()
+        return message
+
+    def _session_targets(
+        self, target_kind: str, target_ids: list[str]
+    ) -> tuple[list[str], list[str]]:
+        if target_kind not in {"group", "sensor"}:
+            raise RegistryError("target_kind must be group or sensor")
+        if not target_ids or len(set(target_ids)) != len(target_ids):
+            raise RegistryError("target_ids must contain unique targets")
+        snapshot = self.registry.inventory
+        if target_kind == "group":
+            missing = [value for value in target_ids if value not in snapshot["sync_groups"]]
+            if missing:
+                raise RegistryError("unknown synchronization group " + missing[0])
+            sensor_ids = sorted({
+                sensor_id
+                for group_id in target_ids
+                for sensor_id in snapshot["sync_groups"][group_id]["members"]
+            })
+            return list(target_ids), sensor_ids
+        missing = [value for value in target_ids if value not in snapshot["sensors"]]
+        if missing:
+            raise RegistryError("unknown enrolled sensor " + missing[0])
+        return [], sorted(target_ids)
+
+    def _create_capture_session(
+        self, owner_id: str, target_kind: str, target_ids: list[str],
+        requested_interval_ms: int, exclusive: bool,
+    ) -> dict[str, Any]:
+        if requested_interval_ms != 0 and not 100 <= requested_interval_ms <= 86_400_000:
+            raise RegistryError("requested_interval_ms must be zero or 100..86400000")
+        group_ids, sensor_ids = self._session_targets(target_kind, target_ids)
+        requested = set(sensor_ids)
+        for current in self.capture_sessions.values():
+            overlap = requested.intersection(current["sensor_ids"])
+            if overlap and (exclusive or current["exclusive"]):
+                names = ", ".join(sorted(overlap))
+                raise RegistryError(
+                    f"cameras are busy in session {current['session_id']} "
+                    f"owned by {current['owner_id']}: {names}"
+                )
+        session_id = "session_" + uuid.uuid4().hex
+        record = {
+            "session_id": session_id,
+            "owner_id": owner_id or "anonymous",
+            "target_kind": target_kind,
+            "target_ids": list(target_ids),
+            "group_ids": group_ids,
+            "sensor_ids": sensor_ids,
+            "requested_interval_ms": int(requested_interval_ms),
+            "exclusive": bool(exclusive),
+            "status": "active",
+            "message": "capture session active",
+            "expires_monotonic": time.monotonic() + self.capture_session_ttl_sec,
+        }
+        self.capture_sessions[session_id] = record
+        self.capture_session_generation += 1
+        self.generation += 1
+        return record
+
+    def _drop_capture_session(self, session_id: str) -> bool:
+        removed = self.capture_sessions.pop(session_id, None) is not None
+        if removed:
+            self.capture_session_generation += 1
+            self.generation += 1
+        return removed
+
+    def _acquire_capture_session(self, request, response):
+        try:
+            with self.lock:
+                record = self._create_capture_session(
+                    request.owner_id, request.target_kind, list(request.target_ids),
+                    int(request.requested_interval_ms), bool(request.exclusive),
+                )
+            response.success = True
+            response.message = "Capture session acquired"
+            response.session = self._capture_session_message(record)
+            self._publish_state()
+        except RegistryError as error:
+            response.success = False
+            response.message = str(error)
+        return response
+
+    def _renew_capture_session(self, request, response):
+        with self.lock:
+            record = self.capture_sessions.get(request.session_id)
+            if record is None:
+                response.success = False
+                response.message = "unknown or expired capture session"
+                return response
+            record["expires_monotonic"] = time.monotonic() + self.capture_session_ttl_sec
+            self.capture_session_generation += 1
+            response.success = True
+            response.message = "Capture session renewed"
+            response.session = self._capture_session_message(record)
+        self._publish_capture_sessions()
+        return response
+
+    def _release_capture_session(self, request, response):
+        with self.lock:
+            removed = self._drop_capture_session(request.session_id)
+        response.success = removed
+        response.message = "Capture session released" if removed else "unknown capture session"
+        if removed:
+            self._publish_state()
+        return response
+
+    def _expire_capture_sessions(self) -> None:
+        now = time.monotonic()
+        with self.lock:
+            expired = [
+                session_id for session_id, record in self.capture_sessions.items()
+                if record["expires_monotonic"] <= now
+            ]
+            for session_id in expired:
+                self._drop_capture_session(session_id)
+        if expired:
+            self.get_logger().warning(
+                "Expired capture sessions: " + ", ".join(expired)
+            )
+            self._publish_state()
+
+    def _publish_capture_sessions(self) -> None:
+        message = CaptureSessionArray()
+        message.header.stamp = self.get_clock().now().to_msg()
+        message.generation = self.capture_session_generation
+        with self.lock:
+            message.sessions = [
+                self._capture_session_message(record)
+                for record in sorted(
+                    self.capture_sessions.values(), key=lambda item: item["session_id"]
+                )
+            ]
+        self.capture_session_publisher.publish(message)
+
+    def _session_for_group(self, group_id: str) -> list[dict[str, Any]]:
+        with self.lock:
+            return [
+                session for session in getattr(self, "capture_sessions", {}).values()
+                if group_id in session["group_ids"]
+            ]
+
+    def _cameras_capture_owned(self, sensor_ids) -> bool:
+        requested = set(sensor_ids)
+        with self.lock:
+            return any(
+                requested.intersection(session["sensor_ids"])
+                for session in self.capture_sessions.values()
+            )
+
+    def _requested_group_mode(self, group_id: str) -> str:
+        if self._session_for_group(group_id):
+            return "capture"
+        return self.group_modes.get(group_id, self.default_group_mode)
+
+    def _requested_group_interval(self, group_id: str) -> int:
+        values = [
+            int(session["requested_interval_ms"])
+            for session in self._session_for_group(group_id)
+            if int(session["requested_interval_ms"]) > 0
+        ]
+        if values:
+            return min(values)
+        return int(self.group_capture_intervals.get(group_id, 0))
+
+    def _capture_session_for_target(
+        self, session_id: str, target_kind: str, target_id: str
+    ) -> dict[str, Any]:
+        session = self.capture_sessions.get(session_id)
+        if session is None:
+            raise RegistryError("unknown or expired capture session")
+        if target_kind == "group" and target_id not in session["group_ids"]:
+            raise RegistryError("capture session does not own this group")
+        if target_kind == "sensor" and (
+            session["target_kind"] != "sensor" or target_id not in session["target_ids"]
+        ):
+            raise RegistryError("capture session does not own this sensor")
+        session["expires_monotonic"] = time.monotonic() + self.capture_session_ttl_sec
+        return session
+
     def _sync_group_message(self, group_id: str, record: dict[str, Any]) -> SyncGroup:
         provider_message = self.provider_groups.get(group_id)
-        requested_mode = self.group_modes.get(group_id, self.default_group_mode)
-        requested_interval = self.group_capture_intervals.get(group_id, 0)
+        requested_mode = self._requested_group_mode(group_id)
+        requested_interval = self._requested_group_interval(group_id)
         # A provider status from the previous operating mode can remain latched
         # while its camera sessions are being restarted.  Do not relabel that
         # stale status with the new mode: doing so briefly made a capture button
@@ -826,6 +1057,7 @@ class InventoryManager(Node):
             self.known_sensor_publisher.publish(known_array)
             self.group_publisher.publish(group_array)
             self.port_publisher.publish(port_array)
+            self._publish_capture_sessions()
             self._publish_static_transforms(sensor_array)
             self._publish_assignments(snapshot)
 
@@ -962,13 +1194,15 @@ class InventoryManager(Node):
             )
             assignment.group_trigger_source = "Action0" if member_groups else ""
             assignment.preferred_master_id = ""
-            modes = [
-                self.group_modes.get(group_id, self.default_group_mode)
-                for group_id in group_ids
-            ]
+            modes = [self._requested_group_mode(group_id) for group_id in group_ids]
+            directly_tested = any(
+                session["target_kind"] == "sensor" and sensor_id in session["sensor_ids"]
+                for session in getattr(self, "capture_sessions", {}).values()
+            )
             assignment.operating_mode = (
                 "capture" if "capture" in modes else
                 "preview" if "preview" in modes else
+                "preview" if directly_tested else
                 "idle" if member_groups else
                 self.sensor_modes.get(sensor_id, self.default_sensor_mode)
             )
@@ -983,10 +1217,10 @@ class InventoryManager(Node):
                 default=float(self.registry.machine["defaults"]["preview_rate_hz"]),
             )
             capture_intervals = [
-                int(self.group_capture_intervals.get(group_id, 0))
+                self._requested_group_interval(group_id)
                 for group_id in group_ids
-                if self.group_modes.get(group_id, self.default_group_mode) == "capture"
-                and int(self.group_capture_intervals.get(group_id, 0)) > 0
+                if self._requested_group_mode(group_id) == "capture"
+                and self._requested_group_interval(group_id) > 0
             ]
             assignment.requested_capture_interval_ms = (
                 min(capture_intervals)
@@ -1038,12 +1272,18 @@ class InventoryManager(Node):
 
     def _mode_for_sensor(self, sensor_id: str) -> str:
         groups = self._groups_for_sensor(sensor_id)
+        directly_owned = any(
+            session["target_kind"] == "sensor" and sensor_id in session["sensor_ids"]
+            for session in getattr(self, "capture_sessions", {}).values()
+        )
         if not groups:
+            if directly_owned:
+                return "preview"
             return self.sensor_modes.get(sensor_id, self.default_sensor_mode)
-        modes = [self.group_modes.get(group_id, self.default_group_mode) for group_id in groups]
+        modes = [self._requested_group_mode(group_id) for group_id in groups]
         if "capture" in modes:
             return "capture"
-        if "preview" in modes:
+        if directly_owned or "preview" in modes:
             return "preview"
         return "idle"
 
@@ -1367,6 +1607,8 @@ class InventoryManager(Node):
 
     def _update_metadata(self, request, response):
         try:
+            if self._cameras_capture_owned([request.sensor_id]):
+                raise RegistryError("cannot edit camera metadata while it is in use")
             pose = _pose_to_dict(request.pose, request.parent_frame) if request.has_pose else None
             self.registry.update_sensor(request.sensor_id, {
                 "display_name": request.display_name,
@@ -1390,6 +1632,14 @@ class InventoryManager(Node):
 
     def _forget_sensor(self, request, response):
         try:
+            groups = self._groups_for_sensor(request.sensor_id)
+            if groups:
+                raise RegistryError(
+                    "remove sensor from synchronization groups before archiving: " +
+                    ", ".join(groups)
+                )
+            if self._cameras_capture_owned([request.sensor_id]):
+                raise RegistryError("cannot archive a camera while it is in use")
             runtime = self.runtime.get(request.sensor_id)
             if runtime and runtime.online and not request.force:
                 raise RegistryError("sensor is online; set force=true to stop and archive it")
@@ -1457,11 +1707,22 @@ class InventoryManager(Node):
             if request.target_kind == "group":
                 if request.target_id not in self.registry.inventory["sync_groups"]:
                     raise RegistryError(f"unknown sync group {request.target_id}")
+                members = set(
+                    self.registry.inventory["sync_groups"][request.target_id]["members"]
+                )
+                if self._cameras_capture_owned(members):
+                    raise RegistryError(
+                        "cannot change mode while cameras are capture-session owned"
+                    )
                 self.group_modes[request.target_id] = request.mode
                 self.group_capture_intervals[request.target_id] = 0
             elif request.target_kind == "sensor":
                 if request.target_id not in self.registry.inventory["sensors"]:
                     raise RegistryError(f"unknown sensor {request.target_id}")
+                if self._cameras_capture_owned([request.target_id]):
+                    raise RegistryError(
+                        "cannot change mode while the camera is capture-session owned"
+                    )
                 if self._groups_for_sensor(request.target_id):
                     raise RegistryError("set the mode on one of the sensor's capture groups")
                 if request.mode == "capture":
@@ -1481,22 +1742,16 @@ class InventoryManager(Node):
 
     def _prepare_capture_groups(self, request, response):
         try:
-            if request.interval_ms < 100 or request.interval_ms > 86_400_000:
-                raise RegistryError("interval_ms must be between 100 and 86400000")
+            if request.interval_ms != 0 and not 100 <= request.interval_ms <= 86_400_000:
+                raise RegistryError("interval_ms must be zero or between 100 and 86400000")
             group_ids = list(request.group_ids)
-            if not group_ids:
-                raise RegistryError("at least one synchronization group is required")
-            if len(set(group_ids)) != len(group_ids):
-                raise RegistryError("group_ids contains a duplicate")
-            for group_id in group_ids:
-                if group_id not in self.registry.inventory["sync_groups"]:
-                    raise RegistryError(f"unknown sync group {group_id}")
             with self.lock:
-                for group_id in group_ids:
-                    self.group_modes[group_id] = "capture"
-                    self.group_capture_intervals[group_id] = int(request.interval_ms)
-                self.generation += 1
+                session = self._create_capture_session(
+                    request.owner_id or "capture-operation", "group", group_ids,
+                    int(request.interval_ms), False,
+                )
             response.accepted = True
+            response.session_id = session["session_id"]
             response.message = (
                 f"Preparing {len(group_ids)} group(s) for {request.interval_ms} ms capture"
             )
@@ -1508,6 +1763,12 @@ class InventoryManager(Node):
 
     def _upsert_group(self, request, response):
         try:
+            affected = set(request.member_ids)
+            existing = self.registry.inventory["sync_groups"].get(request.group_id)
+            if existing:
+                affected.update(existing["members"])
+            if self._cameras_capture_owned(affected):
+                raise RegistryError("cannot edit a group while its cameras are in use")
             self.registry.upsert_group(
                 request.group_id,
                 request.provider,
@@ -1522,7 +1783,7 @@ class InventoryManager(Node):
             with self.lock:
                 self.generation += 1
             response.success = True
-            response.message = "Synchronization group saved in idle mode"
+            response.message = "Synchronization group saved"
             response.group = self._sync_group_message(
                 request.group_id, self.registry.inventory["sync_groups"][request.group_id]
             )
@@ -1534,8 +1795,9 @@ class InventoryManager(Node):
 
     def _delete_group(self, request, response):
         try:
-            if self.group_modes.get(request.group_id, self.default_group_mode) != "idle":
-                raise RegistryError("set the group to idle before deleting it")
+            group = self.registry.inventory["sync_groups"].get(request.group_id)
+            if group and self._cameras_capture_owned(group["members"]):
+                raise RegistryError("cannot delete a group while its cameras are in use")
             self.registry.delete_group(request.group_id)
             self.group_modes.pop(request.group_id, None)
             self.group_capture_intervals.pop(request.group_id, None)
@@ -1549,24 +1811,55 @@ class InventoryManager(Node):
             response.message = str(error)
         return response
 
-    async def _request_group_capture(
-        self, group_id: str, request_id: str, *, trigger_only: bool,
-        has_requested_time: bool = False, requested_time=None,
+    async def _wait_capture_target_ready(
+        self, target_kind: str, target_id: str, session_id: str,
+        timeout_sec: float = 60.0,
+    ) -> None:
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            with self.lock:
+                self._capture_session_for_target(session_id, target_kind, target_id)
+                if target_kind == "group":
+                    group = self.registry.inventory["sync_groups"].get(target_id)
+                    if group and self._sync_group_message(target_id, group).ready:
+                        return
+                else:
+                    sensor = self.runtime.get(target_id)
+                    if sensor and sensor.online and sensor.operating_mode == "preview":
+                        return
+            await asyncio.sleep(0.1)
+        raise RegistryError(f"timed out preparing {target_kind} {target_id}")
+
+    async def _request_capture(
+        self, target_kind: str, target_id: str, request_id: str, *, session_id: str,
+        trigger_only: bool, has_requested_time: bool = False, requested_time=None,
     ):
-        group = self.registry.inventory["sync_groups"].get(group_id)
-        if not group:
-            raise RegistryError(f"unknown sync group {group_id}")
-        if self.group_modes.get(group_id, self.default_group_mode) != "capture":
-            raise RegistryError("synchronization group is not in capture mode")
-        runtime_provider = self._runtime_group_provider(group)
+        with self.lock:
+            self._capture_session_for_target(session_id, target_kind, target_id)
+        if target_kind == "group":
+            group = self.registry.inventory["sync_groups"].get(target_id)
+            if not group:
+                raise RegistryError(f"unknown sync group {target_id}")
+            runtime_provider = self._runtime_group_provider(group)
+            members = list(group["members"])
+            missing_policy = group["missing_policy"]
+        elif target_kind == "sensor":
+            sensor = self.registry.inventory["sensors"].get(target_id)
+            if not sensor:
+                raise RegistryError(f"unknown enrolled sensor {target_id}")
+            runtime_provider = self._runtime_provider(sensor)
+            members = [target_id]
+            missing_policy = "strict"
+        else:
+            raise RegistryError("target_kind must be group or sensor")
         client = self.capture_clients[runtime_provider]
         if not client.wait_for_service(timeout_sec=3.0):
             raise RegistryError(f"provider {runtime_provider} is unavailable")
         provider_request = ProviderCapture.Request()
-        provider_request.group_id = group_id
+        provider_request.group_id = target_id
         provider_request.request_id = request_id
-        provider_request.member_ids = list(group["members"])
-        provider_request.missing_policy = group["missing_policy"]
+        provider_request.member_ids = members
+        provider_request.missing_policy = missing_policy
         provider_request.preferred_master_id = ""
         provider_request.trigger_only = trigger_only
         provider_request.has_requested_time = has_requested_time
@@ -1581,10 +1874,26 @@ class InventoryManager(Node):
             raise RegistryError(str(error)) from error
 
     async def _capture_group(self, request, response):
+        temporary_session = ""
         try:
-            provider_response = await self._request_group_capture(
-                request.group_id,
+            target_kind = request.target_kind or "group"
+            target_id = request.target_id or request.group_id
+            session_id = request.session_id
+            if not session_id:
+                with self.lock:
+                    temporary = self._create_capture_session(
+                        "temporary-capture", target_kind, [target_id], 0, False
+                    )
+                temporary_session = temporary["session_id"]
+                session_id = temporary_session
+                self._publish_state()
+            with self.lock:
+                self._capture_session_for_target(session_id, target_kind, target_id)
+            await self._wait_capture_target_ready(target_kind, target_id, session_id)
+            provider_response = await self._request_capture(
+                target_kind, target_id,
                 request.request_id,
+                session_id=session_id,
                 trigger_only=request.trigger_only,
                 has_requested_time=request.has_requested_time,
                 requested_time=request.requested_time,
@@ -1602,6 +1911,11 @@ class InventoryManager(Node):
         except (RegistryError, TimeoutError) as error:
             response.success = False
             response.message = str(error)
+        finally:
+            if temporary_session:
+                with self.lock:
+                    self._drop_capture_session(temporary_session)
+                self._publish_state()
         return response
 
     def _trigger_goal(self, goal_request):
@@ -1620,10 +1934,28 @@ class InventoryManager(Node):
         feedback.detail = "Arming grouped camera workers"
         feedback.progress_percent = 10
         goal_handle.publish_feedback(feedback)
+        temporary_session = ""
         try:
-            response = await self._request_group_capture(
-                goal_handle.request.group_id,
+            session_id = goal_handle.request.session_id
+            if not session_id:
+                with self.lock:
+                    temporary = self._create_capture_session(
+                        "temporary-trigger", "group", [goal_handle.request.group_id], 0, False
+                    )
+                temporary_session = temporary["session_id"]
+                session_id = temporary_session
+                self._publish_state()
+            with self.lock:
+                self._capture_session_for_target(
+                    session_id, "group", goal_handle.request.group_id
+                )
+            await self._wait_capture_target_ready(
+                "group", goal_handle.request.group_id, session_id
+            )
+            response = await self._request_capture(
+                "group", goal_handle.request.group_id,
                 goal_handle.request.request_id,
+                session_id=session_id,
                 trigger_only=True,
             )
             result.success = response.success
@@ -1648,6 +1980,11 @@ class InventoryManager(Node):
             result.success = False
             result.message = str(error)
             goal_handle.abort()
+        finally:
+            if temporary_session:
+                with self.lock:
+                    self._drop_capture_session(temporary_session)
+                self._publish_state()
         return result
 
 def main(args=None) -> None:

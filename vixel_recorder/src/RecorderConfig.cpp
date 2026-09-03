@@ -47,6 +47,9 @@ RecorderConfig load_recorder_config(const std::string & path)
     recording, "operation_capture_id_limit", result.operation_capture_id_limit);
   result.max_active_operations = read_or(
     recording, "max_active_operations", result.max_active_operations);
+  result.capture_session_ttl = std::chrono::milliseconds(read_or(
+      recording, "capture_session_ttl_ms",
+      static_cast<int>(result.capture_session_ttl.count())));
 
   YAML::Node gps(YAML::NodeType::Map);
   if (recording.IsDefined() && recording.IsMap()) {
@@ -84,6 +87,10 @@ RecorderConfig load_recorder_config(const std::string & path)
   }
   if (result.max_active_operations == 0 || result.max_active_operations > 256) {
     throw std::runtime_error("recording max_active_operations must be between 1 and 256");
+  }
+  if (result.capture_session_ttl < 5s || result.capture_session_ttl > 5min) {
+    throw std::runtime_error(
+            "recording capture_session_ttl_ms must be between 5000 and 300000");
   }
   if (result.gps_enabled && (result.gps_topic.empty() || result.gps_max_age.count() < 0)) {
     throw std::runtime_error("recording GPS topic/max_age_ms is invalid");

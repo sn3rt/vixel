@@ -1,6 +1,9 @@
 builtin_interfaces/Time stamp
 string operation_id
 string kind
+string session_id
+string target_kind
+string target_id
 string status
 string message
 string[] group_ids

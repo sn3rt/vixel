@@ -36,6 +36,7 @@ recording:
   operation_history_limit: 100
   operation_capture_id_limit: 100
   max_active_operations: 64
+  capture_session_ttl_ms: 15000
   gps:
     enabled: false
     topic: /fix
@@ -61,6 +62,11 @@ operation message while `capture_id_count` continues to report the total and
 manifests remain on disk. `max_active_operations` rejects new batches or
 sequences once that many operations are active, without disturbing work that
 is already running.
+
+`capture_session_ttl_ms` is the lease lifetime for ROS and HTTP capture owners.
+Active controllers renew before it expires; abandoned leases are discarded and
+the cameras return to the launch baseline. The supported range is 5000–300000
+ms.
 
 `sequence_prepare_timeout_ms` covers capture-mode configuration, camera
 restart, PTP relock, the first clean automatic-metering frame, and the final

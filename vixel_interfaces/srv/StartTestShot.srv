@@ -1,0 +1,7 @@
+string target_kind
+string target_id
+string request_id
+---
+bool accepted
+string message
+string operation_id

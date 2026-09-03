@@ -20,10 +20,17 @@ ssh -N -L 8080:127.0.0.1:8080 user@camera-host
 ```
 
 Open <http://127.0.0.1:8080>. The dashboard discovers camera cards dynamically,
-shows known and enrolled sensors, controls port modes and groups, and edits
-sensor metadata. Click an active camera preview to open its focused view at
+shows known and enrolled sensors, controls port modes and selections, and edits
+sensor metadata. It is an inspection and configuration surface: production
+capture is intentionally started by ROS or a client script, not by dashboard
+buttons. Camera and selection cards provide a saved **Test shot** for setup
+checks. Click an active camera preview to open its focused view at
 `/sensors/<sensor_id>`. That view keeps the latest cached frame visible while
 showing the same camera details and controls as the dashboard card.
+
+Archiving a camera is blocked while it belongs to any selection. Edit or delete
+those selections first; Vixel never silently changes selection membership as a
+side effect of archiving.
 
 Readiness endpoint:
 
@@ -100,8 +107,8 @@ timing and must not be interpreted as exposure skew. A grouped capture with two
 or more synchronized frames fails when its measured exposure skew exceeds the
 configured PTP tolerance; writing both files is not considered success.
 
-Use **Trigger and publish** for processing without writing files. Subscribe to
-each member's `image_raw` topic before triggering; the resulting images use the
+Use the trigger action for processing without writing files. Subscribe to each
+member's `image_raw` topic before triggering; the resulting images use the
 shared `scheduled_time` returned by the request for correlation:
 
 ```bash
@@ -125,8 +132,8 @@ exposure timestamps ahead of time, so PNG encoding and disk writes from earlier
 cycles do not delay later triggers. Trigger-only applications may still call the
 action at their own cadence.
 
-To persist a capture, put the group in capture mode and use **Capture and save**
-in the dashboard. A ROS client can invoke the same action:
+To persist a production capture, invoke the recorder action from a ROS node or
+client script:
 
 ```bash
 ros2 action send_goal /vixel/record_capture \
@@ -140,6 +147,9 @@ selecting the same cameras share an exposure at an identical target or are
 accepted only when their distinct targets meet the negotiated interval.
 Acquisition, PNG encoding, chunk transport, and
 disk persistence are separate pipeline stages bounded by configured limits.
+One-shot actions without a session ID automatically acquire a temporary capture
+session, wait for the target to become ready, and restore the configured idle or
+preview baseline afterward.
 
 The example clients expose both operations with the same mode names:
 
@@ -207,6 +217,47 @@ missing members, and synchronization status. Failed attempts are retained as
 `<capture_id>.failed` manifests for diagnosis. Vixel does not automatically
 delete captures.
 
+Dashboard test shots are saved separately below
+`/var/lib/vixel/captures/test-shots/YYYY/MM/DD/<capture_id>/`. A selection test
+uses the same PTP scheduled-action, acquisition, lossless PNG, and manifest path
+as production. A camera test captures only that camera. Tests take an exclusive
+session and are rejected when any selected camera is already owned by active
+capture work. Test results have `capture_kind=test_shot`; they are shown in a
+separate dashboard history and are never deleted automatically.
+
+## Capture sessions
+
+Long-running ROS controllers should acquire a lease before starting work,
+include its `session_id` in every trigger or record goal, renew it while active,
+and release it on shutdown. A session declares its sensor or selection targets,
+requested cadence, owner label, and whether it is exclusive. Expired leases are
+removed automatically, so crashed clients do not leave cameras stuck in capture
+mode. The manager then restores each camera to the launch baseline: preview when
+`web_preview:=true`, otherwise idle.
+
+The ROS services are `/vixel/acquire_capture_session`,
+`/vixel/renew_capture_session`, and `/vixel/release_capture_session`. Current
+leases are published on `/vixel/capture_sessions`. The HTTP equivalents are:
+
+```text
+POST   /api/v1/capture-sessions
+PATCH  /api/v1/capture-sessions/<session_id>
+DELETE /api/v1/capture-sessions/<session_id>
+GET    /api/v1/capture-sessions
+```
+
+For example, acquire a 250 ms lease for two selections and copy the returned
+`session.session_id` into subsequent trigger requests:
+
+```bash
+curl -X POST -H 'Content-Type: application/json' \
+  -d '{"owner_id":"machine-controller","target_kind":"group","target_ids":["front","back"],"requested_interval_ms":250,"exclusive":false}' \
+  http://127.0.0.1:8080/api/v1/capture-sessions
+```
+
+The periodic publish example manages this lifecycle automatically. Saved
+server-side sequences also own and renew their session internally.
+
 ## ROS interfaces
 
 Primary state topics:
@@ -217,6 +268,7 @@ Primary state topics:
 - `/vixel/sync_groups`
 - `/vixel/capture_records`
 - `/vixel/capture_operations`
+- `/vixel/capture_sessions`
 
 Per-camera topics:
 
@@ -241,6 +293,10 @@ cancellation use `/vixel/get_capture_operation` and
 `/vixel/cancel_capture_operation`. Caller
 metadata is stored as a JSON object in every resulting manifest. Optional GPS
 metadata is sampled without waiting for a fix.
+
+Dashboard test shots use `/vixel/start_test_shot`. They appear as asynchronous
+capture operations, so the browser remains responsive while cameras prepare and
+files are written.
 
 Control actions and services cover enrollment, placement resolution, operating
 mode, metadata, port mode, known-sensor maintenance, sync groups, capture, and

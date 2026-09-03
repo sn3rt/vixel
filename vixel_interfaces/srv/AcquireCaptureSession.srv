@@ -1,0 +1,9 @@
+string owner_id
+string target_kind
+string[] target_ids
+uint32 requested_interval_ms
+bool exclusive
+---
+bool success
+string message
+CaptureSession session

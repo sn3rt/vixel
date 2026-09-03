@@ -342,6 +342,22 @@ def test_archive_requires_explicit_reenrollment_and_purge_is_guarded(tmp_path):
     assert sensor_id not in registry.inventory["known_sensors"]
 
 
+def test_archive_requires_removing_sensor_from_sync_groups_first(tmp_path):
+    registry, _ = make_registry(tmp_path)
+    sensor_id = registry.enroll(
+        observation(), registry.allocate("left"), "Front camera", "front_left"
+    )
+    registry.upsert_group(
+        "front", "lucid", [sensor_id], "strict", "Action0", 2.0, ""
+    )
+
+    with pytest.raises(RegistryError, match="remove it from those groups"):
+        registry.forget(sensor_id)
+
+    assert sensor_id in registry.inventory["sensors"]
+    assert registry.inventory["sync_groups"]["front"]["members"] == [sensor_id]
+
+
 def test_known_sensor_notes_and_provider_settings_round_trip(tmp_path):
     registry, inventory_path = make_registry(tmp_path)
     registry.record_observation(

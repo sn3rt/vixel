@@ -31,21 +31,26 @@ from vixel_interfaces.action import (
 from vixel_interfaces.msg import (
     CaptureOperationArray,
     CaptureRecordArray,
+    CaptureSessionArray,
     KnownSensorArray,
     ManagedPortArray,
     SensorArray,
     SyncGroupArray,
 )
 from vixel_interfaces.srv import (
+    AcquireCaptureSession,
     CancelCaptureOperation,
     DeleteSyncGroup,
     ForgetSensor,
     GetCaptureOperation,
     PrepareCaptureGroups,
     PurgeKnownSensor,
+    ReleaseCaptureSession,
+    RenewCaptureSession,
     SetOperatingMode,
     SetPortMode,
     StartCaptureSequence,
+    StartTestShot,
     SubmitCaptureBatch,
     UpdateSensorMetadata,
     UpdateKnownSensor,
@@ -285,6 +290,9 @@ def capture_record_to_dict(record) -> dict[str, Any]:
         "metadata": _json_value(getattr(record, "metadata_json", ""), {}),
         "capture_timings": _json_value(getattr(record, "timings_json", ""), {}),
         "group_id": record.group_id,
+        "capture_kind": getattr(record, "capture_kind", "production"),
+        "target_kind": getattr(record, "target_kind", "group"),
+        "target_id": getattr(record, "target_id", record.group_id),
         "status": record.status,
         "directory": record.directory,
         "message": record.message,
@@ -317,6 +325,9 @@ def capture_operation_to_dict(operation) -> dict[str, Any]:
     return {
         "operation_id": operation.operation_id,
         "kind": operation.kind,
+        "session_id": getattr(operation, "session_id", ""),
+        "target_kind": getattr(operation, "target_kind", ""),
+        "target_id": getattr(operation, "target_id", ""),
         "status": operation.status,
         "message": operation.message,
         "group_ids": list(operation.group_ids),
@@ -341,6 +352,25 @@ def capture_operation_to_dict(operation) -> dict[str, Any]:
         "interval_ms": int(operation.interval_ms),
         "synchronize_groups": bool(operation.synchronize_groups),
         "metadata": _json_value(operation.metadata_json, {}),
+    }
+
+
+def capture_session_to_dict(session) -> dict[str, Any]:
+    return {
+        "session_id": session.session_id,
+        "owner_id": session.owner_id,
+        "target_kind": session.target_kind,
+        "target_ids": list(session.target_ids),
+        "group_ids": list(session.group_ids),
+        "sensor_ids": list(session.sensor_ids),
+        "requested_interval_ms": int(session.requested_interval_ms),
+        "exclusive": bool(session.exclusive),
+        "status": session.status,
+        "message": session.message,
+        "expires_at": {
+            "sec": session.expires_at.sec,
+            "nanosec": session.expires_at.nanosec,
+        },
     }
 
 
@@ -382,6 +412,7 @@ class GatewayNode(Node):
         )
         self.max_active_operations = int(recording_settings["max_active_operations"])
         self.capture_operations: dict[str, dict[str, Any]] = {}
+        self.capture_sessions: dict[str, dict[str, Any]] = {}
         self.capture_records: list[dict[str, Any]] = []
         self.frames: dict[
             str, tuple[bytes, float, int] | tuple[bytes, float, int, str]
@@ -411,6 +442,10 @@ class GatewayNode(Node):
             CaptureOperationArray, "/vixel/capture_operations", self._capture_operations,
             STATE_QOS, callback_group=self.callback_group
         )
+        self.capture_sessions_subscription = self.create_subscription(
+            CaptureSessionArray, "/vixel/capture_sessions", self._capture_sessions,
+            STATE_QOS, callback_group=self.callback_group
+        )
         self.enroll_client = ActionClient(
             self, EnrollSensor, "/vixel/enroll_sensor", callback_group=self.callback_group
         )
@@ -438,6 +473,18 @@ class GatewayNode(Node):
             PrepareCaptureGroups, "/vixel/prepare_capture_groups",
             callback_group=self.callback_group
         )
+        self.acquire_capture_session_client = self.create_client(
+            AcquireCaptureSession, "/vixel/acquire_capture_session",
+            callback_group=self.callback_group
+        )
+        self.renew_capture_session_client = self.create_client(
+            RenewCaptureSession, "/vixel/renew_capture_session",
+            callback_group=self.callback_group
+        )
+        self.release_capture_session_client = self.create_client(
+            ReleaseCaptureSession, "/vixel/release_capture_session",
+            callback_group=self.callback_group
+        )
         self.port_mode_client = self.create_client(
             SetPortMode, "/vixel/set_port_mode", callback_group=self.callback_group
         )
@@ -457,6 +504,9 @@ class GatewayNode(Node):
         self.start_capture_sequence_client = self.create_client(
             StartCaptureSequence, "/vixel/start_capture_sequence",
             callback_group=self.callback_group
+        )
+        self.start_test_shot_client = self.create_client(
+            StartTestShot, "/vixel/start_test_shot", callback_group=self.callback_group
         )
         self.get_capture_operation_client = self.create_client(
             GetCaptureOperation, "/vixel/get_capture_operation",
@@ -549,6 +599,15 @@ class GatewayNode(Node):
             }
             self.changed.notify_all()
 
+    def _capture_sessions(self, message: CaptureSessionArray):
+        with self.changed:
+            self.generation = max(self.generation + 1, int(message.generation))
+            self.capture_sessions = {
+                session.session_id: capture_session_to_dict(session)
+                for session in message.sessions
+            }
+            self.changed.notify_all()
+
     def _frame(self, sensor_id: str, message: CompressedImage):
         image_format = message.format.lower()
         if "png" in image_format:
@@ -578,6 +637,7 @@ class GatewayNode(Node):
                 "ports": list(self.ports.values()),
                 "operations": list(self.operations.values()),
                 "capture_operations": list(self.capture_operations.values()),
+                "capture_sessions": list(self.capture_sessions.values()),
                 "capture_records": list(self.capture_records),
             }
 
@@ -698,6 +758,7 @@ class GatewayNode(Node):
         goal = RecordCapture.Goal()
         goal.group_id = group_id
         goal.request_id = str(body.get("request_id", ""))
+        goal.session_id = str(body.get("session_id", ""))
         handle = self.wait_future(
             self.record_capture_client.send_goal_async(goal), 5.0
         )
@@ -794,6 +855,72 @@ class GatewayNode(Node):
             },
         }
 
+    def start_test_shot(self, body: dict[str, Any]):
+        target_kind = str(body.get("target_kind", ""))
+        target_id = str(body.get("target_id", ""))
+        if target_kind not in {"sensor", "group"} or not target_id:
+            raise ValueError("test shot requires target_kind sensor|group and target_id")
+        request = StartTestShot.Request()
+        request.target_kind = target_kind
+        request.target_id = target_id
+        request.request_id = str(body.get("request_id", ""))
+        response = self.call_service(self.start_test_shot_client, request)
+        if not response.accepted:
+            raise RuntimeError(response.message)
+        return {
+            "accepted": True,
+            "message": response.message,
+            "operation_id": response.operation_id,
+        }
+
+    def acquire_capture_session(self, body: dict[str, Any]):
+        target_kind = str(body.get("target_kind", ""))
+        target_ids = body.get("target_ids", [])
+        if target_kind not in {"sensor", "group"}:
+            raise ValueError("capture session target_kind must be sensor or group")
+        if (
+            not isinstance(target_ids, list) or not target_ids
+            or not all(isinstance(value, str) and value for value in target_ids)
+        ):
+            raise ValueError("capture session target_ids must be a non-empty string array")
+        interval_ms = int(body.get("requested_interval_ms", 0))
+        if interval_ms < 0 or interval_ms > 0xFFFFFFFF:
+            raise ValueError("requested_interval_ms must be a non-negative 32-bit integer")
+        request = AcquireCaptureSession.Request()
+        request.owner_id = str(body.get("owner_id", "http-client"))
+        request.target_kind = target_kind
+        request.target_ids = target_ids
+        request.requested_interval_ms = interval_ms
+        request.exclusive = bool(body.get("exclusive", False))
+        response = self.call_service(self.acquire_capture_session_client, request)
+        if not response.success:
+            raise RuntimeError(response.message)
+        return {
+            "success": True,
+            "message": response.message,
+            "session": capture_session_to_dict(response.session),
+        }
+
+    def renew_capture_session(self, session_id: str):
+        request = RenewCaptureSession.Request()
+        request.session_id = session_id
+        response = self.call_service(self.renew_capture_session_client, request)
+        if not response.success:
+            raise RuntimeError(response.message)
+        return {
+            "success": True,
+            "message": response.message,
+            "session": capture_session_to_dict(response.session),
+        }
+
+    def release_capture_session(self, session_id: str):
+        request = ReleaseCaptureSession.Request()
+        request.session_id = session_id
+        response = self.call_service(self.release_capture_session_client, request)
+        if not response.success:
+            raise RuntimeError(response.message)
+        return {"success": True, "message": response.message}
+
     def cancel_capture_operation(self, operation_id: str):
         request = CancelCaptureOperation.Request()
         request.operation_id = operation_id
@@ -824,6 +951,7 @@ class GatewayNode(Node):
         goal = TriggerGroup.Goal()
         goal.group_id = group_id
         goal.request_id = str(body.get("request_id", ""))
+        goal.session_id = str(body.get("session_id", ""))
         handle = self.wait_future(
             self.trigger_group_client.send_goal_async(goal), 5.0
         )
@@ -1143,6 +1271,12 @@ class Handler(BaseHTTPRequestHandler):
                 "generation": snapshot["generation"],
                 "capture_operations": snapshot["capture_operations"],
             })
+        elif parsed.path == "/api/v1/capture-sessions":
+            snapshot = self.server.node.snapshot()
+            self._json(HTTPStatus.OK, {
+                "generation": snapshot["generation"],
+                "capture_sessions": snapshot["capture_sessions"],
+            })
         elif len(parts) == 4 and parts[:3] == ["api", "v1", "capture-operations"]:
             try:
                 self._json(
@@ -1240,6 +1374,7 @@ class Handler(BaseHTTPRequestHandler):
                     request = PrepareCaptureGroups.Request()
                     request.group_ids = [target_id]
                     request.interval_ms = interval_ms
+                    request.owner_id = "legacy-http-mode"
                     response = node.call_service(node.prepare_capture_groups_client, request)
                     success = response.accepted
                 else:
@@ -1249,7 +1384,22 @@ class Handler(BaseHTTPRequestHandler):
                     request.mode = mode
                     response = node.call_service(node.mode_client, request)
                     success = response.success
-                self._json(HTTPStatus.OK, {"success": success, "message": response.message})
+                result = {"success": success, "message": response.message}
+                if isinstance(response, PrepareCaptureGroups.Response):
+                    result["session_id"] = response.session_id
+                self._json(HTTPStatus.OK, result)
+            elif method == "POST" and parsed.path == "/api/v1/capture-sessions":
+                self._json(HTTPStatus.CREATED, node.acquire_capture_session(body))
+            elif (
+                method == "PATCH" and len(parts) == 4
+                and parts[:3] == ["api", "v1", "capture-sessions"]
+            ):
+                self._json(HTTPStatus.OK, node.renew_capture_session(parts[3]))
+            elif (
+                method == "DELETE" and len(parts) == 4
+                and parts[:3] == ["api", "v1", "capture-sessions"]
+            ):
+                self._json(HTTPStatus.OK, node.release_capture_session(parts[3]))
             elif method == "PUT" and len(parts) == 5 and parts[:3] == ["api", "v1", "ports"] and parts[4] == "mode":
                 self._json(HTTPStatus.OK, node.set_port_mode(parts[3], body))
             elif method == "PUT" and len(parts) == 4 and parts[:3] == ["api", "v1", "groups"]:
@@ -1276,6 +1426,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.ACCEPTED, node.submit_capture_batch(body))
             elif method == "POST" and parsed.path == "/api/v1/capture-operations/sequence":
                 self._json(HTTPStatus.ACCEPTED, node.start_capture_sequence(body))
+            elif method == "POST" and parsed.path == "/api/v1/test-shots":
+                self._json(HTTPStatus.ACCEPTED, node.start_test_shot(body))
             elif (
                 method == "POST" and len(parts) == 5
                 and parts[:3] == ["api", "v1", "capture-operations"]

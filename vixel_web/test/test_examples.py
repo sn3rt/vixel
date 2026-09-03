@@ -230,7 +230,7 @@ def test_periodic_sequence_uses_server_managed_cadence(monkeypatch):
     assert captured["body"]["synchronize_groups"] is True
 
 
-def test_periodic_example_sets_capture_mode_and_waits_until_groups_are_ready(monkeypatch):
+def test_periodic_example_acquires_session_and_waits_until_groups_are_ready(monkeypatch):
     example = load_example("http_trigger_groups_periodic")
     calls = []
     group_snapshots = iter([
@@ -265,6 +265,8 @@ def test_periodic_example_sets_capture_mode_and_waits_until_groups_are_ready(mon
 
     def request(base_url, path, timeout, body=None):
         calls.append((base_url, path, timeout, body))
+        if path == "/api/v1/capture-sessions":
+            return {"success": True, "session": {"session_id": "session_1"}}
         if path == "/api/v1/groups":
             return next(group_snapshots)
         return {"success": True}
@@ -272,15 +274,32 @@ def test_periodic_example_sets_capture_mode_and_waits_until_groups_are_ready(mon
     monkeypatch.setattr(example, "api_request", request)
     monkeypatch.setattr(example.time, "sleep", lambda _seconds: None)
 
-    example.prepare_capture_groups(
+    session_id = example.prepare_capture_groups(
         "http://127.0.0.1:8080", ["front", "back"], 5.0, 10.0, 5.0
     )
 
-    mode_calls = [call for call in calls if call[1] == "/api/v1/mode"]
-    assert [call[3]["target_id"] for call in mode_calls] == ["front", "back"]
-    assert all(call[3]["mode"] == "capture" for call in mode_calls)
-    assert all(call[3]["capture_interval_ms"] == 5000 for call in mode_calls)
+    session_calls = [call for call in calls if call[1] == "/api/v1/capture-sessions"]
+    assert session_id == "session_1"
+    assert len(session_calls) == 1
+    assert session_calls[0][3]["target_ids"] == ["front", "back"]
+    assert session_calls[0][3]["requested_interval_ms"] == 5000
     assert len([call for call in calls if call[1] == "/api/v1/groups"]) == 3
+
+
+def test_periodic_example_passes_session_to_each_group_request():
+    example = load_example("http_trigger_groups_periodic")
+    calls = []
+
+    def request(*args):
+        calls.append(args)
+        return {"scheduled_time": {"sec": 1, "nanosec": 0}}
+
+    example.trigger_cycle(
+        ["front", "back"], "http://127.0.0.1:8080", 5.0, 1,
+        "publish", request, "periodic", "session_1",
+    )
+
+    assert {call[-1] for call in calls} == {"session_1"}
 
 
 def test_periodic_monitor_prints_terminal_failure_message(monkeypatch, capsys):

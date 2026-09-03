@@ -22,6 +22,7 @@ recording:
   EXPECT_EQ(config.minimum_free_bytes, 5368709120ULL);
   EXPECT_EQ(config.sequence_dispatch_lead, std::chrono::milliseconds(175));
   EXPECT_EQ(config.sequence_prepare_timeout, std::chrono::milliseconds(45000));
+  EXPECT_EQ(config.capture_session_ttl, std::chrono::milliseconds(15000));
   EXPECT_EQ(config.operation_history_limit, 100U);
   EXPECT_EQ(config.operation_capture_id_limit, 100U);
   EXPECT_EQ(config.max_active_operations, 64U);
@@ -38,6 +39,7 @@ TEST(RecorderConfig, UsesDefaultsWithoutRecordingSection)
 
   const auto config = vixel_recorder::load_recorder_config(path.string());
   EXPECT_EQ(config.root_directory, "/var/lib/vixel/captures");
+  EXPECT_EQ(config.capture_session_ttl, std::chrono::milliseconds(15000));
   EXPECT_FALSE(config.gps_enabled);
   std::filesystem::remove(path);
 }

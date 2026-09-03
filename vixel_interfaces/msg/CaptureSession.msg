@@ -1,0 +1,12 @@
+builtin_interfaces/Time stamp
+string session_id
+string owner_id
+string target_kind
+string[] target_ids
+string[] group_ids
+string[] sensor_ids
+uint32 requested_interval_ms
+bool exclusive
+string status
+string message
+builtin_interfaces/Time expires_at

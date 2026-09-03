@@ -8,6 +8,7 @@ import pytest
 from vixel_web.gateway import (
     capture_operation_to_dict,
     capture_record_to_dict,
+    capture_session_to_dict,
     GatewayNode,
     group_to_dict,
     Handler,
@@ -117,6 +118,23 @@ def test_capture_operation_is_exposed_as_json():
     assert value["capture_id_count"] == 8
     assert value["capture_ids_truncated"] is True
     assert value["metadata"] == {"job": "test"}
+
+
+def test_capture_session_is_exposed_as_json():
+    session = SimpleNamespace(
+        session_id="session_1", owner_id="machine-controller",
+        target_kind="group", target_ids=["front"], group_ids=["front"],
+        sensor_ids=["left", "right"], requested_interval_ms=250,
+        exclusive=False, status="active", message="capture session active",
+        expires_at=SimpleNamespace(sec=12, nanosec=34),
+    )
+
+    value = capture_session_to_dict(session)
+
+    assert value["session_id"] == "session_1"
+    assert value["sensor_ids"] == ["left", "right"]
+    assert value["requested_interval_ms"] == 250
+    assert value["expires_at"] == {"sec": 12, "nanosec": 34}
 
 
 def test_gateway_keeps_only_recent_terminal_operations():
@@ -301,6 +319,29 @@ def test_capture_timeout_returns_gateway_timeout_status():
     Handler(connection, ("127.0.0.1", 12345), SimpleNamespace(node=node))
 
     assert bytes(connection.response).startswith(b"HTTP/1.1 504 Gateway Timeout\r\n")
+
+
+def test_capture_session_http_endpoint_forwards_lease_request():
+    captured = {}
+    node = SimpleNamespace(
+        acquire_capture_session=lambda body: captured.update(body) or {
+            "success": True,
+            "session": {"session_id": "session_1"},
+        },
+        get_logger=lambda: _Logger(),
+    )
+    body = b'{"target_kind":"group","target_ids":["front"]}'
+    request = (
+        b"POST /api/v1/capture-sessions HTTP/1.1\r\n"
+        b"Host: localhost\r\nContent-Type: application/json\r\nContent-Length: 46\r\n\r\n"
+        + body
+    )
+    connection = _HTTPConnection(request)
+
+    Handler(connection, ("127.0.0.1", 12345), SimpleNamespace(node=node))
+
+    assert bytes(connection.response).startswith(b"HTTP/1.1 201 Created\r\n")
+    assert captured == {"target_kind": "group", "target_ids": ["front"]}
 
 
 def test_http_connection_limit_returns_503_without_starting_handler_thread():

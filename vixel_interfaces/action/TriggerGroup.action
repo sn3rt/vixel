@@ -1,5 +1,6 @@
 string group_id
 string request_id
+string session_id
 ---
 bool success
 string message

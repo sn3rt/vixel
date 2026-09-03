@@ -18,9 +18,10 @@ def test_dashboard_is_dynamic_and_uses_gateway_endpoints():
     assert "Unenroll and archive" in page
     assert "front_left" not in page
     assert "web_video_server" not in page
-    assert "Capture and save" in page
-    assert "Trigger and publish" in page
-    assert "/trigger" in page
+    assert "Test shot" in page
+    assert "Capture and save" not in page
+    assert "Trigger and publish" not in page
+    assert "'/api/v1/test-shots'" in page
     assert 'name="trigger_source"' not in page
     assert "PTP synchronized" in page
     assert "Waiting for PTP lock" in page
@@ -29,16 +30,25 @@ def test_dashboard_is_dynamic_and_uses_gateway_endpoints():
 
 def test_dashboard_javascript_parses():
     node = shutil.which("node")
-    assert node is not None, "nodejs is required to validate dashboard JavaScript"
     page = PAGE.read_text()
     script = page.split("<script>", 1)[1].split("</script>", 1)[0]
-    result = subprocess.run(
-        [node, "--check"],
-        check=False,
-        capture_output=True,
-        input=script,
-        text=True,
-    )
+    if node is not None:
+        result = subprocess.run(
+            [node, "--check"],
+            check=False,
+            capture_output=True,
+            input=script,
+            text=True,
+        )
+    else:
+        gjs = shutil.which("gjs")
+        assert gjs is not None, "nodejs or gjs is required to validate dashboard JavaScript"
+        result = subprocess.run(
+            [gjs, "-c", "new Function(ARGV[0]);", script],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
     assert result.returncode == 0, result.stderr
 
 
@@ -64,7 +74,19 @@ def test_dashboard_links_previews_to_a_focused_camera_view():
     assert ".detail-preview { width:100%; max-height:none" in page
     assert "detailSensorId" in page
     assert "sensorDetail(sensor)" in page
-    assert "Preview inactive — showing the last received frame when available." in page
+    assert "Showing the last received frame when available." in page
+
+
+def test_dashboard_hides_manual_modes_and_separates_test_shot_history():
+    page = PAGE.read_text()
+    assert "controls('sensor'" not in page
+    assert "controls('group'" not in page
+    assert ">Snapshot</a>" not in page
+    assert "Open snapshot" not in page
+    assert 'id="capture-sessions"' in page
+    assert 'id="test-shots"' in page
+    assert "capture_kind==='test_shot'" in page
+    assert "Remove from groups first" in page
 
 
 def test_dashboard_uses_bounded_snapshot_polling_for_camera_cards():

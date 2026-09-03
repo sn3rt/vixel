@@ -18,9 +18,13 @@
 #include <vixel_interfaces/msg/sensor_array.hpp>
 #include <vixel_interfaces/msg/sync_group_array.hpp>
 #include <vixel_interfaces/srv/capture_group.hpp>
+#include <vixel_interfaces/srv/acquire_capture_session.hpp>
 #include <vixel_interfaces/srv/cancel_capture_operation.hpp>
 #include <vixel_interfaces/srv/get_capture_operation.hpp>
 #include <vixel_interfaces/srv/prepare_capture_groups.hpp>
+#include <vixel_interfaces/srv/release_capture_session.hpp>
+#include <vixel_interfaces/srv/renew_capture_session.hpp>
+#include <vixel_interfaces/srv/start_test_shot.hpp>
 #include <vixel_interfaces/srv/start_capture_sequence.hpp>
 #include <vixel_interfaces/srv/submit_capture_batch.hpp>
 
@@ -58,9 +62,13 @@ namespace vixel_recorder
 namespace
 {
 using CaptureGroup = vixel_interfaces::srv::CaptureGroup;
+using AcquireCaptureSession = vixel_interfaces::srv::AcquireCaptureSession;
 using CaptureRecord = vixel_interfaces::msg::CaptureRecord;
 using CaptureOperation = vixel_interfaces::msg::CaptureOperation;
 using PrepareCaptureGroups = vixel_interfaces::srv::PrepareCaptureGroups;
+using ReleaseCaptureSession = vixel_interfaces::srv::ReleaseCaptureSession;
+using RenewCaptureSession = vixel_interfaces::srv::RenewCaptureSession;
+using StartTestShot = vixel_interfaces::srv::StartTestShot;
 using RecordCapture = vixel_interfaces::action::RecordCapture;
 using GoalHandle = rclcpp_action::ServerGoalHandle<RecordCapture>;
 using ClientGoalHandle = rclcpp_action::ClientGoalHandle<RecordCapture>;
@@ -73,6 +81,9 @@ struct OperationState
   bool cancelled_by_user{false};
   bool scheduling_done{false};
   bool terminal_recorded{false};
+  bool session_released{false};
+  std::size_t expected_results_per_cycle{0};
+  std::chrono::steady_clock::time_point last_session_renewal{};
   std::map<std::uint32_t, std::size_t> cycle_results;
   std::map<std::uint32_t, std::size_t> cycle_failures;
 };
@@ -308,6 +319,12 @@ public:
     capture_client_ = create_client<CaptureGroup>("/vixel/capture_group");
     prepare_capture_groups_client_ = create_client<PrepareCaptureGroups>(
       "/vixel/prepare_capture_groups");
+    acquire_capture_session_client_ = create_client<AcquireCaptureSession>(
+      "/vixel/acquire_capture_session");
+    renew_capture_session_client_ = create_client<RenewCaptureSession>(
+      "/vixel/renew_capture_session");
+    release_capture_session_client_ = create_client<ReleaseCaptureSession>(
+      "/vixel/release_capture_session");
     capture_callback_group_ = create_callback_group(
       rclcpp::CallbackGroupType::Reentrant);
     records_publisher_ = create_publisher<vixel_interfaces::msg::CaptureRecordArray>(
@@ -330,6 +347,11 @@ public:
       "/vixel/start_capture_sequence",
       std::bind(
         &CaptureRecorder::start_capture_sequence, this, std::placeholders::_1,
+        std::placeholders::_2));
+    start_test_shot_service_ = create_service<StartTestShot>(
+      "/vixel/start_test_shot",
+      std::bind(
+        &CaptureRecorder::start_test_shot, this, std::placeholders::_1,
         std::placeholders::_2));
     get_operation_service_ = create_service<vixel_interfaces::srv::GetCaptureOperation>(
       "/vixel/get_capture_operation",
@@ -356,6 +378,7 @@ public:
     action_server_.reset();
     submit_batch_service_.reset();
     start_sequence_service_.reset();
+    start_test_shot_service_.reset();
     get_operation_service_.reset();
     cancel_operation_service_.reset();
     {
@@ -490,6 +513,104 @@ private:
     return std::nullopt;
   }
 
+  std::string acquire_capture_session(
+    const std::string & owner_id, const std::string & target_kind,
+    const std::vector<std::string> & target_ids, std::uint32_t interval_ms,
+    bool exclusive)
+  {
+    if (!acquire_capture_session_client_->wait_for_service(2s)) {
+      throw std::runtime_error("capture session service is unavailable");
+    }
+    auto request = std::make_shared<AcquireCaptureSession::Request>();
+    request->owner_id = owner_id;
+    request->target_kind = target_kind;
+    request->target_ids = target_ids;
+    request->requested_interval_ms = interval_ms;
+    request->exclusive = exclusive;
+    auto future = acquire_capture_session_client_->async_send_request(request);
+    if (future.wait_for(5s) != std::future_status::ready) {
+      throw std::runtime_error("timed out acquiring capture session");
+    }
+    const auto response = future.get();
+    if (!response->success) {throw std::runtime_error(response->message);}
+    return response->session.session_id;
+  }
+
+  void release_capture_session(const std::string & session_id)
+  {
+    if (session_id.empty() || !release_capture_session_client_->service_is_ready()) {return;}
+    auto request = std::make_shared<ReleaseCaptureSession::Request>();
+    request->session_id = session_id;
+    release_capture_session_client_->async_send_request(request);
+  }
+
+  bool renew_capture_session_id(const std::string & session_id)
+  {
+    if (session_id.empty()) {return true;}
+    if (!renew_capture_session_client_->wait_for_service(1s)) {return false;}
+    auto request = std::make_shared<RenewCaptureSession::Request>();
+    request->session_id = session_id;
+    auto future = renew_capture_session_client_->async_send_request(request);
+    return future.wait_for(2s) == std::future_status::ready && future.get()->success;
+  }
+
+  bool renew_capture_session(OperationState & operation)
+  {
+    if (operation.value.session_id.empty()) {return true;}
+    const auto now = std::chrono::steady_clock::now();
+    const auto renewal_period = std::max(1000ms, config_.capture_session_ttl / 3);
+    if (operation.last_session_renewal != std::chrono::steady_clock::time_point{} &&
+      now - operation.last_session_renewal < renewal_period)
+    {
+      return true;
+    }
+    if (!renew_capture_session_id(operation.value.session_id)) {return false;}
+    operation.last_session_renewal = now;
+    return true;
+  }
+
+  bool capture_target_ready(
+    const std::string & target_kind, const std::string & target_id,
+    std::vector<std::string> * selected = nullptr)
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    if (target_kind == "sensor") {
+      const auto sensor = sensors_.find(target_id);
+      if (sensor == sensors_.end()) {return false;}
+      if (selected) {*selected = {target_id};}
+      return sensor->second.online && sensor->second.operating_mode == "preview";
+    }
+    const auto group = groups_.find(target_id);
+    if (group == groups_.end()) {return false;}
+    if (selected) {*selected = group->second.member_ids;}
+    return group->second.operating_mode == "capture" && group->second.ready;
+  }
+
+  void wait_for_capture_target(
+    const std::string & target_kind, const std::string & target_id,
+    const std::string & session_id, const std::shared_ptr<GoalHandle> & handle)
+  {
+    const auto deadline = std::chrono::steady_clock::now() + config_.sequence_prepare_timeout;
+    const auto renewal_period = std::max(1000ms, config_.capture_session_ttl / 3);
+    auto next_renewal = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (handle->is_canceling() || shutdown_requested()) {
+        throw std::runtime_error(
+                shutdown_requested() ? "recorder is shutting down" : "capture cancelled");
+      }
+      if (std::chrono::steady_clock::now() >= next_renewal) {
+        if (!renew_capture_session_id(session_id)) {
+          throw std::runtime_error("capture session expired while preparing target");
+        }
+        next_renewal = std::chrono::steady_clock::now() + renewal_period;
+      }
+      if (capture_target_ready(target_kind, target_id)) {return;}
+      std::unique_lock<std::mutex> lock(state_mutex_);
+      state_changed_.wait_for(lock, 100ms);
+    }
+    throw std::runtime_error("timed out preparing " + target_kind + " " + target_id);
+  }
+
   std::optional<std::string> validate_sequence_interval(
     const std::vector<std::string> & group_ids, std::uint32_t interval_ms)
   {
@@ -553,6 +674,7 @@ private:
     operation->value.synchronize_groups = synchronize_groups;
     operation->value.metadata_json = metadata_json;
     operation->value.first_scheduled_time = first_time;
+    operation->expected_results_per_cycle = group_ids.size();
     operation->request_prefix = request_id.empty() ? operation->value.operation_id : request_id;
     {
       std::lock_guard<std::mutex> lock(operations_mutex_);
@@ -655,6 +777,106 @@ private:
     }
   }
 
+  void start_test_shot(
+    const std::shared_ptr<StartTestShot::Request> request,
+    std::shared_ptr<StartTestShot::Response> response)
+  {
+    if (request->target_kind != "sensor" && request->target_kind != "group") {
+      response->accepted = false;
+      response->message = "target_kind must be sensor or group";
+      return;
+    }
+    if (request->target_id.empty() ||
+      (!request->request_id.empty() && !safe_identifier(request->request_id)))
+    {
+      response->accepted = false;
+      response->message = "target and request ID must be valid";
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      const bool exists = request->target_kind == "sensor" ?
+        sensors_.count(request->target_id) != 0 : groups_.count(request->target_id) != 0;
+      if (!exists) {
+        response->accepted = false;
+        response->message = "unknown " + request->target_kind + " " + request->target_id;
+        return;
+      }
+    }
+    const std::vector<std::string> groups = request->target_kind == "group" ?
+      std::vector<std::string>{request->target_id} : std::vector<std::string>{};
+    auto operation = create_operation(
+      "test_shot", groups, request->request_id, 1, 0, true, "{}",
+      builtin_interfaces::msg::Time{});
+    if (!operation) {
+      response->accepted = false;
+      response->message = "recorder reached the active operation limit";
+      return;
+    }
+    operation->value.target_kind = request->target_kind;
+    operation->value.target_id = request->target_id;
+    operation->expected_results_per_cycle = 1;
+    response->accepted = true;
+    response->message = "test shot accepted";
+    response->operation_id = operation->value.operation_id;
+    if (!start_worker([this, operation]() {schedule_test_shot(operation);})) {
+      fail_sequence_preparation(operation, "recorder is shutting down");
+      response->accepted = false;
+      response->message = "recorder is shutting down";
+    }
+  }
+
+  void schedule_test_shot(const std::shared_ptr<OperationState> & operation)
+  {
+    if (!operation_capture_client_->wait_for_action_server(2s)) {
+      fail_sequence_preparation(operation, "capture action server is unavailable");
+      return;
+    }
+    RecordCapture::Goal goal;
+    goal.group_id = operation->value.target_kind == "group" ?
+      operation->value.target_id : "";
+    goal.request_id = operation->request_prefix;
+    goal.operation_id = operation->value.operation_id;
+    goal.cycle = 1;
+    goal.capture_kind = "test_shot";
+    goal.target_kind = operation->value.target_kind;
+    goal.target_id = operation->value.target_id;
+    goal.metadata_json = "{}";
+    {
+      std::lock_guard<std::mutex> lock(operations_mutex_);
+      operation->value.status = "preparing";
+      operation->value.message = "preparing saved test shot";
+      operation->value.scheduled_cycles = 1;
+      operation->value.pending_saves = 1;
+      append_bounded_capture_id(
+        operation->value, goal.request_id, config_.operation_capture_id_limit);
+      operation->scheduling_done = true;
+      ++operations_generation_;
+    }
+    publish_operations();
+    rclcpp_action::Client<RecordCapture>::SendGoalOptions options;
+    options.goal_response_callback =
+      [this, operation](const ClientGoalHandle::SharedPtr & handle) {
+        if (!handle) {
+          capture_finished(operation, 1, false, "test shot action rejected");
+        } else {
+          remember_operation_goal(handle);
+        }
+      };
+    options.result_callback =
+      [this, operation](const ClientGoalHandle::WrappedResult & result) {
+        const bool success = result.code == rclcpp_action::ResultCode::SUCCEEDED &&
+          result.result && result.result->success;
+        const auto message = result.result ? result.result->message : "test shot failed";
+        capture_finished(operation, 1, success, message);
+      };
+    try {
+      operation_capture_client_->async_send_goal(goal, options);
+    } catch (const std::exception & error) {
+      capture_finished(operation, 1, false, error.what());
+    }
+  }
+
   void fail_sequence_preparation(
     const std::shared_ptr<OperationState> & operation, const std::string & message)
   {
@@ -681,6 +903,7 @@ private:
     auto request = std::make_shared<PrepareCaptureGroups::Request>();
     request->group_ids = operation->value.group_ids;
     request->interval_ms = operation->value.interval_ms;
+    request->owner_id = operation->value.operation_id;
     auto future = prepare_capture_groups_client_->async_send_request(request);
     const auto response_deadline = std::chrono::steady_clock::now() + 5s;
     while (future.wait_for(100ms) != std::future_status::ready &&
@@ -697,6 +920,12 @@ private:
     if (!response->accepted) {
       fail_sequence_preparation(operation, response->message);
       return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(operations_mutex_);
+      operation->value.session_id = response->session_id;
+      operation->last_session_renewal = std::chrono::steady_clock::now();
+      ++operations_generation_;
     }
 
     const auto deadline = std::chrono::steady_clock::now() + config_.sequence_prepare_timeout;
@@ -716,6 +945,10 @@ private:
       if (stopped) {
         fail_sequence_preparation(
           operation, cancelled ? "sequence cancelled during preparation" : stopped_message);
+        return;
+      }
+      if (!renew_capture_session(*operation)) {
+        fail_sequence_preparation(operation, "capture session expired during preparation");
         return;
       }
 
@@ -872,6 +1105,12 @@ private:
           std::lock_guard<std::mutex> lock(operations_mutex_);
           if (operation->stop_scheduling) {break;}
         }
+        if (!renew_capture_session(*operation)) {
+          std::lock_guard<std::mutex> operations_lock(operations_mutex_);
+          operation->stop_scheduling = true;
+          operation->value.message = "capture session expired";
+          break;
+        }
         std::this_thread::sleep_for(20ms);
       }
       {
@@ -927,6 +1166,10 @@ private:
         RecordCapture::Goal goal;
         goal.group_id = group_id;
         goal.request_id = operation->request_prefix + "_" + std::to_string(cycle) + "_" + group_id;
+        goal.session_id = operation->value.session_id;
+        goal.capture_kind = "production";
+        goal.target_kind = "group";
+        goal.target_id = group_id;
         if (!safe_identifier(goal.request_id)) {
           identifiers_valid = false;
           break;
@@ -1008,7 +1251,7 @@ private:
         operation->stop_scheduling = true;
         operation->value.message = message;
       }
-      if (operation->cycle_results[cycle] == operation->value.group_ids.size()) {
+      if (operation->cycle_results[cycle] == operation->expected_results_per_cycle) {
         if (operation->cycle_failures[cycle] == 0) {++operation->value.completed_cycles;}
         else {++operation->value.failed_cycles;}
         operation->cycle_results.erase(cycle);
@@ -1046,6 +1289,10 @@ private:
       return;
     }
     operation.terminal_recorded = true;
+    if (!operation.session_released) {
+      release_capture_session(operation.value.session_id);
+      operation.session_released = true;
+    }
     terminal_operation_ids_.push_back(operation.value.operation_id);
     while (terminal_operation_ids_.size() > config_.operation_history_limit) {
       const auto expired = terminal_operation_ids_.front();
@@ -1079,7 +1326,16 @@ private:
     std::shared_ptr<const RecordCapture::Goal> goal)
   {
     if (shutdown_requested()) {return rclcpp_action::GoalResponse::REJECT;}
-    if (goal->group_id.empty()) {return rclcpp_action::GoalResponse::REJECT;}
+    const auto target_kind = goal->target_kind.empty() ? "group" : goal->target_kind;
+    const auto target_id = goal->target_id.empty() ? goal->group_id : goal->target_id;
+    if ((target_kind != "group" && target_kind != "sensor") || target_id.empty()) {
+      return rclcpp_action::GoalResponse::REJECT;
+    }
+    if (!goal->capture_kind.empty() && goal->capture_kind != "production" &&
+      goal->capture_kind != "test_shot")
+    {
+      return rclcpp_action::GoalResponse::REJECT;
+    }
     if (!goal->request_id.empty() && !safe_identifier(goal->request_id)) {
       return rclcpp_action::GoalResponse::REJECT;
     }
@@ -1098,11 +1354,16 @@ private:
     std::vector<std::string> selected_sensor_ids;
     {
       std::lock_guard<std::mutex> lock(state_mutex_);
-      const auto group = groups_.find(goal->group_id);
-      if (group == groups_.end() || group->second.member_ids.empty()) {
-        return rclcpp_action::GoalResponse::REJECT;
+      if (target_kind == "sensor") {
+        if (sensors_.count(target_id) == 0) {return rclcpp_action::GoalResponse::REJECT;}
+        selected_sensor_ids = {target_id};
+      } else {
+        const auto group = groups_.find(target_id);
+        if (group == groups_.end() || group->second.member_ids.empty()) {
+          return rclcpp_action::GoalResponse::REJECT;
+        }
+        selected_sensor_ids = group->second.member_ids;
       }
-      selected_sensor_ids = group->second.member_ids;
     }
     const bool track_active_sensors = !goal->has_requested_time;
     if (track_active_sensors) {
@@ -1275,34 +1536,59 @@ private:
     auto result = std::make_shared<RecordCapture::Result>();
     CaptureRecord record;
     nlohmann::json gps_metadata = nlohmann::json::object();
-    record.group_id = handle->get_goal()->group_id;
+    const auto target_kind = handle->get_goal()->target_kind.empty() ?
+      "group" : handle->get_goal()->target_kind;
+    const auto target_id = handle->get_goal()->target_id.empty() ?
+      handle->get_goal()->group_id : handle->get_goal()->target_id;
+    record.group_id = target_kind == "group" ? target_id : "";
+    record.capture_kind = handle->get_goal()->capture_kind.empty() ?
+      "production" : handle->get_goal()->capture_kind;
+    record.target_kind = target_kind;
+    record.target_id = target_id;
     record.operation_id = handle->get_goal()->operation_id;
     record.cycle = handle->get_goal()->cycle;
     record.metadata_json = handle->get_goal()->metadata_json;
     record.started_at = utc_now();
     std::filesystem::path staging;
+    std::string session_id = handle->get_goal()->session_id;
+    struct SessionGuard
+    {
+      CaptureRecorder * owner;
+      std::string session_id;
+      bool temporary{false};
+      ~SessionGuard()
+      {
+        if (temporary) {owner->release_capture_session(session_id);}
+      }
+    } session_guard{this, session_id, false};
     try {
       if (shutdown_requested()) {throw std::runtime_error("recorder is shutting down");}
-      vixel_interfaces::msg::SyncGroup group;
+      if (session_id.empty()) {
+        session_id = acquire_capture_session(
+          record.operation_id.empty() ? "temporary-record" : record.operation_id,
+          target_kind, {target_id}, 0, record.capture_kind == "test_shot");
+        session_guard.session_id = session_id;
+        session_guard.temporary = true;
+      }
+      feedback(handle, "preparing", "Preparing camera ownership and trigger mode", 5);
+      wait_for_capture_target(target_kind, target_id, session_id, handle);
       std::map<std::string, vixel_interfaces::msg::Sensor> sensor_snapshot;
       {
         std::lock_guard<std::mutex> lock(state_mutex_);
-        const auto group_iterator = groups_.find(record.group_id);
-        if (group_iterator == groups_.end()) {
-          throw std::runtime_error("unknown synchronization group " + record.group_id);
+        if (target_kind == "group") {
+          const auto group_iterator = groups_.find(target_id);
+          if (group_iterator == groups_.end()) {
+            throw std::runtime_error("unknown synchronization group " + target_id);
+          }
+          record.requested_sensor_ids = group_iterator->second.member_ids;
+        } else {
+          if (sensors_.count(target_id) == 0) {
+            throw std::runtime_error("unknown enrolled sensor " + target_id);
+          }
+          record.requested_sensor_ids = {target_id};
         }
-        group = group_iterator->second;
         sensor_snapshot = sensors_;
       }
-      if (group.operating_mode != "capture") {
-        throw std::runtime_error("set synchronization group to capture mode first");
-      }
-      if (!group.ready) {
-        throw std::runtime_error(
-                group.last_error.empty() ? "synchronization group is not ready" :
-                group.last_error);
-      }
-      record.requested_sensor_ids = group.member_ids;
       record.capture_id = handle->get_goal()->request_id.empty() ?
         generated_capture_id(++capture_sequence_) : handle->get_goal()->request_id;
       if (!safe_identifier(record.capture_id)) {
@@ -1313,7 +1599,7 @@ private:
         throw std::runtime_error("capture rejected: recording disk is below free-space threshold");
       }
       feedback(handle, "subscribing", "Waiting for full-resolution image publishers", 10);
-      auto subscriptions = subscribe(group.member_ids);
+      auto subscriptions = subscribe(record.requested_sensor_ids);
       const auto match_deadline = std::chrono::steady_clock::now() + 2s;
       while (std::chrono::steady_clock::now() < match_deadline) {
         if (handle->is_canceling() || shutdown_requested()) {
@@ -1343,6 +1629,9 @@ private:
       auto request = std::make_shared<CaptureGroup::Request>();
       request->group_id = record.group_id;
       request->request_id = record.capture_id;
+      request->session_id = session_id;
+      request->target_kind = target_kind;
+      request->target_id = target_id;
       request->trigger_only = false;
       request->has_requested_time = handle->get_goal()->has_requested_time;
       request->requested_time = handle->get_goal()->requested_time;
@@ -1441,7 +1730,9 @@ private:
       }
 
       const auto date = record.started_at.substr(0, 10);
-      const auto parent = config_.root_directory / date.substr(0, 4) / date.substr(5, 2) /
+      const auto storage_root = record.capture_kind == "test_shot" ?
+        config_.root_directory / "test-shots" : config_.root_directory;
+      const auto parent = storage_root / date.substr(0, 4) / date.substr(5, 2) /
         date.substr(8, 2);
       std::filesystem::create_directories(parent);
       staging = parent / ("." + record.capture_id + ".tmp");
@@ -1573,8 +1864,10 @@ private:
       capture_timings = nlohmann::json::parse(record.timings_json);
     }
     nlohmann::json manifest{
-      {"schema_version", 2}, {"capture_id", record.capture_id},
-      {"group_id", record.group_id}, {"status", record.status},
+      {"schema_version", 3}, {"capture_id", record.capture_id},
+      {"group_id", record.group_id}, {"capture_kind", record.capture_kind},
+      {"target_kind", record.target_kind}, {"target_id", record.target_id},
+      {"status", record.status},
       {"operation_id", record.operation_id}, {"cycle", record.cycle},
       {"metadata", metadata}, {"capture_timings", capture_timings},
       {"message", record.message}, {"started_at", record.started_at},
@@ -1603,7 +1896,9 @@ private:
     try {
       if (staging.empty()) {
         const auto date = record.started_at.substr(0, 10);
-        const auto parent = config_.root_directory / date.substr(0, 4) / date.substr(5, 2) /
+        const auto storage_root = record.capture_kind == "test_shot" ?
+          config_.root_directory / "test-shots" : config_.root_directory;
+        const auto parent = storage_root / date.substr(0, 4) / date.substr(5, 2) /
           date.substr(8, 2);
         std::filesystem::create_directories(parent);
         const auto failed = parent / (record.capture_id + ".failed");
@@ -1662,6 +1957,10 @@ private:
     CaptureRecord record;
     record.capture_id = value.value("capture_id", directory.filename().string());
     record.group_id = value.value("group_id", "");
+    record.capture_kind = value.value("capture_kind", "production");
+    record.target_kind = value.value(
+      "target_kind", record.group_id.empty() ? "sensor" : "group");
+    record.target_id = value.value("target_id", record.group_id);
     record.operation_id = value.value("operation_id", "");
     record.cycle = value.value("cycle", 0U);
     record.metadata_json = value.value("metadata", nlohmann::json::object()).dump();
@@ -1754,6 +2053,9 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr gps_subscription_;
   rclcpp::Client<CaptureGroup>::SharedPtr capture_client_;
   rclcpp::Client<PrepareCaptureGroups>::SharedPtr prepare_capture_groups_client_;
+  rclcpp::Client<AcquireCaptureSession>::SharedPtr acquire_capture_session_client_;
+  rclcpp::Client<RenewCaptureSession>::SharedPtr renew_capture_session_client_;
+  rclcpp::Client<ReleaseCaptureSession>::SharedPtr release_capture_session_client_;
   rclcpp::Publisher<vixel_interfaces::msg::CaptureRecordArray>::SharedPtr records_publisher_;
   rclcpp_action::Server<RecordCapture>::SharedPtr action_server_;
   rclcpp_action::Client<RecordCapture>::SharedPtr operation_capture_client_;
@@ -1767,6 +2069,7 @@ private:
   operations_publisher_;
   rclcpp::Service<vixel_interfaces::srv::SubmitCaptureBatch>::SharedPtr submit_batch_service_;
   rclcpp::Service<vixel_interfaces::srv::StartCaptureSequence>::SharedPtr start_sequence_service_;
+  rclcpp::Service<StartTestShot>::SharedPtr start_test_shot_service_;
   rclcpp::Service<vixel_interfaces::srv::GetCaptureOperation>::SharedPtr get_operation_service_;
   rclcpp::Service<vixel_interfaces::srv::CancelCaptureOperation>::SharedPtr
   cancel_operation_service_;
