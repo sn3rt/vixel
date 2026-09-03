@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import copy
 import ipaddress
 import json
@@ -20,6 +19,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.task import Future
 from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
 
 from vixel_interfaces.action import EnrollSensor, ResolveSensorPlacement, TriggerGroup
@@ -1813,6 +1813,25 @@ class InventoryManager(Node):
             response.message = str(error)
         return response
 
+    async def _ros_sleep(self, seconds: float) -> None:
+        """Yield an rclpy callback until a ROS executor timer fires."""
+        future = Future(executor=self.executor)
+        timer = None
+
+        def wake() -> None:
+            if timer is not None:
+                timer.cancel()
+            if not future.done():
+                future.set_result(None)
+
+        timer = self.create_timer(
+            seconds, wake, callback_group=self.callback_group
+        )
+        try:
+            await future
+        finally:
+            self.destroy_timer(timer)
+
     async def _wait_capture_target_ready(
         self, target_kind: str, target_id: str, session_id: str,
         timeout_sec: float = 60.0,
@@ -1829,7 +1848,7 @@ class InventoryManager(Node):
                     sensor = self.runtime.get(target_id)
                     if sensor and sensor.online and sensor.operating_mode == "capture":
                         return
-            await asyncio.sleep(0.1)
+            await self._ros_sleep(0.1)
         raise RegistryError(f"timed out preparing {target_kind} {target_id}")
 
     async def _request_capture(

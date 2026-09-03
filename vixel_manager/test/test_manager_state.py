@@ -206,6 +206,37 @@ def test_exclusive_test_session_rejects_overlapping_capture_owners():
         manager._create_capture_session("dashboard-test", "group", ["front"], 0, True)
 
 
+def test_capture_readiness_wait_yields_through_ros_sleep():
+    manager = InventoryManager.__new__(InventoryManager)
+    manager.registry = SimpleNamespace(inventory={
+        "sync_groups": {}, "sensors": {"camera_a": {}},
+    })
+    manager.lock = threading.RLock()
+    manager.capture_sessions = {}
+    manager.capture_session_generation = 1
+    manager.capture_session_ttl_sec = 15.0
+    manager.generation = 1
+    session = manager._create_capture_session(
+        "dashboard-test", "sensor", ["camera_a"], 0, True
+    )
+    manager.runtime = {
+        "camera_a": SimpleNamespace(online=True, operating_mode="preview")
+    }
+    pauses = []
+
+    async def ros_sleep(seconds):
+        pauses.append(seconds)
+        manager.runtime["camera_a"].operating_mode = "capture"
+
+    manager._ros_sleep = ros_sleep
+
+    asyncio.run(manager._wait_capture_target_ready(
+        "sensor", "camera_a", session["session_id"], timeout_sec=0.5
+    ))
+
+    assert pauses == [0.1]
+
+
 def test_runtime_sensor_from_previous_mode_is_not_ready():
     sensor = SimpleNamespace(online=True, operating_mode="preview")
 
