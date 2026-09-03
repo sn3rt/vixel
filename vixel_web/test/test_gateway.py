@@ -267,6 +267,22 @@ def test_finite_http_response_closes_connection_immediately():
     assert connection.timeout == 40.0
 
 
+def test_sensor_detail_route_serves_the_dashboard(tmp_path):
+    page = tmp_path / "index.html"
+    page.write_text("<html>Vixel dashboard</html>")
+    node = SimpleNamespace(static_file=page, get_logger=lambda: _Logger())
+    connection = _HTTPConnection(
+        b"GET /sensors/camera_test HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    )
+
+    Handler(connection, ("127.0.0.1", 12345), SimpleNamespace(node=node))
+
+    response = bytes(connection.response)
+    assert response.startswith(b"HTTP/1.1 200 OK\r\n")
+    assert b"Content-Type: text/html; charset=utf-8\r\n" in response
+    assert response.endswith(b"<html>Vixel dashboard</html>")
+
+
 def test_capture_timeout_returns_gateway_timeout_status():
     node = SimpleNamespace(
         record_capture=lambda _group, _body: (_ for _ in ()).throw(

@@ -1092,7 +1092,11 @@ class Handler(BaseHTTPRequestHandler):
         self.close_connection = True
         parsed = urllib.parse.urlparse(self.path)
         parts = [part for part in parsed.path.split("/") if part]
-        if parsed.path == "/" or parsed.path == "/index.html":
+        if (
+            parsed.path == "/"
+            or parsed.path == "/index.html"
+            or (len(parts) == 2 and parts[0] == "sensors")
+        ):
             body = self.server.node.static_file.read_bytes()
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/html; charset=utf-8")

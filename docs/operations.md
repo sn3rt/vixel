@@ -21,7 +21,9 @@ ssh -N -L 8080:127.0.0.1:8080 user@camera-host
 
 Open <http://127.0.0.1:8080>. The dashboard discovers camera cards dynamically,
 shows known and enrolled sensors, controls port modes and groups, and edits
-sensor metadata.
+sensor metadata. Click an active camera preview to open its focused view at
+`/sensors/<sensor_id>`. That view keeps the latest cached frame visible while
+showing the same camera details and controls as the dashboard card.
 
 Readiness endpoint:
 

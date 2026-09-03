@@ -56,6 +56,15 @@ def test_dashboard_cancel_buttons_close_dialogs_without_submitting_forms():
     assert "e.submitter?.value==='cancel'" not in page
 
 
+def test_dashboard_links_previews_to_a_focused_camera_view():
+    page = PAGE.read_text()
+    assert 'href="/sensors/${encodeURIComponent(s.sensor_id)}"' in page
+    assert 'id="sensor-view"' in page
+    assert "detailSensorId" in page
+    assert "sensorDetail(sensor)" in page
+    assert "Preview inactive — showing the last received frame when available." in page
+
+
 def test_dashboard_uses_bounded_snapshot_polling_for_camera_cards():
     page = PAGE.read_text()
     assert "data-preview-sensor" in page
