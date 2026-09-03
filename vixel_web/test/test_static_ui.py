@@ -49,6 +49,13 @@ def test_dashboard_reports_initial_and_event_stream_errors():
     assert "start();" in page
 
 
+def test_dashboard_cancel_buttons_close_dialogs_without_submitting_forms():
+    page = PAGE.read_text()
+    assert page.count('type="button" data-dialog-close>Cancel</button>') == 4
+    assert "button.closest('dialog')?.close()" in page
+    assert "e.submitter?.value==='cancel'" not in page
+
+
 def test_dashboard_uses_bounded_snapshot_polling_for_camera_cards():
     page = PAGE.read_text()
     assert "data-preview-sensor" in page
