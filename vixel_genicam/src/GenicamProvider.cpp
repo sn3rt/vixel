@@ -1025,7 +1025,7 @@ public:
   {
     if (assignment_.operating_mode != "capture" || metering_rate_hz_ <= 0.0 ||
       tick < next_metering_ || !vixel_genicam::background_metering_allowed(
-        assignment_.requested_capture_interval_ms, capture_primed_.load()))
+        assignment_.capture_reserved, capture_primed_.load()))
     {
       return false;
     }
@@ -1197,6 +1197,7 @@ public:
     result.sync_group = assignment_.sync_group;
     result.capture_group_ids = capture_group_ids(assignment_);
     result.operating_mode = assignment_.operating_mode;
+    result.capture_ready = assignment_.operating_mode != "capture" || capture_prepared();
     result.capabilities = {
       "image", "compressed_preview", "genicam", "camera_settings",
       "software_capture"};
@@ -2971,6 +2972,8 @@ private:
         iterator->second->assignment().preview_rate_hz &&
         assignment->second.requested_capture_interval_ms ==
         iterator->second->assignment().requested_capture_interval_ms &&
+        assignment->second.capture_reserved ==
+        iterator->second->assignment().capture_reserved &&
         assignment->second.calibration_url ==
         iterator->second->assignment().calibration_url &&
         assignment->second.network_id == iterator->second->assignment().network_id &&
@@ -3180,6 +3183,7 @@ private:
       sensor.sync_group = item.second.sync_group;
       sensor.capture_group_ids = capture_group_ids(item.second);
       sensor.operating_mode = item.second.operating_mode;
+      sensor.capture_ready = false;
       sensor.capabilities = {
         "image", "compressed_preview", "genicam", "camera_settings",
         "software_capture", "ptp_capability_unknown"};
@@ -3255,7 +3259,7 @@ private:
           {
             warming_members[group_id].push_back(item.first);
           } else if (assignment.operating_mode == "capture" &&
-            assignment.requested_capture_interval_ms != 0 &&
+            assignment.capture_reserved &&
             !session->second->capture_prepared())
           {
             arming_members[group_id].push_back(item.first);

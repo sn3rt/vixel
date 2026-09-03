@@ -25,6 +25,9 @@ string interface_name
 string sync_group
 string[] capture_group_ids
 string operating_mode
+# True once capture mode has completed initial metering and its trigger pipeline
+# is idle and armed. False while capture preparation is still in progress.
+bool capture_ready
 string[] capabilities
 string last_error
 bool managed

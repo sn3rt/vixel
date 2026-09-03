@@ -4,14 +4,14 @@
 
 TEST(CapturePreparation, PreparedCadenceQuiescesMeteringAfterInitialFrame)
 {
-  EXPECT_TRUE(vixel_genicam::background_metering_allowed(250, false));
-  EXPECT_FALSE(vixel_genicam::background_metering_allowed(250, true));
+  EXPECT_TRUE(vixel_genicam::background_metering_allowed(true, false));
+  EXPECT_FALSE(vixel_genicam::background_metering_allowed(true, true));
 }
 
 TEST(CapturePreparation, UnreservedCaptureModeContinuesBackgroundMetering)
 {
-  EXPECT_TRUE(vixel_genicam::background_metering_allowed(0, false));
-  EXPECT_TRUE(vixel_genicam::background_metering_allowed(0, true));
+  EXPECT_TRUE(vixel_genicam::background_metering_allowed(false, false));
+  EXPECT_TRUE(vixel_genicam::background_metering_allowed(false, true));
 }
 
 TEST(CapturePreparation, PreparedCameraMustBePrimedIdleAndArmed)

@@ -96,6 +96,13 @@ def test_overlapping_groups_aggregate_sensor_mode_and_cadence():
     manager.default_group_mode = "idle"
     manager.default_sensor_mode = "idle"
     manager.sensor_modes = {}
+    manager.capture_sessions = {
+        "test-shot": {
+            "target_kind": "sensor",
+            "sensor_ids": ["left"],
+            "group_ids": [],
+        }
+    }
     manager.lock = threading.RLock()
     manager.camera_profiles = {}
     manager.generation = 4
@@ -117,6 +124,8 @@ def test_overlapping_groups_aggregate_sensor_mode_and_cadence():
     assert assignments["right"].operating_mode == "capture"
     assert assignments["left"].requested_capture_interval_ms == 250
     assert assignments["right"].requested_capture_interval_ms == 500
+    assert assignments["left"].capture_reserved is True
+    assert assignments["right"].capture_reserved is False
     assert manager._mode_for_sensor("left") == "capture"
     assert assignments["spare"].capture_group_ids == []
     assert assignments["spare"].operating_mode == "idle"
@@ -220,13 +229,16 @@ def test_capture_readiness_wait_yields_through_ros_sleep():
         "dashboard-test", "sensor", ["camera_a"], 0, True
     )
     manager.runtime = {
-        "camera_a": SimpleNamespace(online=True, operating_mode="preview")
+        "camera_a": SimpleNamespace(
+            online=True, operating_mode="preview", capture_ready=False
+        )
     }
     pauses = []
 
     async def ros_sleep(seconds):
         pauses.append(seconds)
         manager.runtime["camera_a"].operating_mode = "capture"
+        manager.runtime["camera_a"].capture_ready = True
 
     manager._ros_sleep = ros_sleep
 
@@ -238,11 +250,23 @@ def test_capture_readiness_wait_yields_through_ros_sleep():
 
 
 def test_runtime_sensor_from_previous_mode_is_not_ready():
-    sensor = SimpleNamespace(online=True, operating_mode="preview")
+    sensor = SimpleNamespace(
+        online=True, operating_mode="preview", capture_ready=False
+    )
 
     assert not _runtime_sensor_is_ready(sensor, "capture")
     assert _runtime_sensor_is_ready(sensor, "preview")
     assert not _runtime_sensor_is_ready(None, "capture")
+
+
+def test_runtime_capture_sensor_waits_until_pipeline_is_prepared():
+    sensor = SimpleNamespace(
+        online=True, operating_mode="capture", capture_ready=False
+    )
+
+    assert not _runtime_sensor_is_ready(sensor, "capture")
+    sensor.capture_ready = True
+    assert _runtime_sensor_is_ready(sensor, "capture")
 
 
 def test_unapproved_network_is_visible_but_not_managed():

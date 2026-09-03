@@ -99,7 +99,12 @@ def _provider_group_is_current(
 
 
 def _runtime_sensor_is_ready(sensor: Sensor | None, requested_mode: str) -> bool:
-    return bool(sensor and sensor.online and sensor.operating_mode == requested_mode)
+    return bool(
+        sensor
+        and sensor.online
+        and sensor.operating_mode == requested_mode
+        and (requested_mode != "capture" or sensor.capture_ready)
+    )
 
 
 def _pose_to_dict(pose: Pose, parent_frame: str) -> dict[str, Any]:
@@ -569,6 +574,7 @@ class InventoryManager(Node):
         message.capture_group_ids = self._groups_for_sensor(sensor_id)
         message.sync_group = message.capture_group_ids[0] if message.capture_group_ids else ""
         message.operating_mode = self._mode_for_sensor(sensor_id)
+        message.capture_ready = False
         runtime = self.runtime.get(sensor_id)
         if runtime:
             message.online = runtime.online
@@ -578,6 +584,7 @@ class InventoryManager(Node):
             message.last_error = runtime.last_error
             message.status_detail = runtime.status_detail
             message.applied_settings_json = runtime.applied_settings_json
+            message.capture_ready = runtime.capture_ready
             if runtime.model:
                 message.model = runtime.model
             if runtime.mac_address:
@@ -1197,6 +1204,10 @@ class InventoryManager(Node):
             modes = [self._requested_group_mode(group_id) for group_id in group_ids]
             directly_owned = any(
                 session["target_kind"] == "sensor" and sensor_id in session["sensor_ids"]
+                for session in getattr(self, "capture_sessions", {}).values()
+            )
+            assignment.capture_reserved = any(
+                sensor_id in session["sensor_ids"]
                 for session in getattr(self, "capture_sessions", {}).values()
             )
             assignment.operating_mode = (
@@ -1846,7 +1857,7 @@ class InventoryManager(Node):
                         return
                 else:
                     sensor = self.runtime.get(target_id)
-                    if sensor and sensor.online and sensor.operating_mode == "capture":
+                    if _runtime_sensor_is_ready(sensor, "capture"):
                         return
             await self._ros_sleep(0.1)
         raise RegistryError(f"timed out preparing {target_kind} {target_id}")

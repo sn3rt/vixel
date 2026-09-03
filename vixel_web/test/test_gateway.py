@@ -4,6 +4,7 @@ from http.server import ThreadingHTTPServer
 from types import SimpleNamespace
 
 import pytest
+from vixel_interfaces.msg import Sensor
 
 from vixel_web.gateway import (
     capture_operation_to_dict,
@@ -17,6 +18,7 @@ from vixel_web.gateway import (
     is_routine_snapshot_request,
     known_sensor_to_dict,
     recording_runtime_settings,
+    sensor_to_dict,
 )
 
 
@@ -70,6 +72,17 @@ def test_group_ptp_locking_members_are_exposed_as_json():
     assert value["cadence_ready"] is True
     assert value["minimum_capture_interval_ms"] == 192
     assert value["action_queue_size"] == 4
+
+
+def test_sensor_capture_readiness_is_exposed_as_json():
+    sensor = Sensor()
+    sensor.sensor_id = "camera_a"
+    sensor.operating_mode = "capture"
+    sensor.capture_ready = True
+
+    value = sensor_to_dict(sensor)
+
+    assert value["capture_ready"] is True
 
 
 def test_capture_record_is_exposed_as_json():

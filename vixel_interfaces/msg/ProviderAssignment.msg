@@ -20,4 +20,7 @@ string preferred_master_id
 string operating_mode
 float64 preview_rate_hz
 uint32 requested_capture_interval_ms
+# True while a capture session owns this camera. Providers use this to finish
+# initial metering, then leave the triggered pipeline idle for the owner.
+bool capture_reserved
 string provider_settings_json
