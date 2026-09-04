@@ -182,6 +182,11 @@ software trigger stays available for free-running preview and reports capture
 as unavailable instead of failing its entire session. Individual settings
 remain effective for ungrouped cameras.
 
+The dashboard keeps this distinction concise: scheduled cameras report current
+PTP readiness and offset, while fallback cameras report that their exposure is
+software-triggered and unsynchronized. Firmware is omitted from normal status,
+and missing GenICam-node diagnostics remain in provider startup logs.
+
 Manual exposure uses `exposure_auto: "Off"` with `exposure_us`, and manual
 gain uses `gain_auto: "Off"` with `gain_db`. With either automatic control
 enabled, `metering_rate_hz` defaults to 2 Hz and requests unsaved, unencoded

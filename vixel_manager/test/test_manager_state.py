@@ -289,7 +289,7 @@ def test_online_sensor_uses_probed_runtime_capabilities():
             current_address="192.168.8.11",
             interface_name="enp15s0",
             last_error="",
-            status_detail="PTP clock Master; scheduled action unsupported",
+            status_detail="Software-triggered capture; exposure not synchronized",
             applied_settings_json="{}",
             capture_ready=True,
             stream_health_state="healthy",

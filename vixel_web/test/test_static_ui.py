@@ -26,6 +26,7 @@ def test_dashboard_is_dynamic_and_uses_gateway_endpoints():
     assert "PTP synchronized" in page
     assert "Waiting for PTP lock" in page
     assert "locking_member_ids" in page
+    assert "sensorStatusClass" in page
 
 
 def test_dashboard_javascript_parses():

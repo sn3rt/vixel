@@ -30,4 +30,23 @@ inline std::string capture_metering_domain(
   return sync_group.empty() ? "sensor:" + sensor_id : sync_group;
 }
 
+inline std::string capture_status_detail(
+  const std::string & operating_mode, bool ptp_action, bool ptp_locked,
+  bool ptp_offset_readable, std::int64_t ptp_offset_ns, bool software_trigger)
+{
+  if (operating_mode != "capture") {return {};}
+  if (ptp_action) {
+    if (!ptp_locked) {return "Waiting for PTP synchronization";}
+    auto detail = std::string("PTP scheduled capture ready");
+    if (ptp_offset_readable) {
+      detail += "; offset " + std::to_string(ptp_offset_ns) + " ns";
+    }
+    return detail;
+  }
+  if (software_trigger) {
+    return "Software-triggered capture; exposure not synchronized";
+  }
+  return "Capture unavailable; free-running preview only";
+}
+
 }  // namespace vixel_genicam

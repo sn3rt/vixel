@@ -1275,22 +1275,13 @@ public:
       std::lock_guard<std::mutex> lock(error_mutex_);
       result.last_error = last_error_;
     }
-    if (ptp_clock_) {
-      const auto state = refresh_ptp_cache();
-      result.status_detail = "PTP clock " + state.status + ", offset " +
-        (!state.offset_exposed ? std::string("not exposed by camera") :
-        state.offset_ns == std::numeric_limits<std::int64_t>::max() ?
-        std::string("unreadable") : std::to_string(state.offset_ns) + " ns");
-      result.status_detail += "; " + ptp_capability_detail_;
-    } else {
-      result.status_detail = ptp_capability_detail_;
-    }
-    if (!software_trigger_ && !software_trigger_detail_.empty()) {
-      result.status_detail += "; software capture unavailable: " + software_trigger_detail_;
-    }
-    if (!device_version_.empty()) {
-      result.status_detail += "; firmware " + device_version_;
-    }
+    PtpState ptp_state;
+    if (ptp_clock_) {ptp_state = refresh_ptp_cache();}
+    const bool ptp_offset_readable = ptp_state.offset_exposed &&
+      ptp_state.offset_ns != std::numeric_limits<std::int64_t>::max();
+    result.status_detail = capture_status_detail(
+      assignment_.operating_mode, ptp_action_, cached_ptp_locked_.load(),
+      ptp_offset_readable, ptp_state.offset_ns, software_trigger_);
     return result;
   }
 

@@ -41,3 +41,25 @@ TEST(CapturePreparation, UngroupedCameraGetsPrivateMeteringDomain)
     vixel_genicam::capture_metering_domain("camera_ids_1", "front"),
     "front");
 }
+
+TEST(CapturePreparation, ReportsCurrentPtpReadinessWithoutStaleStartupText)
+{
+  EXPECT_EQ(
+    vixel_genicam::capture_status_detail("capture", true, true, true, 27, false),
+    "PTP scheduled capture ready; offset 27 ns");
+  EXPECT_EQ(
+    vixel_genicam::capture_status_detail("capture", true, false, true, 27, false),
+    "Waiting for PTP synchronization");
+}
+
+TEST(CapturePreparation, DescribesSoftwareFallbackWithoutGenicamDiagnostics)
+{
+  EXPECT_EQ(
+    vixel_genicam::capture_status_detail("capture", false, true, true, 0, true),
+    "Software-triggered capture; exposure not synchronized");
+  EXPECT_EQ(
+    vixel_genicam::capture_status_detail("capture", false, false, false, 0, false),
+    "Capture unavailable; free-running preview only");
+  EXPECT_TRUE(
+    vixel_genicam::capture_status_detail("preview", true, true, true, 27, true).empty());
+}
