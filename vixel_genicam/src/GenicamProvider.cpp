@@ -3,6 +3,7 @@
 #include "vixel_genicam/GenicamConfig.hpp"
 #include "vixel_genicam/FrameTimestamp.hpp"
 #include "vixel_genicam/StreamRecovery.hpp"
+#include "vixel_genicam/TriggerSelection.hpp"
 
 #include <arv.h>
 #include <camera_info_manager/camera_info_manager.hpp>
@@ -1140,26 +1141,29 @@ public:
     ++stream_health_->restart_count;
   }
   bool capture_primed() const {return capture_primed_.load();}
+  const std::string & software_trigger_detail() const {return software_trigger_detail_;}
+  bool capture_trigger_armed()
+  {
+    if (trigger_armed_feature_.empty()) {return true;}
+    GError * error = nullptr;
+    bool trigger_armed = false;
+    {
+      std::lock_guard<std::mutex> lock(camera_control_mutex_);
+      trigger_armed = arv_camera_get_boolean(camera_, trigger_armed_feature_.c_str(), &error);
+    }
+    if (error == nullptr) {return trigger_armed;}
+    RCLCPP_WARN_THROTTLE(
+      node_->get_logger(), *node_->get_clock(), 5000,
+      "Unable to read %s for %s while preparing capture: %s",
+      trigger_armed_feature_.c_str(), assignment_.sensor_id.c_str(), error->message);
+    g_error_free(error);
+    return false;
+  }
   bool capture_prepared()
   {
     if (capture_preparation_latched_.load()) {return true;}
-    const bool require_trigger_armed = ptp_action_ && !trigger_armed_feature_.empty();
-    bool trigger_armed = true;
-    if (require_trigger_armed) {
-      GError * error = nullptr;
-      {
-        std::lock_guard<std::mutex> lock(camera_control_mutex_);
-        trigger_armed = arv_camera_get_boolean(camera_, trigger_armed_feature_.c_str(), &error);
-      }
-      if (error != nullptr) {
-        RCLCPP_WARN_THROTTLE(
-          node_->get_logger(), *node_->get_clock(), 5000,
-          "Unable to read %s for %s while preparing capture: %s",
-          trigger_armed_feature_.c_str(), assignment_.sensor_id.c_str(), error->message);
-        g_error_free(error);
-        trigger_armed = false;
-      }
-    }
+    const bool require_trigger_armed = !trigger_armed_feature_.empty();
+    const bool trigger_armed = capture_trigger_armed();
     const bool prepared = vixel_genicam::capture_preparation_ready(
       false, capture_primed_.load(), pipeline_idle(), require_trigger_armed, trigger_armed);
     if (prepared) {capture_preparation_latched_.store(true);}
@@ -1246,9 +1250,16 @@ public:
     result.operating_mode = assignment_.operating_mode;
     result.capture_ready = assignment_.operating_mode != "capture" || capture_prepared();
     result.capabilities = {
-      "image", "compressed_preview", "genicam", "camera_settings",
-      "software_capture"};
-    result.capabilities.push_back(ptp_action_ ? "ptp_scheduled_action" : "unsynchronized_group_capture");
+      "image", "compressed_preview", "genicam", "camera_settings"};
+    if (software_trigger_ || ptp_action_) {
+      result.capabilities.push_back("software_capture");
+    }
+    if (software_trigger_) {
+      result.capabilities.push_back("software_trigger");
+    }
+    if (ptp_clock_) {result.capabilities.push_back("ptp_clock_available");}
+    result.capabilities.push_back(
+      ptp_action_ ? "ptp_scheduled_action" : "unsynchronized_group_capture");
     result.applied_settings_json = applied_settings_;
     {
       std::lock_guard<std::mutex> lock(stream_health_->mutex);
@@ -1264,14 +1275,18 @@ public:
       std::lock_guard<std::mutex> lock(error_mutex_);
       result.last_error = last_error_;
     }
-    if (ptp_action_) {
+    if (ptp_clock_) {
       const auto state = refresh_ptp_cache();
-      result.status_detail = "PTP " + state.status + ", offset " +
+      result.status_detail = "PTP clock " + state.status + ", offset " +
         (!state.offset_exposed ? std::string("not exposed by camera") :
         state.offset_ns == std::numeric_limits<std::int64_t>::max() ?
         std::string("unreadable") : std::to_string(state.offset_ns) + " ns");
+      result.status_detail += "; " + ptp_capability_detail_;
     } else {
       result.status_detail = ptp_capability_detail_;
+    }
+    if (!software_trigger_ && !software_trigger_detail_.empty()) {
+      result.status_detail += "; software capture unavailable: " + software_trigger_detail_;
     }
     if (!device_version_.empty()) {
       result.status_detail += "; firmware " + device_version_;
@@ -1288,8 +1303,19 @@ public:
     add_enum_feature(result, "PixelFormat");
     add_enum_feature(result, "ExposureAuto");
     add_enum_feature(result, "GainAuto");
+    add_enum_feature(result, "TriggerSelector");
+    add_enum_feature(result, "TriggerMode");
+    add_enum_feature(result, "TriggerSource");
     add_enum_feature(result, "TriggerOverlap");
     add_boolean_feature(result, "TriggerArmed");
+    if (!ptp_enable_feature_.empty()) {add_boolean_feature(result, ptp_enable_feature_);}
+    if (!ptp_status_feature_.empty()) {add_enum_feature(result, ptp_status_feature_);}
+    if (!ptp_offset_feature_.empty()) {
+      add_integer_feature(result, ptp_offset_feature_, "ns");
+    }
+    if (!ptp_latch_value_feature_.empty()) {
+      add_integer_feature(result, ptp_latch_value_feature_, "ns");
+    }
     add_boolean_feature(result, "ExposureAutoLimitAuto");
     add_enum_feature(result, "ExposureAutoLimitAuto");
     add_integer_feature(result, "ActionQueueSize", "commands");
@@ -1348,7 +1374,7 @@ private:
     const auto state = read_ptp_state();
     const bool locked = lower(state.status) == "slave" &&
       (!state.offset_exposed || std::llabs(state.offset_ns) <= config_.ptp_tolerance_ns);
-    if (locked) {
+    if (locked && !ptp_latch_feature_.empty() && !ptp_latch_value_feature_.empty()) {
       const auto system_before_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
       const auto camera_ns = read_ptp_time_ns();
@@ -1427,6 +1453,150 @@ private:
       if (available) {return candidate;}
     }
     return {};
+  }
+
+  struct TriggerConfiguration
+  {
+    std::string selector;
+    std::string source;
+  };
+
+  std::vector<std::string> enumeration_values(
+    const std::string & feature, std::string & detail)
+  {
+    GError * error = nullptr;
+    guint count = 0;
+    const auto values = arv_camera_dup_available_enumerations_as_strings(
+      camera_, feature.c_str(), &count, &error);
+    std::vector<std::string> result;
+    if (error != nullptr) {
+      detail = feature + ": " + error->message;
+      g_error_free(error);
+    } else {
+      for (guint index = 0; values != nullptr && index < count; ++index) {
+        result.push_back(value_or_empty(values[index]));
+      }
+    }
+    g_free(values);
+    return result;
+  }
+
+  std::optional<TriggerConfiguration> trigger_configuration_for(
+    const std::string & requested_source, std::string & detail)
+  {
+    const auto trigger_source = first_available_feature({"TriggerSource"});
+    if (trigger_source.empty()) {
+      detail = "TriggerSource is unavailable";
+      return std::nullopt;
+    }
+
+    const auto trigger_selector = first_available_feature({"TriggerSelector"});
+    if (trigger_selector.empty()) {
+      const auto sources = enumeration_values(trigger_source, detail);
+      const auto source = advertised_trigger_value(sources, requested_source);
+      if (!source) {
+        detail = "TriggerSource does not advertise " + requested_source;
+        return std::nullopt;
+      }
+      return TriggerConfiguration{"", *source};
+    }
+
+    std::string selector_detail;
+    const auto selectors = preferred_trigger_selectors(
+      enumeration_values(trigger_selector, selector_detail));
+    if (selectors.empty()) {
+      detail = selector_detail.empty() ?
+        "TriggerSelector advertises no values" : selector_detail;
+      return std::nullopt;
+    }
+
+    std::vector<std::string> rejected;
+    for (const auto & selector : selectors) {
+      GError * error = nullptr;
+      arv_camera_set_string(camera_, trigger_selector.c_str(), selector.c_str(), &error);
+      if (error != nullptr) {
+        rejected.push_back(selector + ": " + error->message);
+        g_error_free(error);
+        continue;
+      }
+      std::string source_detail;
+      const auto sources = enumeration_values(trigger_source, source_detail);
+      const auto source = advertised_trigger_value(sources, requested_source);
+      if (source) {return TriggerConfiguration{selector, *source};}
+      rejected.push_back(
+        selector + ": " + (source_detail.empty() ?
+        "TriggerSource does not advertise " + requested_source : source_detail));
+    }
+
+    std::ostringstream message;
+    message << "no TriggerSelector supports TriggerSource=" << requested_source;
+    if (!rejected.empty()) {message << " (" << joined(rejected) << ')';}
+    detail = message.str();
+    return std::nullopt;
+  }
+
+  void apply_trigger_configuration(
+    const TriggerConfiguration & configuration, const std::string & purpose)
+  {
+    GError * error = nullptr;
+    if (!configuration.selector.empty()) {
+      arv_camera_set_string(
+        camera_, "TriggerSelector", configuration.selector.c_str(), &error);
+      throw_on_error(error, purpose + ": selecting TriggerSelector=" + configuration.selector);
+    }
+    arv_camera_set_string(camera_, "TriggerMode", "On", &error);
+    throw_on_error(error, purpose + ": enabling TriggerMode");
+    arv_camera_set_string(camera_, "TriggerSource", configuration.source.c_str(), &error);
+    throw_on_error(error, purpose + ": selecting TriggerSource=" + configuration.source);
+  }
+
+  TriggerConfiguration require_trigger_configuration(
+    const std::string & source, const std::string & purpose)
+  {
+    std::string detail;
+    const auto configuration = trigger_configuration_for(source, detail);
+    if (!configuration) {throw std::runtime_error(purpose + ": " + detail);}
+    apply_trigger_configuration(*configuration, purpose);
+    return *configuration;
+  }
+
+  void configure_free_run()
+  {
+    GError * error = nullptr;
+    const bool trigger_mode_available =
+      arv_camera_is_feature_available(camera_, "TriggerMode", &error);
+    if (error != nullptr) {
+      g_error_free(error);
+      return;
+    }
+    if (!trigger_mode_available) {return;}
+    if (feature_writable(camera_, "TriggerMode")) {
+      arv_camera_clear_triggers(camera_, &error);
+      if (error == nullptr) {return;}
+      const auto clear_error = error_text(error, "disabling camera triggers");
+      error = nullptr;
+      const auto current_mode = value_or_empty(
+        arv_camera_get_string(camera_, "TriggerMode", &error));
+      throw_on_error(error, "checking TriggerMode after disable failed");
+      if (lower(current_mode) != "off") {throw std::runtime_error(clear_error);}
+      RCLCPP_WARN(
+        node_->get_logger(),
+        "%s rejected a redundant TriggerMode write but reports TriggerMode=Off; "
+        "continuing in free-run",
+        assignment_.sensor_id.c_str());
+      return;
+    }
+    const auto current_mode = value_or_empty(
+      arv_camera_get_string(camera_, "TriggerMode", &error));
+    throw_on_error(error, "reading read-only TriggerMode");
+    if (lower(current_mode) != "off") {
+      throw std::runtime_error(
+              "TriggerMode is read-only and currently " + current_mode +
+              "; the camera cannot enter FreeRun mode");
+    }
+    RCLCPP_INFO(
+      node_->get_logger(), "%s has read-only TriggerMode=Off; keeping camera in free-run",
+      assignment_.sensor_id.c_str());
   }
 
   std::optional<double> read_numeric_feature(
@@ -2026,12 +2196,32 @@ private:
     arv_camera_set_acquisition_mode(camera_, ARV_ACQUISITION_MODE_CONTINUOUS, &error);
     throw_on_error(error, "setting continuous acquisition mode");
 
+    const auto configure_software_or_free_run = [this](const std::string & purpose) {
+        try {
+          const auto configuration = require_trigger_configuration("Software", purpose);
+          software_trigger_configuration_ = configuration;
+          software_trigger_ = true;
+          software_trigger_detail_ = "software trigger uses " +
+            (configuration.selector.empty() ? std::string("camera default selector") :
+            "TriggerSelector=" + configuration.selector);
+          RCLCPP_INFO(
+            node_->get_logger(), "%s %s", assignment_.sensor_id.c_str(),
+            software_trigger_detail_.c_str());
+        } catch (const std::exception & trigger_error) {
+          software_trigger_ = false;
+          software_trigger_detail_ = trigger_error.what();
+          RCLCPP_WARN(
+            node_->get_logger(),
+            "%s cannot use a software trigger (%s); keeping free-run preview available",
+            assignment_.sensor_id.c_str(), software_trigger_detail_.c_str());
+          configure_free_run();
+        }
+      };
+
     if (normalized_trigger == "software") {
-      arv_camera_set_trigger(camera_, "Software", &error);
-      throw_on_error(error, "enabling software trigger");
-      software_trigger_ = true;
+      configure_software_or_free_run("enabling software trigger");
     } else if (normalized_trigger == "action0") {
-      bool supported = arv_camera_is_gv_device(camera_);
+      bool scheduled_action_supported = arv_camera_is_gv_device(camera_);
       ptp_enable_feature_ = first_available_feature({"PtpEnable", "GevIEEE1588"});
       ptp_status_feature_ = first_available_feature({"PtpStatus", "GevIEEE1588Status"});
       ptp_offset_feature_ = first_available_feature(
@@ -2053,37 +2243,41 @@ private:
       for (const auto * feature : {"ActionDeviceKey", "ActionGroupKey", "ActionGroupMask"}) {
         if (first_available_feature({feature}).empty()) {missing.emplace_back(feature);}
       }
-      supported = supported && missing.empty();
-      const auto trigger_selector = first_available_feature({"TriggerSelector"});
-      if (!trigger_selector.empty() && feature_writable(camera_, trigger_selector.c_str())) {
+      std::string action_trigger_detail;
+      const auto action_trigger = trigger_configuration_for("Action0", action_trigger_detail);
+      if (!action_trigger) {missing.emplace_back("TriggerSource=Action0");}
+
+      const bool ptp_clock_features = !ptp_enable_feature_.empty() &&
+        !ptp_status_feature_.empty();
+      if (ptp_clock_features) {
         error = nullptr;
-        arv_camera_set_string(camera_, trigger_selector.c_str(), "FrameStart", &error);
-        if (error != nullptr) {
-          RCLCPP_WARN(
-            node_->get_logger(), "%s could not select TriggerSelector=FrameStart: %s",
-            assignment_.sensor_id.c_str(), error->message);
+        arv_camera_set_boolean(camera_, ptp_enable_feature_.c_str(), true, &error);
+        if (error == nullptr) {
+          ptp_clock_ = true;
+        } else {
+          const auto enable_error = std::string(error->message);
           g_error_free(error);
           error = nullptr;
+          const bool already_enabled = arv_camera_get_boolean(
+            camera_, ptp_enable_feature_.c_str(), &error);
+          if (error == nullptr && already_enabled) {
+            ptp_clock_ = true;
+            RCLCPP_WARN(
+              node_->get_logger(),
+              "%s rejected a redundant PTP enable write but reports PTP enabled",
+              assignment_.sensor_id.c_str());
+          } else {
+            if (error != nullptr) {g_error_free(error); error = nullptr;}
+            RCLCPP_WARN(
+              node_->get_logger(), "%s could not enable its PTP clock: %s",
+              assignment_.sensor_id.c_str(), enable_error.c_str());
+            missing.emplace_back("working PTP clock");
+          }
         }
       }
-      guint trigger_count = 0;
-      const auto trigger_values = arv_camera_dup_available_enumerations_as_strings(
-        camera_, "TriggerSource", &trigger_count, &error);
-      bool has_action0 = false;
-      if (error == nullptr) {
-        for (guint index = 0; trigger_values != nullptr && index < trigger_count; ++index) {
-          has_action0 = has_action0 || lower(value_or_empty(trigger_values[index])) == "action0";
-        }
-      } else {
-        g_error_free(error);
-        error = nullptr;
-      }
-      g_free(trigger_values);
-      supported = supported && has_action0;
-      if (!has_action0) {missing.emplace_back("TriggerSource=Action0");}
-      if (supported) {
-        arv_camera_set_boolean(camera_, ptp_enable_feature_.c_str(), true, &error);
-        throw_on_error(error, "enabling PTP");
+      scheduled_action_supported = scheduled_action_supported && missing.empty() &&
+        action_trigger.has_value() && ptp_clock_;
+      if (scheduled_action_supported) {
         const auto slave_only = first_available_feature(
           {"PtpSlaveOnly", "GevIEEE1588SlaveOnly"});
         if (!slave_only.empty() && feature_writable(camera_, slave_only.c_str())) {
@@ -2112,16 +2306,32 @@ private:
         throw_on_error(error, "setting ActionGroupKey");
         arv_camera_set_integer(camera_, "ActionGroupMask", action_group_mask, &error);
         throw_on_error(error, "setting ActionGroupMask");
-        arv_camera_set_trigger(camera_, "Action0", &error);
-        throw_on_error(error, "enabling Action0 trigger");
+        apply_trigger_configuration(*action_trigger, "enabling Action0 trigger");
+        action_trigger_configuration_ = *action_trigger;
         ptp_action_ = true;
         action_trigger_armed_ = true;
+        std::string software_fallback_detail;
+        software_trigger_configuration_ = trigger_configuration_for(
+          "Software", software_fallback_detail);
         if (assignment_.operating_mode == "preview") {
-          error = nullptr;
-          arv_camera_set_trigger(camera_, "Software", &error);
-          throw_on_error(error, "selecting software trigger for preview mode");
+          if (!software_trigger_configuration_) {
+            throw std::runtime_error(
+                    "selecting software trigger for preview mode: " +
+                    software_fallback_detail);
+          }
+          apply_trigger_configuration(
+            *software_trigger_configuration_, "selecting software trigger for preview mode");
+          const auto & preview_trigger = *software_trigger_configuration_;
           software_trigger_ = true;
+          software_trigger_detail_ = "software trigger uses " +
+            (preview_trigger.selector.empty() ? std::string("camera default selector") :
+            "TriggerSelector=" + preview_trigger.selector);
           action_trigger_armed_ = false;
+        } else {
+          // Probing the selector-dependent Software source may leave another
+          // selector active. Restore the scheduled action before acquisition.
+          apply_trigger_configuration(
+            *action_trigger_configuration_, "restoring Action0 after capability probing");
         }
         RCLCPP_INFO(
           node_->get_logger(),
@@ -2133,10 +2343,11 @@ private:
           static_cast<long long>(action_group_key(assignment_.sensor_id)),
           static_cast<unsigned long long>(action_group_mask),
           config_.ptp_action_lead_time_ms);
-        ptp_capability_detail_ = "PTP supported; waiting for lock";
+        ptp_capability_detail_ = "scheduled action supported; waiting for PTP lock";
       } else {
         std::ostringstream detail;
-        detail << "PTP scheduled action unsupported; missing ";
+        detail << (ptp_clock_ ? "PTP clock available; " : "PTP clock unavailable; ") <<
+          "scheduled action unsupported; missing ";
         for (std::size_t index = 0; index < missing.size(); ++index) {
           if (index != 0) {detail << ", ";}
           detail << missing[index];
@@ -2144,48 +2355,13 @@ private:
         ptp_capability_detail_ = detail.str();
         RCLCPP_WARN(
           node_->get_logger(),
-          "%s: %s%s%s; using unsynchronized software trigger",
+          "%s: %s%s%s; selecting an unsynchronized software trigger",
           assignment_.sensor_id.c_str(), ptp_capability_detail_.c_str(),
           device_version_.empty() ? "" : "; firmware ", device_version_.c_str());
-        arv_camera_set_trigger(camera_, "Software", &error);
-        throw_on_error(error, "enabling software fallback trigger");
-        software_trigger_ = true;
+        configure_software_or_free_run("enabling software fallback trigger");
       }
     } else if (normalized_trigger == "freerun" || normalized_trigger == "free_run") {
-      error = nullptr;
-      const bool trigger_mode_available =
-        arv_camera_is_feature_available(camera_, "TriggerMode", &error);
-      if (error != nullptr) {
-        g_error_free(error);
-        error = nullptr;
-      } else if (trigger_mode_available && feature_writable(camera_, "TriggerMode")) {
-        arv_camera_clear_triggers(camera_, &error);
-        if (error != nullptr) {
-          const auto clear_error = error_text(error, "disabling camera triggers");
-          error = nullptr;
-          const auto current_mode = value_or_empty(
-            arv_camera_get_string(camera_, "TriggerMode", &error));
-          throw_on_error(error, "checking TriggerMode after disable failed");
-          if (lower(current_mode) != "off") {throw std::runtime_error(clear_error);}
-          RCLCPP_WARN(
-            node_->get_logger(),
-            "%s rejected a redundant TriggerMode write but reports TriggerMode=Off; "
-            "continuing in free-run",
-            assignment_.sensor_id.c_str());
-        }
-      } else if (trigger_mode_available) {
-        const auto current_mode = value_or_empty(
-          arv_camera_get_string(camera_, "TriggerMode", &error));
-        throw_on_error(error, "reading read-only TriggerMode");
-        if (lower(current_mode) != "off") {
-          throw std::runtime_error(
-                  "TriggerMode is read-only and currently " + current_mode +
-                  "; the camera cannot enter FreeRun mode");
-        }
-        RCLCPP_INFO(
-          node_->get_logger(), "%s has read-only TriggerMode=Off; keeping camera in free-run",
-          assignment_.sensor_id.c_str());
-      }
+      configure_free_run();
     } else {
       throw std::runtime_error(
               "unsupported trigger_source " + trigger_source +
@@ -2356,10 +2532,13 @@ private:
         }
         const bool software_for_request = software_trigger_ || request->force_software_trigger;
         if (request->force_software_trigger && action_trigger_armed_) {
-          GError * error = nullptr;
+          if (!software_trigger_configuration_) {
+            throw std::runtime_error("camera exposes no software fallback trigger");
+          }
           std::lock_guard<std::mutex> lock(camera_control_mutex_);
-          arv_camera_set_trigger(camera_, "Software", &error);
-          throw_on_error(error, "temporarily selecting software trigger while PTP is unlocked");
+          apply_trigger_configuration(
+            *software_trigger_configuration_,
+            "temporarily selecting software trigger while PTP is unavailable");
           restore_action_trigger = true;
         }
         if (software_for_request) {
@@ -2368,14 +2547,26 @@ private:
               static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count());
           }
-          GError * error = nullptr;
-          {
-            std::lock_guard<std::mutex> lock(camera_control_mutex_);
-            arv_camera_software_trigger(camera_, &error);
+          const auto metering_retry_deadline = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(config_.image_timeout_ms);
+          while (true) {
+            GError * error = nullptr;
+            {
+              std::lock_guard<std::mutex> lock(camera_control_mutex_);
+              arv_camera_software_trigger(camera_, &error);
+            }
+            if (error == nullptr) {break;}
+            const auto trigger_error = error_text(error, "software trigger");
+            if (!request->metering || lower(trigger_error).find("busy") == std::string::npos ||
+              std::chrono::steady_clock::now() >= metering_retry_deadline)
+            {
+              throw std::runtime_error(trigger_error);
+            }
+            // Some cameras report TriggerArmed before their first command
+            // register is ready. Retrying only the disposable metering frame
+            // avoids noisy cold-start failures without shifting real captures.
+            std::this_thread::sleep_for(10ms);
           }
-          const auto trigger_error = error == nullptr ? std::string{} :
-            error_text(error, "software trigger");
-          if (!trigger_error.empty()) {throw std::runtime_error(trigger_error);}
         }
         const auto frame_deadline = std::chrono::steady_clock::now() +
           std::chrono::milliseconds(config_.image_timeout_ms);
@@ -2476,10 +2667,9 @@ private:
         if (request->metering) {
           arv_stream_push_buffer(stream_, buffer);
           if (restore_action_trigger) {
-            GError * error = nullptr;
             std::lock_guard<std::mutex> lock(camera_control_mutex_);
-            arv_camera_set_trigger(camera_, "Action0", &error);
-            throw_on_error(error, "restoring Action0 after metering frame");
+            apply_trigger_configuration(
+              *action_trigger_configuration_, "restoring Action0 after metering frame");
             restore_action_trigger = false;
           }
           capture_primed_.store(true);
@@ -2498,10 +2688,10 @@ private:
         }
         arv_stream_push_buffer(stream_, buffer);
         if (restore_action_trigger) {
-          GError * error = nullptr;
           std::lock_guard<std::mutex> lock(camera_control_mutex_);
-          arv_camera_set_trigger(camera_, "Action0", &error);
-          throw_on_error(error, "restoring Action0 after temporary software-triggered frame");
+          apply_trigger_configuration(
+            *action_trigger_configuration_,
+            "restoring Action0 after temporary software-triggered frame");
           restore_action_trigger = false;
         }
         for (const auto & delivery : deliveries) {
@@ -2533,16 +2723,15 @@ private:
       } catch (const std::exception & error) {
         close_deliveries();
         if (restore_action_trigger) {
-          GError * restore_error = nullptr;
-          {
+          try {
             std::lock_guard<std::mutex> lock(camera_control_mutex_);
-            arv_camera_set_trigger(camera_, "Action0", &restore_error);
-          }
-          if (restore_error != nullptr) {
+            apply_trigger_configuration(
+              *action_trigger_configuration_,
+              "restoring Action0 after failed software-triggered frame");
+          } catch (const std::exception & restore_error) {
             RCLCPP_ERROR(
               node_->get_logger(), "Unable to restore Action0 for %s after failed frame: %s",
-              assignment_.sensor_id.c_str(), restore_error->message);
-            g_error_free(restore_error);
+              assignment_.sensor_id.c_str(), restore_error.what());
           }
         }
         for (const auto & delivery : deliveries) {
@@ -2765,8 +2954,11 @@ private:
   std::uint64_t last_resent_packets_{0};
   std::uint64_t last_missing_packets_{0};
   bool software_trigger_{false};
+  bool ptp_clock_{false};
   bool ptp_action_{false};
   bool action_trigger_armed_{false};
+  std::optional<TriggerConfiguration> software_trigger_configuration_;
+  std::optional<TriggerConfiguration> action_trigger_configuration_;
   std::string trigger_armed_feature_;
   std::string ptp_enable_feature_;
   std::string ptp_status_feature_;
@@ -2779,6 +2971,7 @@ private:
   std::atomic<std::int64_t> cached_ptp_clock_offset_ns_{0};
   std::atomic<std::int64_t> cached_ptp_refreshed_ns_{0};
   std::string ptp_capability_detail_{"PTP not requested"};
+  std::string software_trigger_detail_;
   std::string device_version_;
   CaptureCadence cadence_;
   std::uint32_t minimum_capture_interval_ms_{0};
@@ -3040,7 +3233,7 @@ private:
       observation.current_address = record.address;
       observation.capabilities = {
         "image", "compressed_preview", "genicam", "camera_settings",
-        "software_capture"};
+        "capture_capability_unknown"};
       message.observations.push_back(observation);
     }
     try {
@@ -3206,15 +3399,18 @@ private:
     std::map<std::string, std::size_t> expected_group_sizes;
     for (const auto & item : assignments_) {
       const auto & assignment = item.second;
-      if (!assignment.enabled || assignment.operating_mode != "capture" ||
-        assignment.sync_group.empty())
-      {
+      if (!assignment.enabled || assignment.operating_mode != "capture") {
         continue;
       }
-      ++expected_group_sizes[assignment.sync_group];
+      // A directly owned camera does not need to belong to a synchronization
+      // group. Give it a private metering domain so automatic exposure/gain can
+      // produce the clean priming frame required before a single-camera shot.
+      const auto metering_group = capture_metering_domain(
+        assignment.sensor_id, assignment.sync_group);
+      ++expected_group_sizes[metering_group];
       const auto session = sessions_.find(item.first);
       if (session != sessions_.end()) {
-        metering_groups[assignment.sync_group].push_back(session->second.get());
+        metering_groups[metering_group].push_back(session->second.get());
       }
     }
     for (auto & group : metering_groups) {
@@ -3234,6 +3430,10 @@ private:
       std::uint64_t action_time = 0;
       bool has_ptp_members = false;
       for (auto * session : members) {
+        if (!session->capture_trigger_armed()) {
+          triggerable = false;
+          break;
+        }
         if (session->ptp_action()) {
           if (!session->ptp_locked()) {
             triggerable = false;
@@ -3248,8 +3448,9 @@ private:
       }
       if (!triggerable) {continue;}
 
-      const auto lead = !has_ptp_members ? 0ms :
-        std::chrono::milliseconds(config_.ptp_action_lead_time_ms);
+      const auto lead = std::chrono::milliseconds(
+        has_ptp_members ? config_.ptp_action_lead_time_ms :
+        config_.software_trigger_lead_time_ms);
       action_time += static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(lead).count());
       const auto release_at = tick + lead;
@@ -3342,7 +3543,7 @@ private:
       sensor.capture_ready = false;
       sensor.capabilities = {
         "image", "compressed_preview", "genicam", "camera_settings",
-        "software_capture", "ptp_capability_unknown"};
+        "capture_capability_unknown", "ptp_capability_unknown"};
       const auto health = stream_health_.find(item.first);
       if (health != stream_health_.end()) {
         std::lock_guard<std::mutex> health_lock(health->second->mutex);
@@ -3755,6 +3956,7 @@ private:
     std::uint64_t latest_dispatch = 0;
     std::vector<std::string> action_errors;
     std::set<std::string> failed_action_sensors;
+    std::vector<std::string> trigger_unavailable_errors;
     if (action_time) {
       for (const auto & item : action_targets) {
         auto & scheduled_sensors = scheduled_sensor_actions_[*action_time];
@@ -3789,11 +3991,14 @@ private:
     }
     for (const auto & sensor_id : request->member_ids) {
       const auto session = sessions_.find(sensor_id);
-      if (session == sessions_.end() || !session->second->ready() ||
-        (!session->second->software_trigger() &&
-        !session->second->ptp_action()))
-      {
+      if (session == sessions_.end() || !session->second->ready()) {
         response->missing_sensor_ids.push_back(sensor_id);
+      } else if (!session->second->software_trigger() && !session->second->ptp_action()) {
+        response->missing_sensor_ids.push_back(sensor_id);
+        trigger_unavailable_errors.push_back(
+          sensor_id + ": " + (session->second->software_trigger_detail().empty() ?
+          "camera exposes no usable capture trigger" :
+          session->second->software_trigger_detail()));
       } else {
         const bool force_software = session->second->ptp_action() &&
           (!request_ptp_locked[sensor_id] ||
@@ -3883,6 +4088,8 @@ private:
       " unsynchronized frame(s) published" : !acquisition_errors.empty() ?
       "camera acquisition failed: " + joined(acquisition_errors) : !action_errors.empty() ?
       "scheduled action and software fallback failed: " + action_errors.front() :
+      !trigger_unavailable_errors.empty() ?
+      "camera capture trigger unavailable: " + joined(trigger_unavailable_errors) :
       "one or more cameras were unavailable, PTP-unlocked, busy, or failed acquisition";
   }
 

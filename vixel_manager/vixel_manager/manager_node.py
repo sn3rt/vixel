@@ -579,6 +579,11 @@ class InventoryManager(Node):
         if runtime:
             message.online = runtime.online
             message.lifecycle_state = runtime.lifecycle_state
+            # Discovery cannot safely infer selector-dependent trigger support.
+            # Prefer the provider's capabilities after it has opened and probed
+            # the camera, so unsupported devices are not advertised as
+            # software-capturable from stale inventory metadata.
+            message.capabilities = list(runtime.capabilities)
             message.current_address = runtime.current_address
             message.interface_name = runtime.interface_name
             message.last_error = runtime.last_error

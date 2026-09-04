@@ -31,3 +31,13 @@ TEST(CapturePreparation, InFlightCaptureDoesNotRevokeLatchedReadiness)
 {
   EXPECT_TRUE(vixel_genicam::capture_preparation_ready(true, true, false, true, false));
 }
+
+TEST(CapturePreparation, UngroupedCameraGetsPrivateMeteringDomain)
+{
+  EXPECT_EQ(
+    vixel_genicam::capture_metering_domain("camera_ids_1", ""),
+    "sensor:camera_ids_1");
+  EXPECT_EQ(
+    vixel_genicam::capture_metering_domain("camera_ids_1", "front"),
+    "front");
+}

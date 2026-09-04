@@ -269,6 +269,60 @@ def test_runtime_capture_sensor_waits_until_pipeline_is_prepared():
     assert _runtime_sensor_is_ready(sensor, "capture")
 
 
+def test_online_sensor_uses_probed_runtime_capabilities():
+    manager = InventoryManager.__new__(InventoryManager)
+    manager.registry = SimpleNamespace(
+        machine={
+            "managed_networks": {"camera_link": {"approved": True}},
+        }
+    )
+    manager.camera_backend = "genicam"
+    manager._clock = Clock()
+    manager.runtime = {
+        "camera_ids": SimpleNamespace(
+            online=True,
+            lifecycle_state="capture",
+            capabilities=[
+                "image", "software_capture", "software_trigger",
+                "ptp_clock_available", "unsynchronized_group_capture",
+            ],
+            current_address="192.168.8.11",
+            interface_name="enp15s0",
+            last_error="",
+            status_detail="PTP clock Master; scheduled action unsupported",
+            applied_settings_json="{}",
+            capture_ready=True,
+            stream_health_state="healthy",
+            stream_completed_buffers=1,
+            stream_failed_buffers=0,
+            stream_underruns=0,
+            stream_resent_packets=0,
+            stream_missing_packets=0,
+            stream_restart_count=0,
+            model="GV-504xFA-C",
+            mac_address="00:11:22:33:44:55",
+        )
+    }
+    manager.observations = {}
+    manager._groups_for_sensor = lambda _sensor_id: []
+    manager._mode_for_sensor = lambda _sensor_id: "capture"
+    record = {
+        "provider": "genicam",
+        "kind": "camera",
+        "vendor": "IDS",
+        "model": "GV-504xFA-C",
+        "serial": "4103768430",
+        "mac_address": "00:11:22:33:44:55",
+        "network_id": "camera_link",
+        "capabilities": ["image", "software_capture", "ptp_scheduled_action"],
+    }
+
+    message = manager._sensor_message("camera_ids", record)
+
+    assert message.capabilities == manager.runtime["camera_ids"].capabilities
+    assert "ptp_scheduled_action" not in message.capabilities
+
+
 def test_unapproved_network_is_visible_but_not_managed():
     manager = InventoryManager.__new__(InventoryManager)
     manager.registry = SimpleNamespace(machine={

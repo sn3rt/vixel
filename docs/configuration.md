@@ -125,8 +125,11 @@ portable settings include:
 }
 ```
 
-`FreeRun` is the interoperable default. Use `Software` only when the camera
-supports a software `FrameStart` trigger. When SFNC `TransferControlMode` is
+`FreeRun` is the interoperable default. Software-trigger selection is
+capability-driven: Vixel prefers `FrameStart`, then `ExposureStart`, then
+`AcquisitionStart`, and verifies that the selected trigger advertises the
+`Software` source. This supports cameras such as IDS models whose software
+trigger is attached to `ExposureStart`. When SFNC `TransferControlMode` is
 available, Vixel defaults it to `Basic` to avoid frames being held by settings
 left behind by another application.
 
@@ -168,9 +171,16 @@ dedicated camera links can lower the managed-network packet delay in
 `machine.yaml` independently of camera brand.
 
 Grouped cameras automatically request `Action0` and PTP; there is no group
-trigger-source selector. Cameras without the required nodes fall back to the
-software barrier and remain part of the group, with their result marked
-unsynchronized. Individual settings remain effective for ungrouped cameras.
+trigger-source selector. PTP clock synchronization and scheduled action support
+are detected separately. Cameras that expose a PTP clock but not the complete
+scheduled-action feature set keep their clock enabled and fall back to the
+software barrier. They remain part of the group, but their exposure is marked
+unsynchronized. The `ptp_clock_available` capability means only that the clock
+controls were found and enabled; the reported PTP state and capture timing say
+whether synchronization was actually achieved. A camera with no compatible
+software trigger stays available for free-running preview and reports capture
+as unavailable instead of failing its entire session. Individual settings
+remain effective for ungrouped cameras.
 
 Manual exposure uses `exposure_auto: "Off"` with `exposure_us`, and manual
 gain uses `gain_auto: "Off"` with `gain_db`. With either automatic control

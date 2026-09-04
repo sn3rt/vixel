@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 namespace vixel_genicam
 {
@@ -21,6 +22,12 @@ inline bool capture_preparation_ready(
 {
   return preparation_latched || (capture_primed && pipeline_idle &&
          (!trigger_armed_required || trigger_armed));
+}
+
+inline std::string capture_metering_domain(
+  const std::string & sensor_id, const std::string & sync_group)
+{
+  return sync_group.empty() ? "sensor:" + sensor_id : sync_group;
 }
 
 }  // namespace vixel_genicam
