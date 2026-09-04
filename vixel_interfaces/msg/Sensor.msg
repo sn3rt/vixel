@@ -34,3 +34,12 @@ bool managed
 string pending_action
 string status_detail
 string applied_settings_json
+# Cumulative GenICam transport health. Counters survive an automatic stream
+# rebuild for as long as the provider process remains alive.
+string stream_health_state
+uint64 stream_completed_buffers
+uint64 stream_failed_buffers
+uint64 stream_underruns
+uint64 stream_resent_packets
+uint64 stream_missing_packets
+uint64 stream_restart_count

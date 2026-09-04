@@ -202,6 +202,10 @@ def validate_machine(data: dict[str, Any]) -> dict[str, Any]:
             "image_timeout_ms": min(int(legacy.get("image_timeout_ms", 1000)), 1000),
             "buffer_count": 16,
             "socket_buffer_bytes": 33554432,
+            "stream_restart_error_threshold": 10,
+            "stream_restart_window_ms": 30000,
+            "stream_restart_backoff_ms": 30000,
+            "stream_health_log_period_ms": 60000,
             "imaging": copy.deepcopy(legacy_imaging),
         }
         providers["genicam"]["imaging"].setdefault("frame_rate_hz", 10.0)

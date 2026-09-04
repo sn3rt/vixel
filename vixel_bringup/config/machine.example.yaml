@@ -54,6 +54,11 @@ providers:
     image_timeout_ms: 1000
     buffer_count: 16
     socket_buffer_bytes: 33554432
+    # Rebuild only the affected camera stream after repeated transport failures.
+    stream_restart_error_threshold: 10
+    stream_restart_window_ms: 30000
+    stream_restart_backoff_ms: 30000
+    stream_health_log_period_ms: 60000
     software_trigger_lead_time_ms: 10
     encode_queue_depth: 8
     capture_png_compression: 1

@@ -39,6 +39,10 @@ struct GenicamConfig
   int image_timeout_ms{1000};
   int buffer_count{16};
   int socket_buffer_bytes{33554432};
+  int stream_restart_error_threshold{10};
+  int stream_restart_window_ms{30000};
+  int stream_restart_backoff_ms{30000};
+  int stream_health_log_period_ms{60000};
   int software_trigger_lead_time_ms{10};
   int ptp_action_lead_time_ms{100};
   int encode_queue_depth{8};

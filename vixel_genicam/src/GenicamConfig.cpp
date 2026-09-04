@@ -106,6 +106,25 @@ GenicamConfig load_genicam_config(const std::string & path)
   config.buffer_count = std::max(4, read_or(provider, "buffer_count", config.buffer_count));
   config.socket_buffer_bytes = read_or(
     provider, "socket_buffer_bytes", config.socket_buffer_bytes);
+  config.stream_restart_error_threshold = read_or(
+    provider, "stream_restart_error_threshold", config.stream_restart_error_threshold);
+  config.stream_restart_window_ms = read_or(
+    provider, "stream_restart_window_ms", config.stream_restart_window_ms);
+  config.stream_restart_backoff_ms = read_or(
+    provider, "stream_restart_backoff_ms", config.stream_restart_backoff_ms);
+  config.stream_health_log_period_ms = read_or(
+    provider, "stream_health_log_period_ms", config.stream_health_log_period_ms);
+  if (config.stream_restart_error_threshold < 1 ||
+    config.stream_restart_error_threshold > 1000 ||
+    config.stream_restart_window_ms < 1000 ||
+    config.stream_restart_window_ms > 3600000 ||
+    config.stream_restart_backoff_ms < 1000 ||
+    config.stream_restart_backoff_ms > 3600000 ||
+    config.stream_health_log_period_ms < 1000 ||
+    config.stream_health_log_period_ms > 3600000)
+  {
+    throw std::runtime_error("providers.genicam stream recovery configuration is invalid");
+  }
   config.encode_queue_depth = read_or(
     provider, "encode_queue_depth", config.encode_queue_depth);
   if (config.encode_queue_depth < 1 || config.encode_queue_depth > 64) {

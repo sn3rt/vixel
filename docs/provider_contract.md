@@ -56,6 +56,9 @@ fallback. While locking, `synchronization_method` is `ptp_relocking`.
 
 Camera providers publish beneath `/vixel/sensors/<sensor_id>`; the generic
 GenICam provider publishes `image_raw`, `image_raw/compressed`, and `camera_info`.
+Its preview scheduler is subscriber-driven: preview-mode cameras are triggered
+only while `image_raw` or `image_raw/compressed` has a subscriber. Persistent
+capture and capture-mode metering do not depend on those subscriptions.
 Providers that support persistent camera capture also publish
 `image_capture/chunks` as reliable `CaptureFrameChunk` messages. Every chunk for
 one frame uses the `capture_id` and timestamp returned by `ProviderCapture`;

@@ -2,6 +2,7 @@
 #include "vixel_genicam/CapturePreparation.hpp"
 #include "vixel_genicam/GenicamConfig.hpp"
 #include "vixel_genicam/FrameTimestamp.hpp"
+#include "vixel_genicam/StreamRecovery.hpp"
 
 #include <arv.h>
 #include <camera_info_manager/camera_info_manager.hpp>
@@ -841,6 +842,12 @@ public:
     compressed_publisher_->publish(compressed);
   }
 
+  bool has_preview_subscribers() const
+  {
+    return image_publisher_->get_subscription_count() != 0 ||
+           compressed_publisher_->get_subscription_count() != 0;
+  }
+
 private:
   std::mutex publish_mutex_;
   std::string assignment_sensor_id_;
@@ -852,6 +859,26 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr compressed_publisher_;
   rclcpp::Publisher<vixel_interfaces::msg::CaptureFrameChunk>::SharedPtr capture_publisher_;
   rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr info_publisher_;
+};
+
+struct StreamHealth
+{
+  explicit StreamHealth(const GenicamConfig & config)
+  : recovery(
+      static_cast<std::size_t>(config.stream_restart_error_threshold),
+      std::chrono::milliseconds(config.stream_restart_window_ms),
+      std::chrono::milliseconds(config.stream_restart_backoff_ms))
+  {
+  }
+
+  std::atomic<std::uint64_t> completed_buffers{0};
+  std::atomic<std::uint64_t> failed_buffers{0};
+  std::atomic<std::uint64_t> underruns{0};
+  std::atomic<std::uint64_t> resent_packets{0};
+  std::atomic<std::uint64_t> missing_packets{0};
+  std::atomic<std::uint64_t> restart_count{0};
+  std::mutex mutex;
+  StreamRecoveryPolicy recovery;
 };
 
 class CameraSession
@@ -909,10 +936,11 @@ public:
 
   CameraSession(
     rclcpp::Node * node, Assignment assignment, DeviceRecord record, NetworkConfig network,
-    GenicamConfig config)
+    GenicamConfig config, std::shared_ptr<StreamHealth> stream_health)
   : node_(node), assignment_(std::move(assignment)), record_(std::move(record)),
     network_(std::move(network)), config_(std::move(config)),
-    endpoint_(std::make_unique<CameraEndpoint>(node_, assignment_, config_))
+    endpoint_(std::make_unique<CameraEndpoint>(node_, assignment_, config_)),
+    stream_health_(std::move(stream_health))
   {
   }
 
@@ -998,6 +1026,7 @@ public:
     encode_cv_.notify_all();
     if (worker_.joinable()) {worker_.join();}
     if (encoder_.joinable()) {encoder_.join();}
+    collect_stream_statistics();
     if (camera_ != nullptr && streaming_.exchange(false)) {
       GError * error = nullptr;
       if (transfer_start_required_) {
@@ -1014,7 +1043,11 @@ public:
 
   bool preview_due(const std::chrono::steady_clock::time_point tick)
   {
-    if (assignment_.operating_mode != "preview" || tick < next_preview_) {return false;}
+    if (assignment_.operating_mode != "preview" || !endpoint_->has_preview_subscribers() ||
+      tick < next_preview_)
+    {
+      return false;
+    }
     const double rate = std::clamp(assignment_.preview_rate_hz, 0.1, 10.0);
     next_preview_ = tick + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
       std::chrono::duration<double>(1.0 / rate));
@@ -1093,6 +1126,19 @@ public:
   }
 
   bool ready() const {return ready_.load();}
+  bool recovery_requested() const
+  {
+    std::lock_guard<std::mutex> lock(stream_health_->mutex);
+    return stream_health_->recovery.restart_requested();
+  }
+
+  void mark_restarting(const std::chrono::steady_clock::time_point now)
+  {
+    collect_stream_statistics();
+    std::lock_guard<std::mutex> lock(stream_health_->mutex);
+    stream_health_->recovery.mark_restarted(now);
+    ++stream_health_->restart_count;
+  }
   bool capture_primed() const {return capture_primed_.load();}
   bool capture_prepared()
   {
@@ -1175,6 +1221,7 @@ public:
 
   Sensor status()
   {
+    collect_stream_statistics();
     Sensor result;
     result.stamp = node_->now();
     result.sensor_id = assignment_.sensor_id;
@@ -1203,6 +1250,16 @@ public:
       "software_capture"};
     result.capabilities.push_back(ptp_action_ ? "ptp_scheduled_action" : "unsynchronized_group_capture");
     result.applied_settings_json = applied_settings_;
+    {
+      std::lock_guard<std::mutex> lock(stream_health_->mutex);
+      result.stream_health_state = stream_health_->recovery.degraded() ? "degraded" : "healthy";
+    }
+    result.stream_completed_buffers = stream_health_->completed_buffers.load();
+    result.stream_failed_buffers = stream_health_->failed_buffers.load();
+    result.stream_underruns = stream_health_->underruns.load();
+    result.stream_resent_packets = stream_health_->resent_packets.load();
+    result.stream_missing_packets = stream_health_->missing_packets.load();
+    result.stream_restart_count = stream_health_->restart_count.load();
     {
       std::lock_guard<std::mutex> lock(error_mutex_);
       result.last_error = last_error_;
@@ -1243,6 +1300,49 @@ public:
   }
 
 private:
+  static bool is_transport_failure(const std::string & message)
+  {
+    return message == "image timeout" ||
+           message.rfind("incomplete image buffer:", 0) == 0;
+  }
+
+  void record_transport_failure(const std::chrono::steady_clock::time_point now)
+  {
+    std::lock_guard<std::mutex> lock(stream_health_->mutex);
+    stream_health_->recovery.record_failure(now);
+  }
+
+  bool record_healthy_frame(const std::chrono::steady_clock::time_point now)
+  {
+    std::lock_guard<std::mutex> lock(stream_health_->mutex);
+    return stream_health_->recovery.record_success(now);
+  }
+
+  void collect_stream_statistics()
+  {
+    std::lock_guard<std::mutex> lock(statistics_mutex_);
+    if (stream_ == nullptr) {return;}
+    guint64 completed = 0;
+    guint64 failed = 0;
+    guint64 underruns = 0;
+    arv_stream_get_statistics(stream_, &completed, &failed, &underruns);
+    stream_health_->completed_buffers.fetch_add(completed - last_completed_buffers_);
+    stream_health_->failed_buffers.fetch_add(failed - last_failed_buffers_);
+    stream_health_->underruns.fetch_add(underruns - last_underruns_);
+    last_completed_buffers_ = completed;
+    last_failed_buffers_ = failed;
+    last_underruns_ = underruns;
+    if (ARV_IS_GV_STREAM(stream_)) {
+      guint64 resent = 0;
+      guint64 missing = 0;
+      arv_gv_stream_get_statistics(ARV_GV_STREAM(stream_), &resent, &missing);
+      stream_health_->resent_packets.fetch_add(resent - last_resent_packets_);
+      stream_health_->missing_packets.fetch_add(missing - last_missing_packets_);
+      last_resent_packets_ = resent;
+      last_missing_packets_ = missing;
+    }
+  }
+
   PtpState refresh_ptp_cache()
   {
     const auto state = read_ptp_state();
@@ -2357,6 +2457,12 @@ private:
                   "incomplete image buffer: " + buffer_status_name(status) + " (status " +
                   std::to_string(status) + ")");
         }
+        const bool stable_after_errors = record_healthy_frame(std::chrono::steady_clock::now());
+        if (stable_after_errors) {
+          std::lock_guard<std::mutex> error_lock(error_mutex_);
+          warning_active_ = false;
+          warning_count_ = 0;
+        }
         close_deliveries();
         const auto device_timestamp_ns = arv_buffer_get_timestamp(buffer);
         const bool synchronized = ptp_action_ && !request->force_software_trigger;
@@ -2382,7 +2488,6 @@ private:
           {
             std::lock_guard<std::mutex> error_lock(error_mutex_);
             last_error_.clear();
-            warning_active_ = false;
           }
           continue;
         }
@@ -2425,7 +2530,6 @@ private:
         capture_primed_.store(true);
         std::lock_guard<std::mutex> error_lock(error_mutex_);
         last_error_.clear();
-        warning_active_ = false;
       } catch (const std::exception & error) {
         close_deliveries();
         if (restore_action_trigger) {
@@ -2451,20 +2555,29 @@ private:
           delivery.completion->changed.notify_all();
         }
         const auto now = std::chrono::steady_clock::now();
+        if (is_transport_failure(error.what())) {
+          record_transport_failure(now);
+        }
         bool should_log = false;
+        std::uint64_t warning_count = 0;
         {
           std::lock_guard<std::mutex> error_lock(error_mutex_);
           last_error_ = error.what();
+          ++warning_count_;
           should_log = !warning_active_ || now >= next_warning_;
           if (should_log) {
             warning_active_ = true;
-            next_warning_ = now + 5s;
+            next_warning_ = now +
+              std::chrono::milliseconds(config_.stream_health_log_period_ms);
+            warning_count = warning_count_;
+            warning_count_ = 0;
           }
         }
         if (should_log) {
           RCLCPP_WARN(
-            node_->get_logger(), "Acquisition failed for %s: %s",
-            assignment_.sensor_id.c_str(), error.what());
+            node_->get_logger(), "Acquisition failed for %s: %s (%llu failure(s) since last warning)",
+            assignment_.sensor_id.c_str(), error.what(),
+            static_cast<unsigned long long>(warning_count));
         }
         pipeline_depth_.fetch_sub(deliveries.size());
       }
@@ -2633,6 +2746,7 @@ private:
   NetworkConfig network_;
   GenicamConfig config_;
   std::unique_ptr<CameraEndpoint> endpoint_;
+  std::shared_ptr<StreamHealth> stream_health_;
   ArvCamera * camera_{nullptr};
   ArvStream * stream_{nullptr};
   std::thread worker_;
@@ -2644,6 +2758,12 @@ private:
   std::atomic<bool> capture_preparation_latched_{false};
   std::atomic<std::uint64_t> completed_frames_{0};
   std::atomic<std::uint64_t> incomplete_frames_{0};
+  std::mutex statistics_mutex_;
+  std::uint64_t last_completed_buffers_{0};
+  std::uint64_t last_failed_buffers_{0};
+  std::uint64_t last_underruns_{0};
+  std::uint64_t last_resent_packets_{0};
+  std::uint64_t last_missing_packets_{0};
   bool software_trigger_{false};
   bool ptp_action_{false};
   bool action_trigger_armed_{false};
@@ -2685,6 +2805,7 @@ private:
   std::chrono::steady_clock::time_point next_warning_{};
   mutable std::mutex error_mutex_;
   bool warning_active_{false};
+  std::uint64_t warning_count_{0};
   std::string last_error_;
   std::string applied_settings_{"{}"};
 };
@@ -2978,7 +3099,15 @@ private:
         iterator->second->assignment().calibration_url &&
         assignment->second.network_id == iterator->second->assignment().network_id &&
         records_.count(assignment->second.serial) != 0;
-      if (!keep) {iterator = sessions_.erase(iterator);} else {++iterator;}
+      if (!keep) {
+        if (iterator->second->recovery_requested()) {
+          iterator->second->mark_restarting(std::chrono::steady_clock::now());
+          RCLCPP_WARN(
+            get_logger(), "Rebuilding degraded GenICam stream for %s during reconfiguration",
+            iterator->first.c_str());
+        }
+        iterator = sessions_.erase(iterator);
+      } else {++iterator;}
     }
     for (const auto & item : assignments_) {
       const auto & assignment = item.second;
@@ -3028,8 +3157,10 @@ private:
       try {
         std::lock_guard<std::mutex> aravis_lock(aravis_mutex_);
         arv_gv_interface_set_discovery_interface_name(network->second.interface.c_str());
+        auto & health = stream_health_[item.first];
+        if (!health) {health = std::make_shared<StreamHealth>(config_);}
         auto session = std::make_unique<CameraSession>(
-          this, assignment, record->second, network->second, config_);
+          this, assignment, record->second, network->second, config_, health);
         session->initialize();
         sessions_[item.first] = std::move(session);
         initialization_errors_.erase(item.first);
@@ -3055,6 +3186,7 @@ private:
     if (!scheduling_lock.owns_lock()) {return;}
     std::lock_guard<std::mutex> lock(mutex_);
     const auto tick = std::chrono::steady_clock::now();
+    recover_failed_sessions(tick);
     const auto stamp = now();
     for (auto & item : sessions_) {
       if (item.second->preview_due(tick)) {
@@ -3153,6 +3285,30 @@ private:
     }
   }
 
+  void recover_failed_sessions(const std::chrono::steady_clock::time_point tick)
+  {
+    std::vector<std::string> rebuilding;
+    for (const auto & item : sessions_) {
+      const auto assignment = assignments_.find(item.first);
+      if (!item.second->recovery_requested() || assignment == assignments_.end() ||
+        assignment->second.capture_reserved)
+      {
+        continue;
+      }
+      rebuilding.push_back(item.first);
+    }
+    for (const auto & sensor_id : rebuilding) {
+      const auto session = sessions_.find(sensor_id);
+      if (session == sessions_.end()) {continue;}
+      session->second->mark_restarting(tick);
+      RCLCPP_WARN(
+        get_logger(), "Rebuilding GenICam stream for %s after repeated transport failures",
+        sensor_id.c_str());
+      sessions_.erase(session);
+    }
+    if (!rebuilding.empty()) {reconcile_sessions();}
+  }
+
   void publish_status()
   {
     std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
@@ -3187,6 +3343,18 @@ private:
       sensor.capabilities = {
         "image", "compressed_preview", "genicam", "camera_settings",
         "software_capture", "ptp_capability_unknown"};
+      const auto health = stream_health_.find(item.first);
+      if (health != stream_health_.end()) {
+        std::lock_guard<std::mutex> health_lock(health->second->mutex);
+        sensor.stream_health_state =
+          health->second->recovery.degraded() ? "degraded" : "offline";
+        sensor.stream_completed_buffers = health->second->completed_buffers.load();
+        sensor.stream_failed_buffers = health->second->failed_buffers.load();
+        sensor.stream_underruns = health->second->underruns.load();
+        sensor.stream_resent_packets = health->second->resent_packets.load();
+        sensor.stream_missing_packets = health->second->missing_packets.load();
+        sensor.stream_restart_count = health->second->restart_count.load();
+      }
       const auto error = initialization_errors_.find(item.first);
       if (error != initialization_errors_.end()) {sensor.last_error = error->second;}
       status.sensors.push_back(sensor);
@@ -3751,6 +3919,7 @@ private:
   std::map<std::string, DeviceRecord> records_;
   std::map<std::string, Assignment> assignments_;
   std::map<std::string, std::unique_ptr<CameraSession>> sessions_;
+  std::map<std::string, std::shared_ptr<StreamHealth>> stream_health_;
   std::map<std::string, std::string> initialization_errors_;
   std::map<std::string, std::chrono::steady_clock::time_point> last_force_ip_attempt_;
   std::string last_system_error_;

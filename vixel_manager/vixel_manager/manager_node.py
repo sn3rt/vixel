@@ -585,6 +585,13 @@ class InventoryManager(Node):
             message.status_detail = runtime.status_detail
             message.applied_settings_json = runtime.applied_settings_json
             message.capture_ready = runtime.capture_ready
+            message.stream_health_state = runtime.stream_health_state
+            message.stream_completed_buffers = runtime.stream_completed_buffers
+            message.stream_failed_buffers = runtime.stream_failed_buffers
+            message.stream_underruns = runtime.stream_underruns
+            message.stream_resent_packets = runtime.stream_resent_packets
+            message.stream_missing_packets = runtime.stream_missing_packets
+            message.stream_restart_count = runtime.stream_restart_count
             if runtime.model:
                 message.model = runtime.model
             if runtime.mac_address:

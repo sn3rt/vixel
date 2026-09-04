@@ -52,10 +52,19 @@ was killed, power-cycle the camera after confirming no owner remains.
 
 ## Slow or stale preview
 
-The dashboard polls cached compressed snapshots and does not control the raw
-camera rate. Check provider acquisition warnings, preview rate, JPEG encoding
-load, network loss, and browser tunnel latency. A successful HTTP response can
-still contain an old cached frame when acquisition has stalled.
+The dashboard creates preview demand while it polls compressed snapshots. The
+web gateway removes its camera subscription five seconds after polling stops,
+and the GenICam provider stops issuing preview triggers when no raw or compressed
+ROS subscriber remains. External ROS image subscribers intentionally keep the
+preview active. Check the camera detail page for completed/failed buffers,
+underruns, resent/missing packets, and automatic stream restarts. A successful
+HTTP response can still briefly contain the last cached frame while acquisition
+resumes.
+
+Repeated transport failures mark only that camera stream degraded. Ten failures
+within 30 seconds request an affected-camera stream rebuild, with a 30-second
+restart backoff. Rebuilds are deferred while a capture session owns the camera,
+and a failed requested capture is never automatically replayed.
 
 ## Capture is rejected or times out
 

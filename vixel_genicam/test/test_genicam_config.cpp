@@ -17,6 +17,10 @@ TEST(GenicamConfig, LoadsProviderAndNetworks)
 providers:
   genicam:
     buffer_count: 20
+    stream_restart_error_threshold: 12
+    stream_restart_window_ms: 45000
+    stream_restart_backoff_ms: 60000
+    stream_health_log_period_ms: 90000
     encode_queue_depth: 12
     capture_png_compression: 2
     cadence_safety_margin_ms: 12
@@ -34,6 +38,10 @@ defaults:
   EXPECT_EQ(config.networks.at("link").packet_size, 8192);
   EXPECT_EQ(config.networks.at("link").packet_delay, 100000);
   EXPECT_EQ(config.buffer_count, 20);
+  EXPECT_EQ(config.stream_restart_error_threshold, 12);
+  EXPECT_EQ(config.stream_restart_window_ms, 45000);
+  EXPECT_EQ(config.stream_restart_backoff_ms, 60000);
+  EXPECT_EQ(config.stream_health_log_period_ms, 90000);
   EXPECT_EQ(config.encode_queue_depth, 12);
   EXPECT_EQ(config.capture_png_compression, 2);
   EXPECT_EQ(config.cadence_safety_margin_ms, 12);

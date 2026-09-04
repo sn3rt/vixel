@@ -85,6 +85,66 @@ def test_sensor_capture_readiness_is_exposed_as_json():
     assert value["capture_ready"] is True
 
 
+def test_sensor_stream_health_is_exposed_as_json():
+    sensor = Sensor()
+    sensor.sensor_id = "camera_a"
+    sensor.stream_health_state = "degraded"
+    sensor.stream_completed_buffers = 100
+    sensor.stream_failed_buffers = 3
+    sensor.stream_underruns = 2
+    sensor.stream_resent_packets = 45
+    sensor.stream_missing_packets = 6
+    sensor.stream_restart_count = 1
+
+    value = sensor_to_dict(sensor)
+
+    assert value["stream_health_state"] == "degraded"
+    assert value["stream_completed_buffers"] == 100
+    assert value["stream_failed_buffers"] == 3
+    assert value["stream_underruns"] == 2
+    assert value["stream_resent_packets"] == 45
+    assert value["stream_missing_packets"] == 6
+    assert value["stream_restart_count"] == 1
+
+
+def test_preview_subscription_is_created_once_and_refreshed_until_lease_expires():
+    node = GatewayNode.__new__(GatewayNode)
+    node.lock = threading.RLock()
+    node.changed = threading.Condition(node.lock)
+    node.callback_group = object()
+    node.preview_topics = {"camera_a": "/camera_a/compressed"}
+    node.preview_demand = {}
+    node.preview_demand_timeout_sec = 5.0
+    node.image_subscriptions = {}
+    created = []
+    destroyed = []
+    node.create_subscription = lambda *args, **kwargs: created.append((args, kwargs)) or object()
+    node.destroy_subscription = destroyed.append
+
+    assert node.request_preview("camera_a") is True
+    first_requested_at = node.preview_demand["camera_a"]
+    assert node.request_preview("camera_a") is True
+    assert len(created) == 1
+    assert node.preview_demand["camera_a"] >= first_requested_at
+
+    node._expire_preview_demand(node.preview_demand["camera_a"] + 4.9)
+    assert "camera_a" in node.image_subscriptions
+    node._expire_preview_demand(node.preview_demand["camera_a"] + 5.0)
+    assert "camera_a" not in node.image_subscriptions
+    assert len(destroyed) == 1
+
+
+def test_preview_request_rejects_unknown_or_ineligible_camera():
+    node = GatewayNode.__new__(GatewayNode)
+    node.lock = threading.RLock()
+    node.changed = threading.Condition(node.lock)
+    node.preview_topics = {}
+    node.preview_demand = {}
+    node.image_subscriptions = {}
+
+    assert node.request_preview("camera_missing") is False
+
+
 def test_capture_record_is_exposed_as_json():
     class Stamp:
         sec = 12

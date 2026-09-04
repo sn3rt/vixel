@@ -107,3 +107,12 @@ def test_dashboard_uses_bounded_snapshot_polling_for_camera_cards():
     assert "schedulePreviews();" in page
     assert "If-None-Match" in page
     assert 'src="/api/v1/sensors/${encodeURIComponent(s.sensor_id)}/stream"' not in page
+
+
+def test_camera_detail_displays_genicam_stream_health():
+    page = PAGE.read_text()
+    assert "Stream health" in page
+    assert "Completed buffers" in page
+    assert "Resent packets" in page
+    assert "Stream restarts" in page
+    assert "Live preview runs only while this page is open" in page

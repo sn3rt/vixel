@@ -47,10 +47,12 @@ curl --max-time 5 -o camera.jpg \
 
 ## Modes and capture selections
 
-Sensors use `idle`, `preview`, or `capture` modes. Preview publishes compressed
-frames for the dashboard at the configured rate while retaining full-resolution
-ROS image topics. Capture targets a named camera selection. The existing ROS
-and HTTP APIs retain the `group` and `SyncGroup` names for compatibility.
+Sensors use `idle`, `preview`, or `capture` modes. In preview mode, camera
+exposures run at the configured rate only while the dashboard or another raw or
+compressed ROS image subscriber is present. Dashboard demand expires five
+seconds after its last image request. Capture targets a named camera selection
+and is independent of browser preview demand. The existing ROS and HTTP APIs
+retain the `group` and `SyncGroup` names for compatibility.
 
 A camera may belong to multiple selections, such as `front`, `back`, and `all`.
 A `strict` selection requires every member. A `degraded` selection captures

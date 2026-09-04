@@ -187,6 +187,13 @@ def sensor_to_dict(sensor) -> dict[str, Any]:
         "pending_action": sensor.pending_action,
         "status_detail": sensor.status_detail,
         "applied_settings": _json_value(sensor.applied_settings_json, {}),
+        "stream_health_state": sensor.stream_health_state,
+        "stream_completed_buffers": int(sensor.stream_completed_buffers),
+        "stream_failed_buffers": int(sensor.stream_failed_buffers),
+        "stream_underruns": int(sensor.stream_underruns),
+        "stream_resent_packets": int(sensor.stream_resent_packets),
+        "stream_missing_packets": int(sensor.stream_missing_packets),
+        "stream_restart_count": int(sensor.stream_restart_count),
     }
 
 
@@ -418,6 +425,9 @@ class GatewayNode(Node):
         self.frames: dict[
             str, tuple[bytes, float, int] | tuple[bytes, float, int, str]
         ] = {}
+        self.preview_topics: dict[str, str] = {}
+        self.preview_demand: dict[str, float] = {}
+        self.preview_demand_timeout_sec = 5.0
         self.image_subscriptions = {}
         self.sensor_subscription = self.create_subscription(
             SensorArray, "/vixel/sensors", self._sensors, STATE_QOS,
@@ -446,6 +456,9 @@ class GatewayNode(Node):
         self.capture_sessions_subscription = self.create_subscription(
             CaptureSessionArray, "/vixel/capture_sessions", self._capture_sessions,
             STATE_QOS, callback_group=self.callback_group
+        )
+        self.preview_cleanup_timer = self.create_timer(
+            1.0, self._expire_preview_demand, callback_group=self.callback_group
         )
         self.enroll_client = ActionClient(
             self, EnrollSensor, "/vixel/enroll_sensor", callback_group=self.callback_group
@@ -538,7 +551,7 @@ class GatewayNode(Node):
             self.last_state_at = time.monotonic()
             self.generation = max(self.generation + 1, int(message.generation))
             self.sensors = {sensor.sensor_id: sensor_to_dict(sensor) for sensor in message.sensors}
-            wanted = {
+            self.preview_topics = {
                 sensor.sensor_id: sensor.topic_base + "/image_raw/compressed"
                 for sensor in message.sensors
                 if sensor.enrolled
@@ -549,19 +562,41 @@ class GatewayNode(Node):
                 and sensor.topic_base
             }
             for sensor_id in list(self.image_subscriptions):
-                if sensor_id not in wanted:
+                if sensor_id not in self.preview_topics:
                     self.destroy_subscription(self.image_subscriptions.pop(sensor_id))
+                    self.preview_demand.pop(sensor_id, None)
                     self.frames.pop(sensor_id, None)
-            for sensor_id, topic in wanted.items():
-                if sensor_id not in self.image_subscriptions:
-                    self.image_subscriptions[sensor_id] = self.create_subscription(
-                        CompressedImage,
-                        topic,
-                        lambda frame, identity=sensor_id: self._frame(identity, frame),
-                        rclpy.qos.qos_profile_sensor_data,
-                        callback_group=self.callback_group,
-                    )
             self.changed.notify_all()
+
+    def request_preview(self, sensor_id: str) -> bool:
+        """Keep a camera preview subscribed while a browser is actively polling it."""
+        with self.changed:
+            topic = self.preview_topics.get(sensor_id)
+            if not topic:
+                return False
+            self.preview_demand[sensor_id] = time.monotonic()
+            if sensor_id not in self.image_subscriptions:
+                self.image_subscriptions[sensor_id] = self.create_subscription(
+                    CompressedImage,
+                    topic,
+                    lambda frame, identity=sensor_id: self._frame(identity, frame),
+                    rclpy.qos.qos_profile_sensor_data,
+                    callback_group=self.callback_group,
+                )
+            return True
+
+    def _expire_preview_demand(self, now: float | None = None):
+        now = time.monotonic() if now is None else now
+        with self.changed:
+            expired = [
+                sensor_id for sensor_id, requested_at in self.preview_demand.items()
+                if now - requested_at >= self.preview_demand_timeout_sec
+            ]
+            for sensor_id in expired:
+                self.preview_demand.pop(sensor_id, None)
+                subscription = self.image_subscriptions.pop(sensor_id, None)
+                if subscription is not None:
+                    self.destroy_subscription(subscription)
 
     def _groups(self, message: SyncGroupArray):
         with self.changed:
@@ -1497,6 +1532,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _snapshot(self, sensor_id: str):
+        if not self.server.node.request_preview(sensor_id):
+            self._error(HTTPStatus.NOT_FOUND, "camera preview is unavailable")
+            return
         with self.server.node.lock:
             frame = self.server.node.frames.get(sensor_id)
         if not frame:
@@ -1526,6 +1564,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _stream(self, sensor_id: str):
+        if not self.server.node.request_preview(sensor_id):
+            self._error(HTTPStatus.NOT_FOUND, "camera preview is unavailable")
+            return
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=vixel-frame")
         self.send_header("Cache-Control", "no-store")
@@ -1534,6 +1575,7 @@ class Handler(BaseHTTPRequestHandler):
         last_generation = 0
         try:
             while True:
+                self.server.node.request_preview(sensor_id)
                 with self.server.node.changed:
                     self.server.node.changed.wait_for(
                         lambda: self.server.node.frames.get(sensor_id, (b"", 0.0, 0))[2] > last_generation,
