@@ -146,10 +146,13 @@ sequence with the default 10 ms safety margin caps exposure at no more than
 Manual `ExposureTime` is clamped to that ceiling. Automatic exposure uses a
 readable upper-limit node; because that node is not standardized by SFNC,
 Vixel probes known aliases and accepts `exposure_auto_upper_feature` and
-`exposure_auto_limit_auto_feature` overrides. If automatic exposure cannot be
-bounded, preparation is rejected before cycle one instead of risking skipped
-or incorrectly exposed frames. Limit-auto controls are handled as either
-GenICam Boolean nodes or enumerations such as `Off`/`Disabled`/`Manual`.
+`exposure_auto_limit_auto_feature` overrides. IDS uEye+ cameras are supported
+through `BrightnessAutoExposureTimeMax`; Vixel also enables their companion
+`BrightnessAutoExposureTimeLimitMode`. The latter may be overridden with
+`exposure_auto_upper_enable_feature`. If automatic exposure cannot be bounded,
+preparation is rejected before cycle one instead of risking skipped or
+incorrectly exposed frames. Limit-auto controls are handled as either GenICam
+Boolean nodes or enumerations such as `Off`/`Disabled`/`Manual`.
 
 `trigger_overlap` is capability-driven and optional. If no explicit override
 is present and a sequence requests a cadence, Vixel prefers `PreviousFrame`
@@ -206,10 +209,10 @@ ceiling.
 
 The live feature service reports cadence-related nodes when available:
 `TriggerOverlap`, `TriggerArmed`, `ActionQueueSize`,
-`ExposureAutoUpperLimit` (or its known alias), and the synthetic nanosecond
-`PacketDelayNs` readback. Synchronization-group status reports the calculated
-minimum interval, maximum reliable rate, limiting camera/reason, and smallest
-action queue.
+`ExposureAutoUpperLimit` (or its known aliases, including IDS
+`BrightnessAutoExposureTimeMax`), and the synthetic nanosecond `PacketDelayNs`
+readback. Synchronization-group status reports the calculated minimum interval,
+maximum reliable rate, limiting camera/reason, and smallest action queue.
 
 `providers.genicam.software_trigger_lead_time_ms` controls the short interval
 between arming all group workers and releasing their software triggers. It

@@ -11,6 +11,27 @@ TEST(CaptureCadence, RecognizesPortableDisabledEnumerationValues)
   EXPECT_FALSE(vixel_genicam::disabled_feature_value("Once"));
 }
 
+TEST(CaptureCadence, RecognizesPortableEnabledEnumerationValues)
+{
+  EXPECT_TRUE(vixel_genicam::enabled_feature_value("On"));
+  EXPECT_TRUE(vixel_genicam::enabled_feature_value("ENABLED"));
+  EXPECT_TRUE(vixel_genicam::enabled_feature_value("true"));
+  EXPECT_FALSE(vixel_genicam::enabled_feature_value("Off"));
+  EXPECT_FALSE(vixel_genicam::enabled_feature_value("Manual"));
+}
+
+TEST(CaptureCadence, ClampsSafeCeilingToVendorFeatureBounds)
+{
+  const auto ids_limit = vixel_genicam::bounded_numeric_limit(
+    240000.0, 35.33783783783784, 23779.45945945946);
+  ASSERT_TRUE(ids_limit);
+  EXPECT_DOUBLE_EQ(*ids_limit, 23779.45945945946);
+  EXPECT_DOUBLE_EQ(
+    *vixel_genicam::bounded_numeric_limit(10000.0, 35.0, 23779.0),
+    10000.0);
+  EXPECT_FALSE(vixel_genicam::bounded_numeric_limit(20.0, 35.0, 23779.0));
+}
+
 TEST(CaptureCadence, OverlapUsesTheSlowerExposureOrFramePeriod)
 {
   const vixel_genicam::CaptureCadence cadence{

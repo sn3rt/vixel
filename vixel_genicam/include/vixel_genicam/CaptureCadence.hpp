@@ -29,6 +29,25 @@ inline bool disabled_feature_value(std::string value)
          value == "manual" || value == "no";
 }
 
+inline bool enabled_feature_value(std::string value)
+{
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char character) {
+    return static_cast<char>(std::tolower(character));
+  });
+  return value == "on" || value == "true" || value == "enabled" || value == "yes";
+}
+
+inline std::optional<double> bounded_numeric_limit(
+  double requested, double minimum, double maximum)
+{
+  if (!std::isfinite(requested) || !std::isfinite(minimum) ||
+    !std::isfinite(maximum) || minimum > maximum || minimum > requested + 1.0)
+  {
+    return std::nullopt;
+  }
+  return std::clamp(requested, minimum, maximum);
+}
+
 inline std::uint32_t minimum_capture_interval_ms(const CaptureCadence & cadence)
 {
   if (cadence.maximum_frame_rate_hz <= 0.0 ||

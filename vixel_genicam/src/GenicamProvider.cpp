@@ -1294,6 +1294,7 @@ public:
     add_enum_feature(result, "PixelFormat");
     add_enum_feature(result, "ExposureAuto");
     add_enum_feature(result, "GainAuto");
+    add_enum_feature(result, "BrightnessAutoExposureTimeLimitMode");
     add_enum_feature(result, "TriggerSelector");
     add_enum_feature(result, "TriggerMode");
     add_enum_feature(result, "TriggerSource");
@@ -1312,6 +1313,7 @@ public:
     add_integer_feature(result, "ActionQueueSize", "commands");
     add_float_feature(result, "ExposureAutoUpperLimit", "us");
     add_float_feature(result, "AutoExposureTimeUpperLimit", "us");
+    add_float_feature(result, "BrightnessAutoExposureTimeMax", "us");
     add_packet_delay_feature(result);
     return result;
   }
@@ -1618,12 +1620,46 @@ private:
       return false;
     }
     GError * error = nullptr;
-    arv_camera_set_float(camera_, name.c_str(), value, &error);
+    double minimum = 0.0;
+    double maximum = 0.0;
+    double target = value;
+    arv_camera_get_float_bounds(camera_, name.c_str(), &minimum, &maximum, &error);
+    if (error == nullptr) {
+      const auto bounded = bounded_numeric_limit(value, minimum, maximum);
+      if (!bounded) {
+        detail = name + " minimum " + std::to_string(minimum) +
+          " exceeds the calculated limit " + std::to_string(value);
+        return false;
+      }
+      target = *bounded;
+    } else {
+      g_error_free(error);
+      error = nullptr;
+      std::int64_t integer_minimum = 0;
+      std::int64_t integer_maximum = 0;
+      arv_camera_get_integer_bounds(
+        camera_, name.c_str(), &integer_minimum, &integer_maximum, &error);
+      if (error == nullptr) {
+        const auto bounded = bounded_numeric_limit(
+          value, static_cast<double>(integer_minimum),
+          static_cast<double>(integer_maximum));
+        if (!bounded) {
+          detail = name + " minimum " + std::to_string(integer_minimum) +
+            " exceeds the calculated limit " + std::to_string(value);
+          return false;
+        }
+        target = *bounded;
+      } else {
+        g_error_free(error);
+        error = nullptr;
+      }
+    }
+    arv_camera_set_float(camera_, name.c_str(), target, &error);
     if (error == nullptr) {return true;}
     g_error_free(error);
     error = nullptr;
     arv_camera_set_integer(
-      camera_, name.c_str(), static_cast<std::int64_t>(std::llround(value)), &error);
+      camera_, name.c_str(), static_cast<std::int64_t>(std::llround(target)), &error);
     if (error == nullptr) {return true;}
     detail = name + " rejected the calculated limit: " + error->message;
     g_error_free(error);
@@ -1720,6 +1756,90 @@ private:
     const auto applied = feature_is_disabled(name);
     if (applied && !*applied) {
       detail = name + " readback is still enabled after setting " + *selected;
+      return false;
+    }
+    return true;
+  }
+
+  std::optional<bool> feature_is_enabled(const std::string & name)
+  {
+    if (name.empty() || !feature_readable(camera_, name.c_str())) {
+      return std::nullopt;
+    }
+    GError * error = nullptr;
+    const auto boolean_value = arv_camera_get_boolean(camera_, name.c_str(), &error);
+    if (error == nullptr) {return boolean_value;}
+    g_error_free(error);
+    error = nullptr;
+    const auto enum_value = value_or_empty(
+      arv_camera_get_string(camera_, name.c_str(), &error));
+    if (error == nullptr) {
+      if (enabled_feature_value(enum_value)) {return true;}
+      if (disabled_feature_value(enum_value)) {return false;}
+    } else {
+      g_error_free(error);
+    }
+    return std::nullopt;
+  }
+
+  bool enable_auto_limit_feature(const std::string & name, std::string & detail)
+  {
+    if (name.empty()) {return true;}
+    const auto current = feature_is_enabled(name);
+    if (current && *current) {return true;}
+    if (!feature_writable(camera_, name.c_str())) {
+      detail = name + " is not writable and is not enabled";
+      return false;
+    }
+
+    GError * error = nullptr;
+    arv_camera_set_boolean(camera_, name.c_str(), true, &error);
+    if (error == nullptr) {
+      const auto applied = feature_is_enabled(name);
+      if (!applied || *applied) {return true;}
+      detail = name + " Boolean readback is still disabled";
+      return false;
+    }
+    const auto boolean_error = std::string(error->message);
+    g_error_free(error);
+    error = nullptr;
+
+    guint count = 0;
+    const auto values = arv_camera_dup_available_enumerations_as_strings(
+      camera_, name.c_str(), &count, &error);
+    std::vector<std::string> available;
+    if (error == nullptr) {
+      for (guint index = 0; values != nullptr && index < count; ++index) {
+        available.push_back(value_or_empty(values[index]));
+      }
+    } else {
+      const auto enum_error = std::string(error->message);
+      g_error_free(error);
+      g_free(values);
+      detail = name + " cannot be enabled as Boolean (" + boolean_error +
+        ") or enumeration (" + enum_error + ")";
+      return false;
+    }
+    g_free(values);
+
+    const auto selected = std::find_if(
+      available.begin(), available.end(), [](const auto & value) {
+        return enabled_feature_value(value);
+      });
+    if (selected == available.end()) {
+      detail = name + " cannot be enabled as Boolean (" + boolean_error +
+        ") and advertises no On/Enabled enumeration";
+      return false;
+    }
+    arv_camera_set_string(camera_, name.c_str(), selected->c_str(), &error);
+    if (error != nullptr) {
+      detail = name + " rejected " + *selected + ": " + error->message;
+      g_error_free(error);
+      return false;
+    }
+    const auto applied = feature_is_enabled(name);
+    if (applied && !*applied) {
+      detail = name + " readback is still disabled after setting " + *selected;
       return false;
     }
     return true;
@@ -1827,9 +1947,13 @@ private:
     const auto automatic = exposure_auto_enabled_;
     const auto auto_upper_feature = configured_feature(
       settings, "exposure_auto_upper_feature",
-      {"ExposureAutoUpperLimit", "AutoExposureTimeUpperLimit"});
+      {"ExposureAutoUpperLimit", "AutoExposureTimeUpperLimit",
+        "BrightnessAutoExposureTimeMax"});
     const auto auto_limit_feature = configured_feature(
       settings, "exposure_auto_limit_auto_feature", {"ExposureAutoLimitAuto"});
+    const auto auto_upper_enable_feature = configured_feature(
+      settings, "exposure_auto_upper_enable_feature",
+      {"BrightnessAutoExposureTimeLimitMode"});
 
     auto apply_exposure_limit = [&](double limit_us) -> bool {
         if (automatic) {
@@ -1838,6 +1962,13 @@ private:
               "automatic exposure has no readable upper-limit feature; use manual exposure "
               "or configure exposure_auto_upper_feature";
             return false;
+          }
+          if (!auto_upper_enable_feature.empty()) {
+            std::string detail;
+            if (!enable_auto_limit_feature(auto_upper_enable_feature, detail)) {
+              cadence_limit_reason_ = detail;
+              return false;
+            }
           }
           if (!auto_limit_feature.empty()) {
             std::string detail;
@@ -2125,9 +2256,21 @@ private:
       };
     set_optional_boolean(
       "exposure_auto_limit_auto", {"ExposureAutoLimitAuto"});
+    if (settings && settings["exposure_auto_upper_us"]) {
+      const auto auto_upper_enable_feature = configured_feature(
+        settings, "exposure_auto_upper_enable_feature",
+        {"BrightnessAutoExposureTimeLimitMode"});
+      if (!auto_upper_enable_feature.empty()) {
+        std::string detail;
+        if (!enable_auto_limit_feature(auto_upper_enable_feature, detail)) {
+          throw std::runtime_error("enabling automatic exposure limit: " + detail);
+        }
+      }
+    }
     set_optional_float(
       "exposure_auto_upper_us",
-      {"ExposureAutoUpperLimit", "AutoExposureTimeUpperLimit"});
+      {"ExposureAutoUpperLimit", "AutoExposureTimeUpperLimit",
+        "BrightnessAutoExposureTimeMax"});
     set_optional_float(
       "gain_auto_upper_db", {"GainAutoUpperLimit", "AutoGainUpperLimit"});
     set_optional_float(
