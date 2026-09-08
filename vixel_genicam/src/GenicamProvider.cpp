@@ -1296,7 +1296,7 @@ public:
     std::set<std::string> visited;
     if (root != nullptr && ARV_IS_GC_CATEGORY(root)) {
       add_category_features(
-        result, ARV_GC_CATEGORY(root), "", visited);
+        result, genicam, ARV_GC_CATEGORY(root), "", visited);
     }
     add_packet_delay_feature(result);
     std::sort(
@@ -1360,7 +1360,7 @@ private:
 
   void add_category_features(
     std::vector<vixel_interfaces::msg::CameraFeature> & output,
-    ArvGcCategory * category, const std::string & parent,
+    ArvGc * genicam, ArvGcCategory * category, const std::string & parent,
     std::set<std::string> & visited)
   {
     auto * category_feature = ARV_GC_FEATURE_NODE(category);
@@ -1379,10 +1379,16 @@ private:
     for (const GSList * item = arv_gc_category_get_features(category);
       item != nullptr; item = item->next)
     {
-      if (!ARV_IS_GC_FEATURE_NODE(item->data)) {continue;}
-      auto * node = ARV_GC_FEATURE_NODE(item->data);
+      // Aravis category entries are feature-name strings, not ArvGcNode pointers.
+      // Resolve each name through the GenICam document before applying GObject
+      // type checks. Treating item->data as a node segfaults on real IDS XML.
+      const auto * feature_name = static_cast<const char *>(item->data);
+      if (feature_name == nullptr || feature_name[0] == '\0') {continue;}
+      auto * child = arv_gc_get_node(genicam, feature_name);
+      if (!ARV_IS_GC_FEATURE_NODE(child)) {continue;}
+      auto * node = ARV_GC_FEATURE_NODE(child);
       if (ARV_IS_GC_CATEGORY(node)) {
-        add_category_features(output, ARV_GC_CATEGORY(node), path, visited);
+        add_category_features(output, genicam, ARV_GC_CATEGORY(node), path, visited);
       } else {
         add_discovered_feature(output, node, path, visited);
       }
