@@ -87,16 +87,67 @@ exceeded.
 ## Portable camera settings
 
 Reusable administrator-managed profiles are loaded from
-`/etc/vixel/camera-profiles/*.yaml` by default. A camera selects a profile in
-**Known sensor details** and may add per-camera JSON overrides. Resolution is
-machine defaults, then profile settings, then per-camera overrides; the GenICam
-runtime finally enforces `Action0` and PTP.
+`/etc/vixel/camera-profiles/*.yaml` by default. Profiles created or imported in
+the dashboard are stored together in
+`/var/lib/vixel/camera-profiles.yaml`. Configure both locations with:
+
+```yaml
+camera_profiles:
+  directory: /etc/vixel/camera-profiles
+  managed_file: /var/lib/vixel/camera-profiles.yaml
+```
+
+Administrator files are read-only in the dashboard. The managed file is
+written atomically and should be backed up with `inventory.yaml`.
+
+Open an enrolled camera from the dashboard to edit its settings. The basic
+controls cover the common portable image, exposure, gain, and frame-rate
+settings reported by that camera. **Advanced GenICam features** exposes the
+camera's live feature tree with its value type, range, enum choices, units,
+access state, category, and a search field. Read-only or Vixel-owned controls
+are visible for diagnosis but disabled.
+
+A camera selects at most one reusable profile and may add per-camera overrides.
+Resolution is machine defaults, then profile settings, then per-camera
+overrides; the GenICam runtime finally enforces the capture and synchronization
+policy. **Apply and save** stages the proposed assignment, restarts only that
+camera, waits for the provider to report the accepted assignment, and persists
+it only after success. A failed or timed-out change republishes the previous
+durable assignment. Offline changes are saved explicitly as unverified and are
+checked when the camera reconnects.
 
 Portable constrained-auto and fixed manual examples are installed under
 `share/vixel/config/camera-profiles/`. Copy the profiles you approve into the
 configured admin directory, then call `/vixel/reload_camera_profiles` or restart
-the stack. The dashboard can select profiles and set overrides but cannot edit
-the administrator-owned profile files.
+the stack. Dashboard profiles can be exported as a single YAML file and
+imported on another Vixel host. Import never overwrites an existing profile;
+delete or rename the existing managed profile first.
+
+Profile schema version 2 has two scopes. `portable` profiles contain only the
+stable Vixel setting names and can be offered to any GenICam camera. `model`
+profiles include an exact vendor/model compatibility declaration and may also
+contain raw GenICam feature nodes:
+
+```yaml
+schema_version: 2
+name: lucid_triton_indoor
+description: Indoor settings for TRI032S-C cameras
+scope: model
+compatibility:
+  vendor: Lucid Vision Labs
+  model: TRI032S-C
+settings:
+  exposure_auto: Continuous
+  gain_auto: Continuous
+  features:
+    BalanceWhiteAuto:
+      type: enum
+      value: Once
+```
+
+The manager rejects model profiles on a different vendor/model. Existing
+schema-version-1 administrator profiles remain supported as legacy wildcard
+profiles so deployments can migrate deliberately.
 
 The **Known sensor details → Per-camera overrides** field accepts JSON. Common
 portable settings include:
@@ -231,7 +282,7 @@ ptp:
 The lead time is how far into the common PTP clock a group action is queued.
 The tolerance is used for camera lock status and measured exposure skew.
 
-Arbitrary GenICam nodes can be set without vendor code:
+Writable, non-provider-owned GenICam nodes can be set without vendor code:
 
 ```json
 {
@@ -241,9 +292,16 @@ Arbitrary GenICam nodes can be set without vendor code:
 }
 ```
 
-Supported types are `boolean`, `integer`, `float`, `string`, `enum`, and
-`command`. Unsupported or invalid writes fail the camera session with the
-underlying GenICam error instead of being ignored.
+Persistent setting types are `boolean`, `integer`, `float`, `string`, and
+`enum`. Commands are reported for inspection but cannot be stored in a profile,
+because replaying them every time a camera reconnects is unsafe. Unsupported or
+invalid writes fail the camera session with the underlying GenICam error instead
+of being ignored. Trigger selection, action
+keys and masks, PTP control, acquisition start/stop, device reset, transport
+packet policy, user-set/file operations, and transfer-control commands are
+provider-owned. They are locked in feature discovery and rejected if submitted
+through a raw `features` override because changing them could break group
+synchronization, capture ownership, or network stability.
 
 Inspect standard live features with:
 
@@ -252,6 +310,24 @@ ros2 service call /vixel/providers/genicam/features \
   vixel_interfaces/srv/GetCameraFeatures \
   "{sensor_id: acme_cam_test0001, names: []}"
 ```
+
+The manager-level service uses the same result and is normally more convenient
+for applications:
+
+```bash
+ros2 service call /vixel/get_camera_features \
+  vixel_interfaces/srv/GetCameraFeatures \
+  "{sensor_id: acme_cam_test0001, names: []}"
+
+ros2 service call /vixel/get_camera_profiles \
+  vixel_interfaces/srv/GetCameraProfiles "{}"
+```
+
+HTTP clients can use `GET /api/v1/sensors/<sensor_id>/features`,
+`GET /api/v1/camera-profiles`, and
+`POST /api/v1/sensors/<sensor_id>/camera-settings`. Profile YAML is imported at
+`POST /api/v1/camera-profiles/import` and exported from
+`GET /api/v1/camera-profiles/<name>/export`.
 
 ## Calibration
 

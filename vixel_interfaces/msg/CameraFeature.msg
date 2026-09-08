@@ -9,3 +9,11 @@ string increment_value_json
 string[] enum_values
 string unit
 string description
+string display_name
+string category
+string visibility
+string representation
+string selector_context_json
+bool available
+bool editable
+string lock_reason

@@ -62,7 +62,7 @@ def test_dashboard_reports_initial_and_event_stream_errors():
 
 def test_dashboard_cancel_buttons_close_dialogs_without_submitting_forms():
     page = PAGE.read_text()
-    assert page.count('type="button" data-dialog-close>Cancel</button>') == 4
+    assert page.count('type="button" data-dialog-close>Cancel</button>') == 5
     assert "button.closest('dialog')?.close()" in page
     assert "e.submitter?.value==='cancel'" not in page
 
@@ -117,3 +117,15 @@ def test_camera_detail_displays_genicam_stream_health():
     assert "Resent packets" in page
     assert "Stream restarts" in page
     assert "Live preview runs only while this page is open" in page
+
+
+def test_camera_detail_supports_staged_settings_and_reusable_profiles():
+    page = PAGE.read_text()
+    assert "Advanced GenICam features" in page
+    assert "filterAdvancedFeatures" in page
+    assert "Apply and save" in page
+    assert "Save staged as profile" in page
+    assert "Import profile" in page
+    assert "Export profile" in page
+    assert "/api/v1/sensors/${encodeURIComponent(id)}/camera-settings" in page
+    assert "/api/v1/camera-profiles/import" in page

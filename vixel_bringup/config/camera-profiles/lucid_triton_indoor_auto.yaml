@@ -1,6 +1,10 @@
-schema_version: 1
+schema_version: 2
 name: lucid_triton_indoor_auto
 description: Constrained automatic exposure for LUCID Triton indoor capture
+scope: model
+compatibility:
+  vendor: Lucid Vision Labs
+  model: TRI032S-C
 settings:
   pixel_format: BGR8
   exposure_auto: Continuous

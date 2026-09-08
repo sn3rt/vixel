@@ -7,6 +7,7 @@ import pytest
 from vixel_interfaces.msg import Sensor
 
 from vixel_web.gateway import (
+    camera_feature_to_dict,
     capture_operation_to_dict,
     capture_record_to_dict,
     capture_session_to_dict,
@@ -20,6 +21,54 @@ from vixel_web.gateway import (
     recording_runtime_settings,
     sensor_to_dict,
 )
+
+
+def test_camera_feature_metadata_is_exposed_as_typed_json():
+    feature = SimpleNamespace(
+        name="ExposureTime", display_name="Exposure time", category="Acquisition",
+        value_type="float", readable=True, writable=True, available=True,
+        editable=True, current_value_json="1500.5", minimum_value_json="10.0",
+        maximum_value_json="200000.0", increment_value_json="1.0",
+        enum_values=[], unit="us", description="Exposure duration",
+        visibility="beginner", representation="linear",
+        selector_context_json='{"ExposureMode":"Timed"}', lock_reason="",
+    )
+
+    value = camera_feature_to_dict(feature)
+
+    assert value["current_value"] == 1500.5
+    assert value["minimum"] == 10.0
+    assert value["selector_context"] == {"ExposureMode": "Timed"}
+    assert value["editable"] is True
+
+
+def test_camera_profile_import_parses_yaml_and_does_not_overwrite_by_default():
+    node = GatewayNode.__new__(GatewayNode)
+    received = {}
+    node.upsert_camera_profile = (
+        lambda name, profile: received.update(name=name, profile=profile)
+        or {"success": True, "message": "saved"}
+    )
+
+    result = node.import_camera_profile({
+        "profile_yaml": """schema_version: 2
+name: indoor_auto
+scope: portable
+settings:
+  exposure_auto: Continuous
+"""
+    })
+
+    assert result["success"] is True
+    assert received["name"] == "indoor_auto"
+    assert received["profile"]["overwrite"] is False
+
+
+def test_camera_profile_import_rejects_non_mapping_yaml():
+    node = GatewayNode.__new__(GatewayNode)
+
+    with pytest.raises(ValueError, match="must contain a mapping"):
+        node.import_camera_profile({"profile_yaml": "- invalid\n- profile\n"})
 
 
 def test_unavailable_ros_service_error_names_the_service():

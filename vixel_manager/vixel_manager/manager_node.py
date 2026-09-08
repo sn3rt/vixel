@@ -39,10 +39,14 @@ from vixel_interfaces.msg import (
     SyncGroupArray,
 )
 from vixel_interfaces.srv import (
+    ApplyCameraSettings,
     CaptureGroup,
     AcquireCaptureSession,
     DeleteSyncGroup,
+    DeleteCameraProfile,
     ForgetSensor,
+    GetCameraFeatures,
+    GetCameraProfiles,
     PrepareCaptureGroups,
     PurgeKnownSensor,
     ProviderCapture,
@@ -54,13 +58,18 @@ from vixel_interfaces.srv import (
     SetPortMode,
     UpdateSensorMetadata,
     UpdateKnownSensor,
+    UpsertCameraProfile,
     UpsertSyncGroup,
 )
 
 from .camera_profiles import (
     CameraProfileError,
+    camera_profile_compatible,
+    camera_profiles_json,
     load_camera_profiles,
+    normalize_camera_profile,
     resolve_camera_settings,
+    save_managed_camera_profiles,
 )
 from .registry import Allocation, Registry, RegistryError, VALID_OPERATING_MODES
 from .port_status import PortStatus, PortStatusMonitor
@@ -143,6 +152,7 @@ class InventoryManager(Node):
         # rclpy may destroy a partially constructed node when startup fails.
         # Establish cleanup state before loading any fallible configuration.
         self.lock = threading.RLock()
+        self.runtime_condition = threading.Condition(self.lock)
         self.catalog_dirty = False
         self.port_status_monitor = None
         self.callback_group = ReentrantCallbackGroup()
@@ -168,7 +178,12 @@ class InventoryManager(Node):
         self.camera_profiles_directory = str(
             self.registry.machine["camera_profiles"]["directory"]
         )
-        self.camera_profiles = load_camera_profiles(self.camera_profiles_directory)
+        self.managed_camera_profiles_file = str(
+            self.registry.machine["camera_profiles"]["managed_file"]
+        )
+        self.camera_profiles = load_camera_profiles(
+            self.camera_profiles_directory, self.managed_camera_profiles_file
+        )
         missing_profiles = sorted({
             str(sensor.get("camera_profile", ""))
             for sensor in self.registry.inventory["known_sensors"].values()
@@ -202,6 +217,8 @@ class InventoryManager(Node):
         self.group_capture_intervals: dict[str, int] = {}
         self.capture_sessions: dict[str, dict[str, Any]] = {}
         self.capture_session_generation = 1
+        self.pending_camera_settings: dict[str, dict[str, Any]] = {}
+        self.settings_applying: set[str] = set()
         self.capture_session_ttl_sec = (
             int(self.registry.machine["recording"]["capture_session_ttl_ms"]) / 1000.0
         )
@@ -209,6 +226,7 @@ class InventoryManager(Node):
         self.assignment_publishers = {}
         self.provision_clients = {}
         self.capture_clients = {}
+        self.feature_clients = {}
         self.static_tf_broadcaster = StaticTransformBroadcaster(self)
         self.port_status_monitor = PortStatusMonitor(
             self.registry.machine["managed_networks"],
@@ -256,6 +274,36 @@ class InventoryManager(Node):
             ReloadCameraProfiles,
             "reload_camera_profiles",
             self._reload_camera_profiles,
+            callback_group=self.callback_group,
+        )
+        self.get_camera_profiles_service = self.create_service(
+            GetCameraProfiles,
+            "get_camera_profiles",
+            self._get_camera_profiles,
+            callback_group=self.callback_group,
+        )
+        self.upsert_camera_profile_service = self.create_service(
+            UpsertCameraProfile,
+            "upsert_camera_profile",
+            self._upsert_camera_profile,
+            callback_group=self.callback_group,
+        )
+        self.delete_camera_profile_service = self.create_service(
+            DeleteCameraProfile,
+            "delete_camera_profile",
+            self._delete_camera_profile,
+            callback_group=self.callback_group,
+        )
+        self.apply_camera_settings_service = self.create_service(
+            ApplyCameraSettings,
+            "apply_camera_settings",
+            self._apply_camera_settings,
+            callback_group=self.callback_group,
+        )
+        self.get_camera_features_service = self.create_service(
+            GetCameraFeatures,
+            "get_camera_features",
+            self._get_camera_features,
             callback_group=self.callback_group,
         )
         self.purge_known_service = self.create_service(
@@ -431,11 +479,41 @@ class InventoryManager(Node):
             f"/vixel/providers/{provider}/capture",
             callback_group=self.callback_group,
         )
+        self.feature_clients[provider] = self.create_client(
+            GetCameraFeatures,
+            f"/vixel/providers/{provider}/features",
+            callback_group=self.callback_group,
+        )
+
+    async def _get_camera_features(self, request, response):
+        with self.lock:
+            sensor = self.registry.inventory["sensors"].get(request.sensor_id)
+            if sensor is None:
+                response.success = False
+                response.message = f"unknown enrolled sensor {request.sensor_id}"
+                return response
+            if self._cameras_capture_owned([request.sensor_id]):
+                response.success = False
+                response.message = "camera features cannot be inspected while it is in use"
+                return response
+            provider = self._runtime_provider(sensor)
+            client = self.feature_clients.get(provider)
+        if client is None or not client.wait_for_service(timeout_sec=2.0):
+            response.success = False
+            response.message = f"camera feature service unavailable for provider {provider}"
+            return response
+        provider_response = await client.call_async(request)
+        response.success = provider_response.success
+        response.message = provider_response.message
+        response.features = provider_response.features
+        return response
 
     def _reload_camera_profiles(self, _request, response):
         """Atomically replace the profile catalogue after validating selections."""
         try:
-            loaded = load_camera_profiles(self.camera_profiles_directory)
+            loaded = load_camera_profiles(
+                self.camera_profiles_directory, self.managed_camera_profiles_file
+            )
             selected = {
                 str(sensor.get("camera_profile", ""))
                 for sensor in self.registry.inventory["known_sensors"].values()
@@ -457,6 +535,219 @@ class InventoryManager(Node):
             response.success = False
             response.message = str(error)
             response.profile_names = sorted(self.camera_profiles)
+        return response
+
+    def _get_camera_profiles(self, _request, response):
+        with self.lock:
+            profiles_json = camera_profiles_json(self.camera_profiles)
+            profile_count = len(self.camera_profiles)
+        response.success = True
+        response.message = f"{profile_count} camera profile(s)"
+        response.profiles_json = profiles_json
+        return response
+
+    def _upsert_camera_profile(self, request, response):
+        try:
+            value = json.loads(request.profile_json or "{}")
+            profile = normalize_camera_profile(value, source="managed")
+            name = profile["name"]
+            with self.lock:
+                current = self.camera_profiles.get(name)
+                if current and current.get("source") == "admin":
+                    raise CameraProfileError(
+                        f"camera profile {name} is administrator-owned and read-only"
+                    )
+                if current and not request.overwrite:
+                    raise CameraProfileError(f"camera profile {name} already exists")
+                users = sorted(
+                    sensor_id for sensor_id, sensor in
+                    self.registry.inventory["known_sensors"].items()
+                    if sensor.get("camera_profile") == name
+                )
+                if current and users:
+                    raise CameraProfileError(
+                        f"camera profile {name} cannot be replaced while selected by: "
+                        + ", ".join(users)
+                    )
+                updated = copy.deepcopy(self.camera_profiles)
+                updated[name] = profile
+                save_managed_camera_profiles(self.managed_camera_profiles_file, updated)
+                self.camera_profiles = updated
+                self.generation += 1
+            self._publish_state()
+            response.success = True
+            response.message = f"camera profile {name} saved"
+            response.profile_json = json.dumps(
+                profile, separators=(",", ":"), sort_keys=True
+            )
+        except (CameraProfileError, json.JSONDecodeError) as error:
+            response.success = False
+            response.message = str(error)
+            response.profile_json = "{}"
+        return response
+
+    def _delete_camera_profile(self, request, response):
+        try:
+            name = str(request.name)
+            with self.lock:
+                current = self.camera_profiles.get(name)
+                if current is None:
+                    raise CameraProfileError(f"unknown camera profile {name}")
+                if current.get("source") == "admin":
+                    raise CameraProfileError(
+                        f"camera profile {name} is administrator-owned and read-only"
+                    )
+                users = sorted(
+                    sensor_id for sensor_id, sensor in
+                    self.registry.inventory["known_sensors"].items()
+                    if sensor.get("camera_profile") == name
+                )
+                if users:
+                    raise CameraProfileError(
+                        f"camera profile {name} is selected by: " + ", ".join(users)
+                    )
+                updated = copy.deepcopy(self.camera_profiles)
+                del updated[name]
+                save_managed_camera_profiles(self.managed_camera_profiles_file, updated)
+                self.camera_profiles = updated
+                self.generation += 1
+            self._publish_state()
+            response.success = True
+            response.message = f"camera profile {name} deleted"
+        except CameraProfileError as error:
+            response.success = False
+            response.message = str(error)
+        return response
+
+    def _validate_profile_for_sensor(
+        self, profile_name: str, sensor: dict[str, Any],
+    ) -> None:
+        if not profile_name:
+            return
+        profile = self.camera_profiles.get(profile_name)
+        if profile is None:
+            raise CameraProfileError(f"unknown camera profile {profile_name}")
+        compatibility = profile.get("compatibility", {})
+        legacy_wildcard = (
+            profile.get("scope") == "model"
+            and not compatibility.get("vendor")
+            and not compatibility.get("model")
+        )
+        if not legacy_wildcard and not camera_profile_compatible(profile, sensor):
+            raise CameraProfileError(
+                f"camera profile {profile_name} is for "
+                f"{compatibility.get('vendor')} {compatibility.get('model')}, not "
+                f"{sensor.get('vendor')} {sensor.get('model')}"
+            )
+
+    def _apply_camera_settings(self, request, response):
+        sensor_id = str(request.sensor_id)
+        try:
+            if len(request.provider_settings_json.encode("utf-8")) > 64 * 1024:
+                raise RegistryError("provider_settings exceeds 64 KiB")
+            overrides = json.loads(request.provider_settings_json or "{}")
+            if not isinstance(overrides, dict):
+                raise RegistryError("provider_settings must be a JSON object")
+            with self.lock:
+                sensor = copy.deepcopy(
+                    self.registry.inventory["sensors"].get(sensor_id)
+                )
+                known = copy.deepcopy(
+                    self.registry.inventory["known_sensors"].get(sensor_id)
+                )
+                if sensor is None or known is None:
+                    raise RegistryError(f"unknown enrolled sensor {sensor_id}")
+                if sensor_id in self.settings_applying:
+                    raise RegistryError(f"camera settings are already being applied to {sensor_id}")
+                if self._cameras_capture_owned([sensor_id]):
+                    raise RegistryError("cannot change camera settings while it is in use")
+                self._validate_profile_for_sensor(request.camera_profile, sensor)
+                runtime = self.runtime.get(sensor_id)
+                if not runtime or not runtime.online:
+                    if not request.allow_offline:
+                        raise RegistryError(
+                            "camera is offline; set allow_offline=true to save for next connection"
+                        )
+                    self.registry.update_known_sensor(sensor_id, {
+                        "camera_profile": str(request.camera_profile),
+                        "provider_settings": overrides,
+                    })
+                    self.generation += 1
+                    response.success = True
+                    response.message = "camera settings saved for next connection (unverified)"
+                    response.effective_settings_json = "{}"
+                    response.rolled_back = False
+                    publish_offline = True
+                else:
+                    publish_offline = False
+                    initial_applied_settings = runtime.applied_settings_json
+                    initial_error = runtime.last_error
+                if not publish_offline:
+                    self.settings_applying.add(sensor_id)
+                    self.pending_camera_settings[sensor_id] = {
+                        "camera_profile": str(request.camera_profile),
+                        "provider_settings": copy.deepcopy(overrides),
+                    }
+                    self.generation += 1
+            self._publish_state()
+            if publish_offline:
+                return response
+
+            deadline = time.monotonic() + 25.0
+            effective = ""
+            failure = ""
+            with self.runtime_condition:
+                while time.monotonic() < deadline:
+                    runtime = self.runtime.get(sensor_id)
+                    if runtime and runtime.online:
+                        applied = json.loads(runtime.applied_settings_json or "{}")
+                        if (
+                            applied.get("camera_profile", "") == request.camera_profile
+                            and all(applied.get(key) == value for key, value in overrides.items())
+                        ):
+                            effective = runtime.applied_settings_json
+                            break
+                    # Ignore a pre-existing transport/configuration error until
+                    # the provider has actually reacted to the new assignment.
+                    # Otherwise a stale status can make a valid staged change
+                    # fail before the camera restart has even begun.
+                    provider_reacted = runtime and (
+                        runtime.applied_settings_json != initial_applied_settings
+                        or runtime.last_error != initial_error
+                        or not runtime.online
+                    )
+                    if provider_reacted and runtime.last_error:
+                        failure = runtime.last_error
+                        break
+                    self.runtime_condition.wait(timeout=0.25)
+            if not effective:
+                raise RegistryError(failure or "camera did not accept settings within 25 seconds")
+
+            with self.lock:
+                self.registry.update_known_sensor(sensor_id, {
+                    "camera_profile": str(request.camera_profile),
+                    "provider_settings": overrides,
+                })
+                self.pending_camera_settings.pop(sensor_id, None)
+                self.settings_applying.discard(sensor_id)
+                self.generation += 1
+            self._publish_state()
+            response.success = True
+            response.message = "camera settings applied and saved"
+            response.effective_settings_json = effective
+            response.rolled_back = False
+        except (RegistryError, CameraProfileError, json.JSONDecodeError) as error:
+            with self.lock:
+                was_pending = self.pending_camera_settings.pop(sensor_id, None) is not None
+                self.settings_applying.discard(sensor_id)
+                if was_pending:
+                    self.generation += 1
+            if was_pending:
+                self._publish_state()
+            response.success = False
+            response.message = str(error) + ("; previous settings restored" if was_pending else "")
+            response.effective_settings_json = "{}"
+            response.rolled_back = was_pending
         return response
 
     def _runtime_provider(self, record: dict[str, Any]) -> str:
@@ -522,7 +813,7 @@ class InventoryManager(Node):
                 self.get_logger().error(f"Unable to save known-sensor catalogue: {error}")
 
     def _provider_status(self, provider: str, message: SensorArray) -> None:
-        with self.lock:
+        with self.runtime_condition:
             provider_ids = {
                 sensor_id for sensor_id, sensor in self.registry.inventory["sensors"].items()
                 if self._runtime_provider(sensor) == provider
@@ -532,6 +823,7 @@ class InventoryManager(Node):
             for sensor in message.sensors:
                 self.runtime[sensor.sensor_id] = sensor
             self.generation += 1
+            self.runtime_condition.notify_all()
 
     def _provider_group_status(self, provider: str, message: SyncGroupArray) -> None:
         with self.lock:
@@ -1249,7 +1541,13 @@ class InventoryManager(Node):
                 min(capture_intervals)
                 if assignment.operating_mode == "capture" and capture_intervals else 0
             )
-            known = snapshot["known_sensors"].get(sensor_id, {})
+            known = copy.deepcopy(snapshot["known_sensors"].get(sensor_id, {}))
+            pending = getattr(self, "pending_camera_settings", {}).get(sensor_id)
+            if pending:
+                known["camera_profile"] = pending["camera_profile"]
+                known["provider_settings"] = copy.deepcopy(
+                    pending["provider_settings"]
+                )
             provider_config = self.registry.machine["providers"].get(runtime_provider, {})
             portable_defaults = dict(provider_config.get("imaging", {}))
             if "exposure_time_us" in portable_defaults:
@@ -1688,8 +1986,20 @@ class InventoryManager(Node):
             if not isinstance(settings, dict):
                 raise RegistryError("provider_settings must be a JSON object")
             profile = str(request.camera_profile)
-            if profile and profile not in self.camera_profiles:
-                raise RegistryError(f"unknown camera profile {profile}")
+            known = self.registry.inventory["known_sensors"].get(request.sensor_id)
+            if known is None:
+                raise RegistryError(f"unknown sensor {request.sensor_id}")
+            self._validate_profile_for_sensor(profile, known)
+            configuration_changed = (
+                profile != str(known.get("camera_profile", ""))
+                or settings != known.get("provider_settings", {})
+            )
+            runtime = self.runtime.get(request.sensor_id)
+            if configuration_changed and runtime and runtime.online:
+                raise RegistryError(
+                    "use apply_camera_settings for an online camera so changes "
+                    "are verified and rolled back on failure"
+                )
             self.registry.update_known_sensor(request.sensor_id, {
                 "notes": request.notes,
                 "camera_profile": profile,
@@ -1705,7 +2015,7 @@ class InventoryManager(Node):
                 request.sensor_id, snapshot["known_sensors"][request.sensor_id], snapshot
             )
             self._publish_state()
-        except (RegistryError, json.JSONDecodeError) as error:
+        except (RegistryError, CameraProfileError, json.JSONDecodeError) as error:
             response.success = False
             response.message = str(error)
         return response

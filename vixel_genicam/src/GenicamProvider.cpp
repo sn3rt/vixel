@@ -60,6 +60,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -1287,38 +1288,221 @@ public:
 
   std::vector<vixel_interfaces::msg::CameraFeature> features()
   {
+    std::lock_guard<std::mutex> camera_lock(camera_control_mutex_);
     std::vector<vixel_interfaces::msg::CameraFeature> result;
-    add_float_feature(result, "ExposureTime", "us");
-    add_float_feature(result, "Gain", "dB");
-    add_float_feature(result, "AcquisitionFrameRate", "Hz");
-    add_enum_feature(result, "PixelFormat");
-    add_enum_feature(result, "ExposureAuto");
-    add_enum_feature(result, "GainAuto");
-    add_enum_feature(result, "BrightnessAutoExposureTimeLimitMode");
-    add_enum_feature(result, "TriggerSelector");
-    add_enum_feature(result, "TriggerMode");
-    add_enum_feature(result, "TriggerSource");
-    add_enum_feature(result, "TriggerOverlap");
-    add_boolean_feature(result, "TriggerArmed");
-    if (!ptp_enable_feature_.empty()) {add_boolean_feature(result, ptp_enable_feature_);}
-    if (!ptp_status_feature_.empty()) {add_enum_feature(result, ptp_status_feature_);}
-    if (!ptp_offset_feature_.empty()) {
-      add_integer_feature(result, ptp_offset_feature_, "ns");
+    auto * device = arv_camera_get_device(camera_);
+    auto * genicam = device == nullptr ? nullptr : arv_device_get_genicam(device);
+    auto * root = genicam == nullptr ? nullptr : arv_gc_get_node(genicam, "Root");
+    std::set<std::string> visited;
+    if (root != nullptr && ARV_IS_GC_CATEGORY(root)) {
+      add_category_features(
+        result, ARV_GC_CATEGORY(root), "", visited);
     }
-    if (!ptp_latch_value_feature_.empty()) {
-      add_integer_feature(result, ptp_latch_value_feature_, "ns");
-    }
-    add_boolean_feature(result, "ExposureAutoLimitAuto");
-    add_enum_feature(result, "ExposureAutoLimitAuto");
-    add_integer_feature(result, "ActionQueueSize", "commands");
-    add_float_feature(result, "ExposureAutoUpperLimit", "us");
-    add_float_feature(result, "AutoExposureTimeUpperLimit", "us");
-    add_float_feature(result, "BrightnessAutoExposureTimeMax", "us");
     add_packet_delay_feature(result);
+    std::sort(
+      result.begin(), result.end(), [](const auto & left, const auto & right) {
+        return std::tie(left.category, left.display_name, left.name) <
+               std::tie(right.category, right.display_name, right.name);
+      });
     return result;
   }
 
 private:
+  static std::string visibility_name(ArvGcVisibility visibility)
+  {
+    switch (visibility) {
+      case ARV_GC_VISIBILITY_BEGINNER: return "beginner";
+      case ARV_GC_VISIBILITY_EXPERT: return "expert";
+      case ARV_GC_VISIBILITY_GURU: return "guru";
+      case ARV_GC_VISIBILITY_INVISIBLE: return "invisible";
+      default: return "undefined";
+    }
+  }
+
+  static std::string representation_name(ArvGcRepresentation representation)
+  {
+    switch (representation) {
+      case ARV_GC_REPRESENTATION_LINEAR: return "linear";
+      case ARV_GC_REPRESENTATION_LOGARITHMIC: return "logarithmic";
+      case ARV_GC_REPRESENTATION_BOOLEAN: return "boolean";
+      case ARV_GC_REPRESENTATION_PURE_NUMBER: return "number";
+      case ARV_GC_REPRESENTATION_HEX_NUMBER: return "hex";
+      case ARV_GC_REPRESENTATION_IPV4_ADDRESS: return "ipv4";
+      case ARV_GC_REPRESENTATION_MAC_ADDRESS: return "mac";
+      default: return "undefined";
+    }
+  }
+
+  static bool provider_managed_feature(const std::string & name)
+  {
+    const auto value = lower(name);
+    return value.rfind("trigger", 0) == 0 || value.rfind("action", 0) == 0 ||
+           value.find("ptp") != std::string::npos ||
+           value.find("ieee1588") != std::string::npos ||
+           value.rfind("gev", 0) == 0 || value.rfind("event", 0) == 0 ||
+           value == "acquisitionstart" || value == "acquisitionstop" ||
+           value == "acquisitionabort" || value == "acquisitionmode" ||
+           value == "acquisitionframecount" ||
+           value == "acquisitionburstframecount" ||
+           value == "tlparamslocked" || value.rfind("chunk", 0) == 0 ||
+           value == "devicereset" || value.rfind("devicelink", 0) == 0 ||
+           value.rfind("file", 0) == 0 || value.rfind("userset", 0) == 0 ||
+           value.rfind("transfercontrol", 0) == 0;
+  }
+
+  static void clear_error(GError *& error)
+  {
+    if (error != nullptr) {
+      g_error_free(error);
+      error = nullptr;
+    }
+  }
+
+  void add_category_features(
+    std::vector<vixel_interfaces::msg::CameraFeature> & output,
+    ArvGcCategory * category, const std::string & parent,
+    std::set<std::string> & visited)
+  {
+    auto * category_feature = ARV_GC_FEATURE_NODE(category);
+    const auto category_name = value_or_empty(
+      arv_gc_feature_node_get_display_name(category_feature));
+    const auto fallback_name = value_or_empty(
+      arv_gc_feature_node_get_name(category_feature));
+    if (!fallback_name.empty() &&
+      !visited.insert("category:" + fallback_name).second)
+    {
+      return;
+    }
+    const auto label = category_name.empty() ? fallback_name : category_name;
+    const auto path = label == "Root" ? parent :
+      (parent.empty() ? label : parent + " / " + label);
+    for (const GSList * item = arv_gc_category_get_features(category);
+      item != nullptr; item = item->next)
+    {
+      if (!ARV_IS_GC_FEATURE_NODE(item->data)) {continue;}
+      auto * node = ARV_GC_FEATURE_NODE(item->data);
+      if (ARV_IS_GC_CATEGORY(node)) {
+        add_category_features(output, ARV_GC_CATEGORY(node), path, visited);
+      } else {
+        add_discovered_feature(output, node, path, visited);
+      }
+    }
+  }
+
+  void add_discovered_feature(
+    std::vector<vixel_interfaces::msg::CameraFeature> & output,
+    ArvGcFeatureNode * node, const std::string & category,
+    std::set<std::string> & visited)
+  {
+    const auto name = value_or_empty(arv_gc_feature_node_get_name(node));
+    if (name.empty() || !visited.insert(name).second) {return;}
+    GError * error = nullptr;
+    const bool implemented = arv_gc_feature_node_is_implemented(node, &error);
+    if (error != nullptr || !implemented) {clear_error(error); return;}
+    vixel_interfaces::msg::CameraFeature feature;
+    feature.name = name;
+    feature.display_name = value_or_empty(arv_gc_feature_node_get_display_name(node));
+    if (feature.display_name.empty()) {feature.display_name = name;}
+    feature.description = value_or_empty(arv_gc_feature_node_get_description(node));
+    if (feature.description.empty()) {
+      feature.description = value_or_empty(arv_gc_feature_node_get_tooltip(node));
+    }
+    feature.category = category.empty() ? "Other" : category;
+    feature.visibility = visibility_name(arv_gc_feature_node_get_visibility(node));
+    feature.selector_context_json = "{}";
+    feature.available = arv_gc_feature_node_is_available(node, &error);
+    clear_error(error);
+    const auto access = arv_gc_feature_node_get_actual_access_mode(node);
+    feature.readable = feature.available &&
+      (access == ARV_GC_ACCESS_MODE_RO || access == ARV_GC_ACCESS_MODE_RW);
+    feature.writable = feature.available &&
+      (access == ARV_GC_ACCESS_MODE_WO || access == ARV_GC_ACCESS_MODE_RW);
+    const bool managed = provider_managed_feature(name);
+    feature.editable = feature.writable && !managed && !ARV_IS_GC_COMMAND(node);
+    if (managed) {feature.lock_reason = "managed by Vixel capture and synchronization";}
+    if (ARV_IS_GC_COMMAND(node)) {
+      feature.value_type = "command";
+      feature.lock_reason = "commands are not persistent camera settings";
+    } else if (ARV_IS_GC_ENUMERATION(node)) {
+      feature.value_type = "enum";
+      if (feature.readable) {
+        const auto value = arv_gc_enumeration_get_string_value(
+          ARV_GC_ENUMERATION(node), &error);
+        if (error == nullptr) {
+          feature.current_value_json = "\"" + json_escape(value_or_empty(value)) + "\"";
+        }
+        clear_error(error);
+      }
+      guint count = 0;
+      const auto values = arv_gc_enumeration_dup_available_string_values(
+        ARV_GC_ENUMERATION(node), &count, &error);
+      if (error == nullptr && values != nullptr) {
+        for (guint index = 0; index < count; ++index) {
+          feature.enum_values.push_back(value_or_empty(values[index]));
+        }
+        g_free(values);
+      }
+      clear_error(error);
+    } else if (ARV_IS_GC_BOOLEAN(node)) {
+      feature.value_type = "boolean";
+      if (feature.readable) {
+        const auto value = arv_gc_boolean_get_value(ARV_GC_BOOLEAN(node), &error);
+        if (error == nullptr) {feature.current_value_json = value ? "true" : "false";}
+        clear_error(error);
+      }
+    } else if (ARV_IS_GC_FLOAT(node)) {
+      feature.value_type = "float";
+      feature.representation = representation_name(
+        arv_gc_float_get_representation(ARV_GC_FLOAT(node)));
+      feature.unit = value_or_empty(arv_gc_float_get_unit(ARV_GC_FLOAT(node)));
+      if (feature.readable) {
+        const auto value = arv_gc_float_get_value(ARV_GC_FLOAT(node), &error);
+        if (error == nullptr) {feature.current_value_json = std::to_string(value);}
+        clear_error(error);
+        const auto minimum = arv_gc_float_get_min(ARV_GC_FLOAT(node), &error);
+        if (error == nullptr) {feature.minimum_value_json = std::to_string(minimum);}
+        clear_error(error);
+        const auto maximum = arv_gc_float_get_max(ARV_GC_FLOAT(node), &error);
+        if (error == nullptr) {feature.maximum_value_json = std::to_string(maximum);}
+        clear_error(error);
+        const auto increment = arv_gc_float_get_inc(ARV_GC_FLOAT(node), &error);
+        if (error == nullptr) {feature.increment_value_json = std::to_string(increment);}
+        clear_error(error);
+      }
+    } else if (ARV_IS_GC_INTEGER(node)) {
+      feature.value_type = "integer";
+      feature.representation = representation_name(
+        arv_gc_integer_get_representation(ARV_GC_INTEGER(node)));
+      feature.unit = value_or_empty(arv_gc_integer_get_unit(ARV_GC_INTEGER(node)));
+      if (feature.readable) {
+        const auto value = arv_gc_integer_get_value(ARV_GC_INTEGER(node), &error);
+        if (error == nullptr) {feature.current_value_json = std::to_string(value);}
+        clear_error(error);
+        const auto minimum = arv_gc_integer_get_min(ARV_GC_INTEGER(node), &error);
+        if (error == nullptr) {feature.minimum_value_json = std::to_string(minimum);}
+        clear_error(error);
+        const auto maximum = arv_gc_integer_get_max(ARV_GC_INTEGER(node), &error);
+        if (error == nullptr) {feature.maximum_value_json = std::to_string(maximum);}
+        clear_error(error);
+        const auto increment = arv_gc_integer_get_inc(ARV_GC_INTEGER(node), &error);
+        if (error == nullptr) {feature.increment_value_json = std::to_string(increment);}
+        clear_error(error);
+      }
+    } else if (ARV_IS_GC_STRING(node)) {
+      feature.value_type = "string";
+      if (feature.readable) {
+        const auto value = arv_gc_string_get_value(ARV_GC_STRING(node), &error);
+        if (error == nullptr) {
+          feature.current_value_json = "\"" + json_escape(value_or_empty(value)) + "\"";
+        }
+        clear_error(error);
+      }
+    } else {
+      return;
+    }
+    output.push_back(std::move(feature));
+  }
+
   static bool is_transport_failure(const std::string & message)
   {
     return message == "image timeout" ||
@@ -2507,8 +2691,17 @@ private:
     if (feature_values && feature_values.IsMap()) {
       for (const auto & item : feature_values) {
         const auto name = item.first.as<std::string>();
+        if (provider_managed_feature(name)) {
+          throw std::runtime_error(
+                  "GenICam feature " + name +
+                  " is managed by Vixel capture and synchronization");
+        }
         const auto specification = item.second;
         const auto type = specification["type"].as<std::string>();
+        if (type == "command") {
+          throw std::runtime_error(
+                  "GenICam commands are not persistent camera settings: " + name);
+        }
         error = nullptr;
         if (type == "boolean") {
           arv_camera_set_boolean(camera_, name.c_str(), specification["value"].as<bool>(), &error);
@@ -2519,8 +2712,6 @@ private:
         } else if (type == "string" || type == "enum") {
           const auto value = specification["value"].as<std::string>();
           arv_camera_set_string(camera_, name.c_str(), value.c_str(), &error);
-        } else if (type == "command") {
-          arv_camera_execute_command(camera_, name.c_str(), &error);
         } else {
           throw std::runtime_error("unknown GenICam feature type for " + name);
         }
@@ -3055,6 +3246,14 @@ private:
     if (error != nullptr) {g_error_free(error); return;}
     vixel_interfaces::msg::CameraFeature feature;
     feature.name = "PacketDelayNs";
+    feature.display_name = "Packet delay";
+    feature.category = "Transport Layer Control";
+    feature.visibility = "expert";
+    feature.representation = "number";
+    feature.selector_context_json = "{}";
+    feature.available = true;
+    feature.editable = false;
+    feature.lock_reason = "managed by Vixel network policy";
     feature.value_type = "integer";
     feature.readable = true;
     feature.writable = false;
@@ -4238,6 +4437,11 @@ private:
       response->message = "camera must be online to inspect its GenICam features";
       return;
     }
+    if (session->second->assignment().capture_reserved) {
+      response->success = false;
+      response->message = "camera features cannot be inspected during an active capture session";
+      return;
+    }
     response->features = session->second->features();
     if (!request->names.empty()) {
       const std::set<std::string> requested(request->names.begin(), request->names.end());
@@ -4248,7 +4452,7 @@ private:
         response->features.end());
     }
     response->success = true;
-    response->message = "standard GenICam features read";
+    response->message = "GenICam feature tree read";
   }
 
   GenicamConfig config_;

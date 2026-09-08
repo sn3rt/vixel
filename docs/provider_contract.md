@@ -32,6 +32,15 @@ Providers apply supported settings when opening a session and report the
 effective document in `Sensor.applied_settings_json`. Invalid requested settings
 must fail visibly instead of being silently accepted.
 
+Camera-feature discovery should return the device's live feature tree rather
+than a hard-coded vendor list. Each `CameraFeature` identifies its display name,
+category, type, current value, range or enum values, units, visibility,
+representation, availability, writability, and whether Vixel permits editing.
+`lock_reason` explains controls that are readable but provider-owned. Providers
+must reject raw writes to trigger, synchronization, acquisition lifecycle,
+device reset, persistent user-set/file, and transport-policy nodes that would
+violate the platform's capture contract.
+
 `ProviderAssignment.capture_group_ids` lists every logical capture selection
 containing the sensor. `sync_group` remains the deterministic first selection
 for compatibility with older providers; `capture_group_missing_policies` is the

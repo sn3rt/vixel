@@ -186,8 +186,11 @@ def validate_machine(data: dict[str, Any]) -> dict[str, Any]:
             "managed_networks, providers, recording, and camera_profiles must be mappings"
         )
     camera_profiles.setdefault("directory", "/etc/vixel/camera-profiles")
+    camera_profiles.setdefault("managed_file", "/var/lib/vixel/camera-profiles.yaml")
     if not str(camera_profiles["directory"]).strip():
         raise RegistryError("camera_profiles.directory must not be empty")
+    if not str(camera_profiles["managed_file"]).strip():
+        raise RegistryError("camera_profiles.managed_file must not be empty")
     # Releases before the generic backend stored the same camera settings under
     # providers.lucid. Keep existing machines bootable while presenting only
     # the generic provider to the rest of the runtime.

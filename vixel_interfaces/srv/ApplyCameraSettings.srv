@@ -1,0 +1,9 @@
+string sensor_id
+string camera_profile
+string provider_settings_json
+bool allow_offline
+---
+bool success
+string message
+string effective_settings_json
+bool rolled_back

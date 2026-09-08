@@ -11,7 +11,65 @@ from vixel_manager.manager_node import (
     _provider_group_is_current,
     _runtime_sensor_is_ready,
 )
+from vixel_manager.camera_profiles import CameraProfileError
 from vixel_manager.registry import RegistryError
+
+
+def test_model_camera_profile_is_rejected_for_a_different_camera_model():
+    manager = InventoryManager.__new__(InventoryManager)
+    manager.camera_profiles = {
+        "lucid_triton": {
+            "scope": "model",
+            "compatibility": {
+                "vendor": "Lucid Vision Labs", "model": "TRI032S-C"
+            },
+        }
+    }
+
+    manager._validate_profile_for_sensor(
+        "lucid_triton", {"vendor": "Lucid Vision Labs", "model": "TRI032S-C"}
+    )
+    with pytest.raises(CameraProfileError, match="not IDS U3-38J0XCP"):
+        manager._validate_profile_for_sensor(
+            "lucid_triton", {"vendor": "IDS", "model": "U3-38J0XCP"}
+        )
+
+
+def test_selected_managed_camera_profile_cannot_be_replaced(tmp_path):
+    manager = InventoryManager.__new__(InventoryManager)
+    manager.lock = threading.RLock()
+    manager.generation = 1
+    manager.managed_camera_profiles_file = str(tmp_path / "profiles.yaml")
+    manager.camera_profiles = {
+        "indoor": {
+            "schema_version": 2,
+            "name": "indoor",
+            "description": "current",
+            "scope": "portable",
+            "compatibility": {"vendor": "", "model": ""},
+            "settings": {"exposure_auto": "Continuous"},
+            "source": "managed",
+            "source_path": "",
+        }
+    }
+    manager.registry = SimpleNamespace(inventory={
+        "known_sensors": {"camera_a": {"camera_profile": "indoor"}}
+    })
+    request = SimpleNamespace(
+        profile_json=json.dumps({
+            "schema_version": 2,
+            "name": "indoor",
+            "scope": "portable",
+            "settings": {"exposure_auto": "Off"},
+        }),
+        overwrite=True,
+    )
+    response = SimpleNamespace(success=False, message="", profile_json="")
+
+    result = manager._upsert_camera_profile(request, response)
+
+    assert result.success is False
+    assert "cannot be replaced while selected by: camera_a" in result.message
 
 
 def test_provider_group_status_must_match_requested_mode():

@@ -2,6 +2,7 @@ schema_version: 1
 
 camera_profiles:
   directory: /etc/vixel/camera-profiles
+  managed_file: /var/lib/vixel/camera-profiles.yaml
 
 # Copy this file to /etc/vixel/machine.yaml and replace every example interface,
 # MAC address, and subnet with values for the target computer. The locally

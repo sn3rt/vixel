@@ -237,6 +237,10 @@ def test_recording_configuration_gets_safe_defaults():
     assert machine["recording"]["operation_history_limit"] == 100
     assert machine["recording"]["operation_capture_id_limit"] == 100
     assert machine["recording"]["max_active_operations"] == 64
+    assert machine["camera_profiles"] == {
+        "directory": "/etc/vixel/camera-profiles",
+        "managed_file": "/var/lib/vixel/camera-profiles.yaml",
+    }
 
 
 def test_invalid_recording_configuration_is_rejected():

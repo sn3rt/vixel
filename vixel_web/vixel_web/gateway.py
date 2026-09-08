@@ -38,11 +38,15 @@ from vixel_interfaces.msg import (
     SyncGroupArray,
 )
 from vixel_interfaces.srv import (
+    ApplyCameraSettings,
     AcquireCaptureSession,
     CancelCaptureOperation,
     DeleteSyncGroup,
+    DeleteCameraProfile,
     ForgetSensor,
     GetCaptureOperation,
+    GetCameraFeatures,
+    GetCameraProfiles,
     PrepareCaptureGroups,
     PurgeKnownSensor,
     ReleaseCaptureSession,
@@ -54,6 +58,7 @@ from vixel_interfaces.srv import (
     SubmitCaptureBatch,
     UpdateSensorMetadata,
     UpdateKnownSensor,
+    UpsertCameraProfile,
     UpsertSyncGroup,
 )
 
@@ -194,6 +199,36 @@ def sensor_to_dict(sensor) -> dict[str, Any]:
         "stream_resent_packets": int(sensor.stream_resent_packets),
         "stream_missing_packets": int(sensor.stream_missing_packets),
         "stream_restart_count": int(sensor.stream_restart_count),
+    }
+
+
+def camera_feature_to_dict(feature) -> dict[str, Any]:
+    def decoded(value, default=None):
+        try:
+            return json.loads(value) if value else default
+        except (TypeError, json.JSONDecodeError):
+            return default
+
+    return {
+        "name": feature.name,
+        "display_name": feature.display_name or feature.name,
+        "category": feature.category or "Other",
+        "value_type": feature.value_type,
+        "readable": bool(feature.readable),
+        "writable": bool(feature.writable),
+        "available": bool(feature.available),
+        "editable": bool(feature.editable),
+        "current_value": decoded(feature.current_value_json),
+        "minimum": decoded(feature.minimum_value_json),
+        "maximum": decoded(feature.maximum_value_json),
+        "increment": decoded(feature.increment_value_json),
+        "enum_values": list(feature.enum_values),
+        "unit": feature.unit,
+        "description": feature.description,
+        "visibility": feature.visibility,
+        "representation": feature.representation,
+        "selector_context": decoded(feature.selector_context_json, {}),
+        "lock_reason": feature.lock_reason,
     }
 
 
@@ -476,6 +511,24 @@ class GatewayNode(Node):
         )
         self.update_known_client = self.create_client(
             UpdateKnownSensor, "/vixel/update_known_sensor", callback_group=self.callback_group
+        )
+        self.camera_features_client = self.create_client(
+            GetCameraFeatures, "/vixel/get_camera_features", callback_group=self.callback_group
+        )
+        self.camera_profiles_client = self.create_client(
+            GetCameraProfiles, "/vixel/get_camera_profiles", callback_group=self.callback_group
+        )
+        self.upsert_camera_profile_client = self.create_client(
+            UpsertCameraProfile, "/vixel/upsert_camera_profile",
+            callback_group=self.callback_group
+        )
+        self.delete_camera_profile_client = self.create_client(
+            DeleteCameraProfile, "/vixel/delete_camera_profile",
+            callback_group=self.callback_group
+        )
+        self.apply_camera_settings_client = self.create_client(
+            ApplyCameraSettings, "/vixel/apply_camera_settings",
+            callback_group=self.callback_group
         )
         self.purge_known_client = self.create_client(
             PurgeKnownSensor, "/vixel/purge_known_sensor", callback_group=self.callback_group
@@ -1147,6 +1200,97 @@ class GatewayNode(Node):
             "sensor": known_sensor_to_dict(response.sensor),
         }
 
+    def camera_features(self, sensor_id: str) -> dict[str, Any]:
+        request = GetCameraFeatures.Request()
+        request.sensor_id = sensor_id
+        request.names = []
+        response = self.call_service(self.camera_features_client, request)
+        if not response.success:
+            raise RuntimeError(response.message)
+        return {
+            "success": True,
+            "message": response.message,
+            "features": [camera_feature_to_dict(value) for value in response.features],
+        }
+
+    def camera_profiles(self) -> dict[str, Any]:
+        response = self.call_service(
+            self.camera_profiles_client, GetCameraProfiles.Request()
+        )
+        if not response.success:
+            raise RuntimeError(response.message)
+        return {
+            "success": True,
+            "message": response.message,
+            "profiles": json.loads(response.profiles_json or "[]"),
+        }
+
+    def upsert_camera_profile(self, name: str, body: dict[str, Any]):
+        profile = dict(body)
+        if profile.get("name", name) != name:
+            raise ValueError("profile name in URL and document must match")
+        profile["name"] = name
+        request = UpsertCameraProfile.Request()
+        request.profile_json = json.dumps(profile, separators=(",", ":"), sort_keys=True)
+        request.overwrite = bool(body.get("overwrite", False))
+        response = self.call_service(self.upsert_camera_profile_client, request)
+        if not response.success:
+            raise RuntimeError(response.message)
+        return {
+            "success": True,
+            "message": response.message,
+            "profile": json.loads(response.profile_json or "{}"),
+        }
+
+    def import_camera_profile(self, body: dict[str, Any]):
+        profile_yaml = body.get("profile_yaml", "")
+        if not isinstance(profile_yaml, str) or not profile_yaml.strip():
+            raise ValueError("profile_yaml must contain a YAML camera profile")
+        if len(profile_yaml.encode("utf-8")) > 64 * 1024:
+            raise ValueError("camera profile exceeds 64 KiB")
+        try:
+            profile = yaml.safe_load(profile_yaml)
+        except yaml.YAMLError as error:
+            raise ValueError(f"invalid camera profile YAML: {error}") from error
+        if not isinstance(profile, dict):
+            raise ValueError("camera profile YAML must contain a mapping")
+        name = str(profile.get("name", "")).strip()
+        if not name:
+            raise ValueError("camera profile YAML must contain a name")
+        profile["overwrite"] = bool(body.get("overwrite", False))
+        return self.upsert_camera_profile(name, profile)
+
+    def delete_camera_profile(self, name: str):
+        request = DeleteCameraProfile.Request()
+        request.name = name
+        response = self.call_service(self.delete_camera_profile_client, request)
+        if not response.success:
+            raise RuntimeError(response.message)
+        return {"success": True, "message": response.message}
+
+    def apply_camera_settings(self, sensor_id: str, body: dict[str, Any]):
+        settings = body.get("provider_settings", {})
+        if not isinstance(settings, dict):
+            raise ValueError("provider_settings must be a JSON object")
+        request = ApplyCameraSettings.Request()
+        request.sensor_id = sensor_id
+        request.camera_profile = str(body.get("camera_profile", ""))
+        request.provider_settings_json = json.dumps(
+            settings, separators=(",", ":"), sort_keys=True
+        )
+        request.allow_offline = bool(body.get("allow_offline", False))
+        response = self.call_service(
+            self.apply_camera_settings_client, request, timeout=30.0
+        )
+        if not response.success:
+            raise RuntimeError(response.message)
+        return {
+            "success": True,
+            "message": response.message,
+            "rolled_back": bool(response.rolled_back),
+            "effective_settings": _json_value(response.effective_settings_json, {}),
+        }
+
     def purge_known_sensor(self, sensor_id: str):
         request = PurgeKnownSensor.Request()
         request.sensor_id = sensor_id
@@ -1238,6 +1382,16 @@ class Handler(BaseHTTPRequestHandler):
     def _error(self, status: int, message: str):
         self._json(status, {"success": False, "message": message})
 
+    def _download(self, content_type: str, filename: str, body: bytes):
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+
     def _body(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
         if length > 1024 * 1024:
@@ -1287,6 +1441,41 @@ class Handler(BaseHTTPRequestHandler):
                 self._error(HTTPStatus.NOT_FOUND, f"unknown sensor {parts[3]}")
             else:
                 self._json(HTTPStatus.OK, {"sensor": sensor})
+        elif parsed.path == "/api/v1/camera-profiles":
+            try:
+                self._json(HTTPStatus.OK, self.server.node.camera_profiles())
+            except (RuntimeError, TimeoutError, json.JSONDecodeError) as error:
+                self._error(HTTPStatus.SERVICE_UNAVAILABLE, str(error))
+        elif (
+            len(parts) == 5 and parts[:3] == ["api", "v1", "sensors"]
+            and parts[4] == "features"
+        ):
+            try:
+                self._json(
+                    HTTPStatus.OK, self.server.node.camera_features(parts[3])
+                )
+            except (RuntimeError, TimeoutError) as error:
+                self._error(HTTPStatus.SERVICE_UNAVAILABLE, str(error))
+        elif (
+            len(parts) == 5 and parts[:3] == ["api", "v1", "camera-profiles"]
+            and parts[4] == "export"
+        ):
+            try:
+                profiles = self.server.node.camera_profiles()["profiles"]
+                profile = next(
+                    (value for value in profiles if value.get("name") == parts[3]), None
+                )
+                if profile is None:
+                    self._error(HTTPStatus.NOT_FOUND, f"unknown camera profile {parts[3]}")
+                else:
+                    exported = {
+                        key: value for key, value in profile.items()
+                        if key not in {"source", "source_path"}
+                    }
+                    body = yaml.safe_dump(exported, sort_keys=False).encode("utf-8")
+                    self._download("application/yaml", f"{parts[3]}.yaml", body)
+            except (RuntimeError, TimeoutError) as error:
+                self._error(HTTPStatus.SERVICE_UNAVAILABLE, str(error))
         elif parsed.path == "/api/v1/groups":
             snapshot = self.server.node.snapshot()
             self._json(HTTPStatus.OK, {
@@ -1397,6 +1586,30 @@ class Handler(BaseHTTPRequestHandler):
                 and parts[:3] == ["api", "v1", "known-sensors"]
             ):
                 self._json(HTTPStatus.OK, node.update_known_sensor(parts[3], body))
+            elif (
+                method == "POST" and len(parts) == 5
+                and parts[:3] == ["api", "v1", "sensors"]
+                and parts[4] == "camera-settings"
+            ):
+                self._json(
+                    HTTPStatus.OK, node.apply_camera_settings(parts[3], body)
+                )
+            elif (
+                method == "PUT" and len(parts) == 4
+                and parts[:3] == ["api", "v1", "camera-profiles"]
+            ):
+                self._json(
+                    HTTPStatus.OK, node.upsert_camera_profile(parts[3], body)
+                )
+            elif method == "POST" and parsed.path == "/api/v1/camera-profiles/import":
+                self._json(HTTPStatus.OK, node.import_camera_profile(body))
+            elif (
+                method == "DELETE" and len(parts) == 4
+                and parts[:3] == ["api", "v1", "camera-profiles"]
+            ):
+                self._json(
+                    HTTPStatus.OK, node.delete_camera_profile(parts[3])
+                )
             elif method == "DELETE" and len(parts) == 4 and parts[:3] == ["api", "v1", "sensors"]:
                 request = ForgetSensor.Request()
                 request.sensor_id = parts[3]
