@@ -3,6 +3,7 @@
 #include "vixel_genicam/GenicamConfig.hpp"
 #include "vixel_genicam/FrameTimestamp.hpp"
 #include "vixel_genicam/StreamRecovery.hpp"
+#include "vixel_genicam/TriggerReadiness.hpp"
 #include "vixel_genicam/TriggerSelection.hpp"
 
 #include <arv.h>
@@ -1512,6 +1513,7 @@ private:
   static bool is_transport_failure(const std::string & message)
   {
     return message == "image timeout" ||
+           message == "software trigger armed timeout" ||
            message.rfind("incomplete image buffer:", 0) == 0;
   }
 
@@ -2873,6 +2875,16 @@ private:
           restore_action_trigger = true;
         }
         if (software_for_request) {
+          const auto trigger_armed_deadline = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(config_.image_timeout_ms);
+          if (!vixel_genicam::wait_for_trigger_armed(
+              trigger_armed_deadline, std::chrono::steady_clock::duration(10ms),
+              [this]() {return capture_trigger_armed();},
+              []() {return std::chrono::steady_clock::now();},
+              [](const auto delay) {std::this_thread::sleep_for(delay);}))
+          {
+            throw std::runtime_error("software trigger armed timeout");
+          }
           if (request->completion) {
             request->completion->trigger_started_ns =
               static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
