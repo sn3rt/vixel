@@ -17,3 +17,8 @@ inventory.yaml.bak
 persist.json
 calibration*.yaml
 camera_calibration/
+
+/.logs/
+/config/
+/state/
+/captures/
