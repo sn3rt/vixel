@@ -160,7 +160,7 @@ portable settings include:
   "exposure_auto": "Off",
   "exposure_us": 1500.0,
   "exposure_auto_limit_auto": false,
-  "exposure_auto_upper_us": 10000.0,
+  "exposure_auto_upper_us": 200000.0,
   "gain_auto": "Off",
   "gain_db": 2.0,
   "gain_auto_upper_db": 12.0,

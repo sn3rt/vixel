@@ -16,6 +16,8 @@ TEST(CaptureCadence, RecognizesPortableEnabledEnumerationValues)
   EXPECT_TRUE(vixel_genicam::enabled_feature_value("On"));
   EXPECT_TRUE(vixel_genicam::enabled_feature_value("ENABLED"));
   EXPECT_TRUE(vixel_genicam::enabled_feature_value("true"));
+  EXPECT_TRUE(vixel_genicam::enabled_feature_value("Continuous"));
+  EXPECT_TRUE(vixel_genicam::enabled_feature_value("Once"));
   EXPECT_FALSE(vixel_genicam::enabled_feature_value("Off"));
   EXPECT_FALSE(vixel_genicam::enabled_feature_value("Manual"));
 }

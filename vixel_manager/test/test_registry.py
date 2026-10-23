@@ -225,8 +225,30 @@ def test_unapproved_network_cannot_allocate_camera_addresses():
 def test_legacy_lucid_provider_is_migrated_in_memory():
     machine = validate_machine(MACHINE)
     assert "lucid" not in machine["providers"]
-    assert machine["providers"]["genicam"]["imaging"]["frame_rate_hz"] == 10.0
+    imaging = machine["providers"]["genicam"]["imaging"]
+    assert imaging["frame_rate_hz"] == 10.0
+    assert imaging["exposure_auto_limit_auto"] is False
+    assert imaging["exposure_auto_upper_us"] == 200000.0
+    assert imaging["gain_auto_upper_db"] == 12.0
+    assert imaging["auto_brightness_target"] == 50.0
     assert machine["managed_networks"]["left"]["packet_delay"] == 100000
+
+
+def test_explicit_genicam_imaging_defaults_are_preserved():
+    configured = yaml.safe_load(yaml.safe_dump(MACHINE))
+    configured["providers"] = {
+        "genicam": {
+            "imaging": {
+                "exposure_auto_limit_auto": True,
+                "exposure_auto_upper_us": 25000.0,
+            }
+        }
+    }
+
+    imaging = validate_machine(configured)["providers"]["genicam"]["imaging"]
+
+    assert imaging["exposure_auto_limit_auto"] is True
+    assert imaging["exposure_auto_upper_us"] == 25000.0
 
 
 def test_recording_configuration_gets_safe_defaults():

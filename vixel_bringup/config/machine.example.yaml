@@ -75,8 +75,16 @@ providers:
       use_max_height: true
       exposure_auto: Continuous
       exposure_time_us: 1000.0
+      # Bound idle/preview automatic exposure for every camera. Capture
+      # cadence can tighten this further; profiles and per-camera settings
+      # can deliberately select a different value.
+      exposure_auto_limit_auto: false
+      exposure_auto_upper_us: 200000.0
       gain_auto: Continuous
       gain_db: 0.0
+      gain_auto_upper_db: 12.0
+      auto_brightness_target: 50.0
+      metering_rate_hz: 2.0
       frame_rate_hz: 10.0
 
 recording:

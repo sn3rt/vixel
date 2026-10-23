@@ -212,6 +212,32 @@ def validate_machine(data: dict[str, Any]) -> dict[str, Any]:
             "imaging": copy.deepcopy(legacy_imaging),
         }
         providers["genicam"]["imaging"].setdefault("frame_rate_hz", 10.0)
+    genicam = providers.setdefault("genicam", {})
+    if not isinstance(genicam, dict):
+        raise RegistryError("providers.genicam must be a mapping")
+    imaging = genicam.setdefault("imaging", {})
+    if not isinstance(imaging, dict):
+        raise RegistryError("providers.genicam.imaging must be a mapping")
+    # These portable defaults make camera behavior deterministic even when a
+    # newly enrolled device has different settings saved in non-volatile
+    # memory. Profiles and per-camera settings still override each value.
+    for key, value in {
+        "pixel_format": "BGR8",
+        "use_max_width": True,
+        "use_max_height": True,
+        "exposure_auto": "Continuous",
+        "exposure_time_us": 1000.0,
+        "exposure_auto_limit_auto": False,
+        "exposure_auto_upper_us": 200000.0,
+        "gain_auto": "Continuous",
+        "gain_db": 0.0,
+        "gain_auto_upper_db": 12.0,
+        "auto_brightness_target": 50.0,
+        "metering_rate_hz": 2.0,
+        "frame_rate_hz": 10.0,
+    }.items():
+        imaging.setdefault(key, value)
+    genicam.setdefault("capture_png_compression", 1)
     recording.setdefault("root_directory", "/var/lib/vixel/captures")
     recording.setdefault("minimum_free_bytes", 5 * 1024 * 1024 * 1024)
     recording.setdefault("capture_timeout_ms", 10000)

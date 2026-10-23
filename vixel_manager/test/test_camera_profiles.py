@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
+import yaml
 
 from vixel_manager.camera_profiles import (
     CameraProfileError,
@@ -48,6 +51,29 @@ settings:
 
 def test_missing_profile_directory_is_empty(tmp_path):
     assert load_camera_profiles(str(tmp_path / "missing")) == {}
+
+
+def test_shipped_lucid_auto_profile_enforces_exposure_ceiling():
+    profile_directory = (
+        Path(__file__).resolve().parents[2]
+        / "vixel_bringup/config/camera-profiles"
+    )
+    profile = load_camera_profiles(str(profile_directory))["lucid_triton_indoor_auto"]
+
+    assert profile["settings"]["exposure_auto_limit_auto"] is False
+    assert profile["settings"]["exposure_auto_upper_us"] == 200000.0
+
+
+def test_example_machine_defaults_enforce_exposure_ceiling():
+    machine_path = (
+        Path(__file__).resolve().parents[2]
+        / "vixel_bringup/config/machine.example.yaml"
+    )
+    machine = yaml.safe_load(machine_path.read_text(encoding="utf-8"))
+    imaging = machine["providers"]["genicam"]["imaging"]
+
+    assert imaging["exposure_auto_limit_auto"] is False
+    assert imaging["exposure_auto_upper_us"] == 200000.0
 
 
 def test_unknown_profile_is_rejected():

@@ -2405,16 +2405,13 @@ private:
             camera_, candidate, &feature_error);
           if (feature_error != nullptr) {g_error_free(feature_error); continue;}
           if (!available) {continue;}
-          if (!value) {
-            std::string detail;
-            if (!disable_auto_limit_feature(candidate, detail)) {
-              throw std::runtime_error("setting " + std::string(candidate) + ": " + detail);
-            }
-            return;
+          std::string detail;
+          const bool applied = value ?
+            enable_auto_limit_feature(candidate, detail) :
+            disable_auto_limit_feature(candidate, detail);
+          if (!applied) {
+            throw std::runtime_error("setting " + std::string(candidate) + ": " + detail);
           }
-          if (!feature_writable(camera_, candidate)) {continue;}
-          arv_camera_set_boolean(camera_, candidate, value, &feature_error);
-          throw_on_error(feature_error, std::string("setting ") + candidate);
           return;
         }
         RCLCPP_WARN(

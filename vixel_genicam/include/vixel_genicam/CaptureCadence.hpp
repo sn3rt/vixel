@@ -34,7 +34,8 @@ inline bool enabled_feature_value(std::string value)
   std::transform(value.begin(), value.end(), value.begin(), [](unsigned char character) {
     return static_cast<char>(std::tolower(character));
   });
-  return value == "on" || value == "true" || value == "enabled" || value == "yes";
+  return value == "on" || value == "true" || value == "enabled" || value == "yes" ||
+         value == "continuous" || value == "once";
 }
 
 inline std::optional<double> bounded_numeric_limit(

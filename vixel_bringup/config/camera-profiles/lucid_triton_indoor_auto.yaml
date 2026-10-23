@@ -8,7 +8,8 @@ compatibility:
 settings:
   pixel_format: BGR8
   exposure_auto: Continuous
-  exposure_auto_upper_us: 10000.0
+  exposure_auto_limit_auto: false
+  exposure_auto_upper_us: 200000.0
   gain_auto: Continuous
   gain_auto_upper_db: 12.0
   auto_brightness_target: 50.0
