@@ -103,6 +103,16 @@ GenicamConfig load_genicam_config(const std::string & path)
   if (migrating_legacy) {
     config.image_timeout_ms = std::min(config.image_timeout_ms, 1000);
   }
+  config.frame_retention_ms = read_or(
+    provider, "frame_retention_ms", std::max(250, config.image_timeout_ms - 100));
+  if (config.image_timeout_ms < 250 || config.image_timeout_ms > 60000 ||
+    config.frame_retention_ms < 100 ||
+    config.frame_retention_ms >= config.image_timeout_ms)
+  {
+    throw std::runtime_error(
+            "providers.genicam image_timeout_ms must be between 250 and 60000 and "
+            "frame_retention_ms must be at least 100 and smaller than image_timeout_ms");
+  }
   config.buffer_count = std::max(4, read_or(provider, "buffer_count", config.buffer_count));
   config.socket_buffer_bytes = read_or(
     provider, "socket_buffer_bytes", config.socket_buffer_bytes);

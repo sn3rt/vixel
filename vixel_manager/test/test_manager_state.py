@@ -175,9 +175,9 @@ def test_overlapping_groups_aggregate_sensor_mode_and_cadence():
         assignment.sensor_id: assignment
         for assignment in publisher.messages[0].assignments
     }
-    assert assignments["left"].capture_group_ids == ["all", "front"]
-    assert assignments["right"].capture_group_ids == ["all", "back"]
-    assert assignments["left"].capture_group_missing_policies == ["strict", "strict"]
+    assert assignments["left"].capture_group_ids == ["front"]
+    assert assignments["right"].capture_group_ids == ["back"]
+    assert assignments["left"].capture_group_missing_policies == ["strict"]
     assert assignments["left"].operating_mode == "capture"
     assert assignments["right"].operating_mode == "capture"
     assert assignments["left"].requested_capture_interval_ms == 250
@@ -188,6 +188,17 @@ def test_overlapping_groups_aggregate_sensor_mode_and_cadence():
     assert assignments["spare"].capture_group_ids == []
     assert assignments["spare"].operating_mode == "idle"
     assert json.loads(assignments["spare"].provider_settings_json)["trigger_source"] == "Action0"
+
+    manager.group_modes = {"all": "preview", "front": "preview", "back": "preview"}
+    manager.capture_sessions = {}
+    manager._publish_assignments(snapshot)
+    preview_assignments = {
+        assignment.sensor_id: assignment
+        for assignment in publisher.messages[1].assignments
+    }
+    assert preview_assignments["left"].capture_group_ids == ["all", "front"]
+    assert preview_assignments["right"].capture_group_ids == ["all", "back"]
+    assert preview_assignments["left"].operating_mode == "preview"
 
 
 def test_prepare_capture_groups_acquires_a_session_without_mutating_baseline_modes():

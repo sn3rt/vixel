@@ -224,7 +224,7 @@ def wait_for_capture_groups_ready(
 
 def start_save_sequence(
     base_url: str, groups: list[str], interval: float, count: int,
-    request_prefix: str, timeout: float,
+    request_prefix: str, timeout: float, synchronize_groups: bool = False,
 ) -> dict[str, Any]:
     return api_request(
         base_url, "/api/v1/capture-operations/sequence", timeout,
@@ -233,10 +233,39 @@ def start_save_sequence(
             "request_id": request_prefix,
             "interval_ms": round(interval * 1000),
             "count": count,
-            "synchronize_groups": True,
+            "synchronize_groups": synchronize_groups,
             "metadata": {"source": "http_trigger_groups_periodic.py"},
         },
     )
+
+
+def aggregate_capture_group(
+    base_url: str, groups: list[str], timeout: float,
+) -> str:
+    result = api_request(base_url, "/api/v1/groups", timeout)
+    records = {
+        str(group.get("group_id", "")): group
+        for group in result.get("groups", [])
+        if isinstance(group, dict) and group.get("group_id")
+    }
+    missing = [group_id for group_id in groups if group_id not in records]
+    if missing:
+        raise RuntimeError(f"unknown capture group(s): {','.join(missing)}")
+    requested_members = {
+        str(member)
+        for group_id in groups
+        for member in records[group_id].get("member_ids", [])
+    }
+    candidates = sorted(
+        group_id for group_id, group in records.items()
+        if set(map(str, group.get("member_ids", []))) == requested_members
+    )
+    if not candidates:
+        raise RuntimeError(
+            "no aggregate capture group contains exactly the requested cameras; "
+            "create one or pass --separate-groups"
+        )
+    return min(candidates, key=lambda group_id: (len(group_id), group_id))
 
 
 def monitor_save_sequence(
@@ -282,7 +311,7 @@ def parser() -> argparse.ArgumentParser:
         "--mode",
         choices=("publish", "save"),
         default="publish",
-        help="Publish each triggered set or save separate group capture directories",
+        help="Publish each triggered set or run a server-managed saved sequence",
     )
     value.add_argument("--interval", type=float, default=2.0, help="Seconds between cycles")
     value.add_argument("--count", type=int, default=0, help="Cycles; 0 runs until Ctrl-C")
@@ -296,6 +325,22 @@ def parser() -> argparse.ArgumentParser:
         "--request-prefix",
         default="",
         help="Capture ID prefix; default includes the current UTC time",
+    )
+    value.add_argument(
+        "--synchronize-groups",
+        action="store_true",
+        help=(
+            "Use one exact PTP timestamp across separate groups; by default "
+            "multi-group saves phase group actions across each capture interval"
+        ),
+    )
+    value.add_argument(
+        "--separate-groups",
+        action="store_true",
+        help=(
+            "Keep separate provider requests and capture directories instead of "
+            "using an existing aggregate group with the same camera membership"
+        ),
     )
     return value
 
@@ -330,14 +375,24 @@ def main(argv: list[str] | None = None) -> int:
     if args.mode == "save":
         operation_id = ""
         try:
+            capture_groups = list(args.group_ids)
+            if len(capture_groups) > 1 and not args.separate_groups:
+                aggregate = aggregate_capture_group(
+                    args.base_url, capture_groups, args.timeout
+                )
+                print(
+                    f"using aggregate group {aggregate} for reliable capture of "
+                    f"{','.join(capture_groups)}"
+                )
+                capture_groups = [aggregate]
             accepted = start_save_sequence(
-                args.base_url, args.group_ids, args.interval, args.count,
-                request_prefix, args.timeout,
+                args.base_url, capture_groups, args.interval, args.count,
+                request_prefix, args.timeout, args.synchronize_groups,
             )
             operation_id = str(accepted["operation_id"])
             print(
                 f"sequence accepted: operation={operation_id} interval={args.interval:.3f} s "
-                f"groups={','.join(args.group_ids)}"
+                f"groups={','.join(capture_groups)}"
             )
             operation = monitor_save_sequence(args.base_url, operation_id, args.timeout)
             return 0 if operation.get("status") == "complete" else 1

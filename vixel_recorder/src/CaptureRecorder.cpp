@@ -1179,6 +1179,10 @@ private:
           operation->value.synchronize_groups;
         const auto group_target = target +
           (operation->value.synchronize_groups ? 0ms :
+          operation->value.kind == "sequence" ?
+          group_dispatch_offset(
+            std::chrono::milliseconds(operation->value.interval_ms),
+            operation->value.group_ids.size(), group_index) :
           std::chrono::milliseconds(5 * static_cast<std::int64_t>(group_index)));
         goal.requested_time = system_time_message(group_target);
         goal.operation_id = operation->value.operation_id;

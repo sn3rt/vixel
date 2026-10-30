@@ -976,10 +976,18 @@ public:
     throw_on_error(error, "creating GenICam stream");
     if (stream_ == nullptr) {throw std::runtime_error("Aravis returned no stream");}
     if (ARV_IS_GV_STREAM(stream_)) {
+      const auto frame_retention_us = static_cast<guint>(
+        config_.frame_retention_ms * 1000);
       g_object_set(
         stream_, "packet-resend", ARV_GV_STREAM_PACKET_RESEND_ALWAYS,
         "socket-buffer", ARV_GV_STREAM_SOCKET_BUFFER_FIXED,
-        "socket-buffer-size", config_.socket_buffer_bytes, nullptr);
+        "socket-buffer-size", config_.socket_buffer_bytes,
+        "frame-retention", frame_retention_us, nullptr);
+      RCLCPP_INFO(
+        node_->get_logger(),
+        "%s GigE stream: packet_resend=always frame_retention=%d ms socket_buffer=%d bytes",
+        assignment_.sensor_id.c_str(), config_.frame_retention_ms,
+        config_.socket_buffer_bytes);
     }
     error = nullptr;
     const auto payload = arv_camera_get_payload(camera_, &error);

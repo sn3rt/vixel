@@ -16,6 +16,8 @@ TEST(GenicamConfig, LoadsProviderAndNetworks)
     packet_size: 8192
 providers:
   genicam:
+    image_timeout_ms: 1200
+    frame_retention_ms: 1000
     buffer_count: 20
     stream_restart_error_threshold: 12
     stream_restart_window_ms: 45000
@@ -38,6 +40,8 @@ defaults:
   EXPECT_EQ(config.networks.at("link").packet_size, 8192);
   EXPECT_EQ(config.networks.at("link").packet_delay, 100000);
   EXPECT_EQ(config.buffer_count, 20);
+  EXPECT_EQ(config.image_timeout_ms, 1200);
+  EXPECT_EQ(config.frame_retention_ms, 1000);
   EXPECT_EQ(config.stream_restart_error_threshold, 12);
   EXPECT_EQ(config.stream_restart_window_ms, 45000);
   EXPECT_EQ(config.stream_restart_backoff_ms, 60000);
@@ -80,6 +84,21 @@ TEST(GenicamConfig, ReportsMissingProvider)
     "vixel-genicam-missing-provider.yaml";
   std::ofstream(path) << R"(managed_networks: {}
 providers: {}
+)";
+
+  EXPECT_THROW(vixel_genicam::load_genicam_config(path.string()), std::runtime_error);
+  std::filesystem::remove(path);
+}
+
+TEST(GenicamConfig, RejectsFrameRetentionAtOrBeyondImageTimeout)
+{
+  const auto path = std::filesystem::temp_directory_path() /
+    "vixel-genicam-invalid-retention.yaml";
+  std::ofstream(path) << R"(managed_networks: {}
+providers:
+  genicam:
+    image_timeout_ms: 1000
+    frame_retention_ms: 1000
 )";
 
   EXPECT_THROW(vixel_genicam::load_genicam_config(path.string()), std::runtime_error);

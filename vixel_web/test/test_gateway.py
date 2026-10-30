@@ -82,6 +82,23 @@ def test_unavailable_ros_service_error_names_the_service():
         node.call_service(client, object())
 
 
+def test_multi_group_capture_defaults_to_staggered_actions():
+    groups, _request_id, synchronize, _metadata = GatewayNode._capture_operation_request({
+        "group_ids": ["front", "back"],
+    })
+
+    assert groups == ["front", "back"]
+    assert synchronize is False
+
+
+def test_cross_group_synchronization_remains_explicitly_available():
+    _groups, _request_id, synchronize, _metadata = GatewayNode._capture_operation_request({
+        "group_ids": ["front", "back"], "synchronize_groups": True,
+    })
+
+    assert synchronize is True
+
+
 def test_group_ptp_locking_members_are_exposed_as_json():
     group = SimpleNamespace(
         group_id="front",

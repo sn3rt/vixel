@@ -891,10 +891,15 @@ class GatewayNode(Node):
             raise ValueError("group_ids must be an array of strings")
         if not isinstance(metadata, dict):
             raise ValueError("metadata must be a JSON object")
+        # Separate group requests share the provider's action-command path.
+        # Phase-staggering across the sequence interval is the safer default;
+        # callers that require a shared PTP timestamp can request it explicitly
+        # or use one aggregate group.
+        synchronize_default = len(group_ids) <= 1
         return (
             group_ids,
             str(body.get("request_id", "")),
-            bool(body.get("synchronize_groups", True)),
+            bool(body.get("synchronize_groups", synchronize_default)),
             json.dumps(metadata, separators=(",", ":"), sort_keys=True),
         )
 

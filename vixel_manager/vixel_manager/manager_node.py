@@ -1492,19 +1492,6 @@ class InventoryManager(Node):
             assignment.assigned_address = sensor.get("assigned_address", "")
             member_groups = groups_for_member.get(sensor_id, [])
             group_ids = [group_id for group_id, _ in member_groups]
-            assignment.capture_group_ids = group_ids
-            assignment.capture_group_missing_policies = [
-                group.get("missing_policy", "strict") for _, group in member_groups
-            ]
-            assignment.sync_group = group_ids[0] if group_ids else ""
-            assignment.group_missing_policy = (
-                "strict" if any(
-                    group.get("missing_policy", "strict") == "strict"
-                    for _, group in member_groups
-                ) else "degraded" if member_groups else ""
-            )
-            assignment.group_trigger_source = "Action0" if member_groups else ""
-            assignment.preferred_master_id = ""
             modes = [self._requested_group_mode(group_id) for group_id in group_ids]
             directly_owned = any(
                 session["target_kind"] == "sensor" and sensor_id in session["sensor_ids"]
@@ -1521,6 +1508,31 @@ class InventoryManager(Node):
                 "idle" if member_groups else
                 self.sensor_modes.get(sensor_id, self.default_sensor_mode)
             )
+            # ProviderAssignment has one operating mode for a camera even when
+            # that camera belongs to overlapping groups. While capturing, only
+            # advertise groups that actually requested capture; otherwise an
+            # idle/preview selection is incorrectly promoted to a second
+            # capture group inside the provider.
+            assigned_groups = member_groups
+            if assignment.operating_mode == "capture":
+                assigned_groups = [
+                    (group_id, group) for group_id, group in member_groups
+                    if self._requested_group_mode(group_id) == "capture"
+                ]
+            assigned_group_ids = [group_id for group_id, _ in assigned_groups]
+            assignment.capture_group_ids = assigned_group_ids
+            assignment.capture_group_missing_policies = [
+                group.get("missing_policy", "strict") for _, group in assigned_groups
+            ]
+            assignment.sync_group = assigned_group_ids[0] if assigned_group_ids else ""
+            assignment.group_missing_policy = (
+                "strict" if any(
+                    group.get("missing_policy", "strict") == "strict"
+                    for _, group in assigned_groups
+                ) else "degraded" if assigned_groups else ""
+            )
+            assignment.group_trigger_source = "Action0" if assigned_groups else ""
+            assignment.preferred_master_id = ""
             assignment.preview_rate_hz = max(
                 (
                     float(group.get(
@@ -1533,7 +1545,7 @@ class InventoryManager(Node):
             )
             capture_intervals = [
                 self._requested_group_interval(group_id)
-                for group_id in group_ids
+                for group_id in assigned_group_ids
                 if self._requested_group_mode(group_id) == "capture"
                 and self._requested_group_interval(group_id) > 0
             ]

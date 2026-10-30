@@ -65,13 +65,9 @@ The periodic example sends the `front` and `back` HTTP requests concurrently:
 python3 examples/http_trigger_groups_periodic.py front back --interval 2
 ```
 
-Use `--count 10` for a finite run; the default continues until Ctrl-C. Each
-disjoint selection receives the same requested timestamp and the provider
-converts it to one shared PTP action time, so synchronization also spans `front`
-and `back`. The script prints the scheduled-time difference between selections
-on every cycle. This example is
-publish-only unless `--mode save` is supplied. To persist separate front and
-back capture directories on every cycle:
+Use `--count 10` for a finite run; the default continues until Ctrl-C. This
+example is publish-only unless `--mode save` is supplied. To persist all front
+and back cameras on every cycle:
 
 ```bash
 python3 examples/http_trigger_groups_periodic.py \
@@ -81,17 +77,22 @@ python3 examples/http_trigger_groups_periodic.py \
 In publish mode, the helper acquires one capture session for every named group,
 renews it while the script runs, releases it on exit, and waits until the cameras
 are ready; `--ready-timeout` changes the default 60-second wait. Save mode
-submits one server-managed sequence immediately. The server owns its capture
-session, applies an exposure ceiling derived from `--interval`, waits for
-camera/PTP/metering and trigger-armed readiness, and only then starts
-the sequence. It reports a preparation failure without firing a trigger when a
-camera cannot support that cadence.
+resolves multiple selections to an existing aggregate group with the same
+camera membership (`front back` resolves to `all4` on this machine), then
+submits one server-managed sequence. This keeps one scheduled-action request
+and one capture directory per cycle. The server owns its capture session,
+applies an exposure ceiling derived from `--interval`, waits for camera/PTP/
+metering and trigger-armed readiness, and only then starts the sequence.
 
-Use `--interval 0.5 --count 10` for ten 2 Hz cycles. All listed groups share
-each cycle's requested PTP timestamp, while each group keeps its own directory
-and manifest. Camera acquisition continues on schedule while previous PNGs are
-encoded and saved. If a bounded queue fills, the sequence stops scheduling new
-cycles and drains all captures already accepted.
+Use `--interval 0.5 --count 10` for ten 2 Hz cycles. Pass `--separate-groups`
+only when separate front/back manifests are required; those requests are phased
+evenly across the interval to reduce transport contention. Add
+`--synchronize-groups` only when exact cross-group timing is required and has
+been validated on the installed cameras.
+
+Camera acquisition continues on schedule while previous PNGs are encoded and
+saved. If a bounded queue fills, the sequence stops scheduling new cycles and
+drains all captures already accepted.
 
 ## Trigger through ROS and save in the client
 

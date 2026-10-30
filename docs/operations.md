@@ -175,25 +175,34 @@ python3 examples/http_trigger_groups_periodic.py \
   front back --interval 0.5 --mode save --count 10
 ```
 
-The server accepts the request in a `preparing` state, atomically reserves both
-groups, requests capture mode with the 500 ms interval, and waits for camera,
-cadence, PTP, automatic-metering, pipeline-idle, and trigger-armed readiness.
-Only then does it schedule the
-first cycle. A camera that cannot bound automatic exposure or cannot meet the
-interval fails preparation before any trigger is fired. The preparation
-deadline is configured with `recording.sequence_prepare_timeout_ms`.
+The helper first resolves multiple selections to an existing aggregate group
+with the same camera membership. On this machine, `front back` resolves to
+`all4`, avoiding concurrent provider requests while retaining one exact PTP
+exposure across all four cameras. The server accepts the resulting request in a
+`preparing` state, requests capture mode with the 500 ms interval, and waits for
+camera, cadence, PTP, automatic-metering, pipeline-idle, and trigger-armed
+readiness. Only then does it schedule the first cycle. A camera that cannot
+bound automatic exposure or cannot meet the interval fails preparation before
+any trigger is fired. The preparation deadline is configured with
+`recording.sequence_prepare_timeout_ms`.
 
-Each cycle creates a separate capture directory and manifest per group. The
-example requests one shared timestamp for every included group. The requested
-500 ms cadence is based on exposure timestamps; completed files may appear
-later and out of order. If a queue reaches its configured limit, Vixel stops
-scheduling that sequence and finishes every capture it already accepted.
+The default aggregate path creates one capture directory and manifest per
+cycle. Pass `--separate-groups` to retain one directory per requested group;
+separate groups are phased evenly across the requested interval. Add
+`--synchronize-groups` only when exact cross-group timing is required and has
+been validated.
 
-The equivalent HTTP request returns `202 Accepted` immediately:
+The requested 500 ms cadence is based on exposure timestamps; completed files
+may appear later and out of order. If a queue reaches its configured limit,
+Vixel stops scheduling that sequence and finishes every capture it already
+accepted.
+
+To bypass helper-side aggregate selection and request separate groups directly,
+the HTTP API returns `202 Accepted` immediately:
 
 ```bash
 curl -X POST -H 'Content-Type: application/json' \
-  -d '{"group_ids":["front","back"],"interval_ms":500,"count":10,"synchronize_groups":true,"metadata":{"job":"example"}}' \
+  -d '{"group_ids":["front","back"],"interval_ms":500,"count":10,"synchronize_groups":false,"metadata":{"job":"example"}}' \
   http://127.0.0.1:8080/api/v1/capture-operations/sequence
 ```
 

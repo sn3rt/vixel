@@ -37,6 +37,7 @@ struct GenicamConfig
   std::vector<std::string> vendor_allowlist;
   int discovery_period_ms{2000};
   int image_timeout_ms{1000};
+  int frame_retention_ms{900};
   int buffer_count{16};
   int socket_buffer_bytes{33554432};
   int stream_restart_error_threshold{10};

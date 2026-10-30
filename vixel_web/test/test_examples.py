@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 
 ROOT = Path(__file__).parents[2]
 
@@ -132,6 +134,8 @@ def test_example_parsers_have_runnable_defaults():
     assert periodic.count == 0
     assert periodic.mode == "publish"
     assert periodic.ready_timeout == 60.0
+    assert periodic.synchronize_groups is False
+    assert periodic.separate_groups is False
     assert ros_request.mode == "publish"
     assert ros_request.timeout == 35.0
     assert ros.output_dir == Path("vixel-triggered-images")
@@ -227,7 +231,54 @@ def test_periodic_sequence_uses_server_managed_cadence(monkeypatch):
     assert result["operation_id"] == "operation_1"
     assert captured["path"] == "/api/v1/capture-operations/sequence"
     assert captured["body"]["interval_ms"] == 500
+    assert captured["body"]["synchronize_groups"] is False
+
+
+def test_periodic_sequence_can_request_exact_cross_group_synchronization(monkeypatch):
+    example = load_example("http_trigger_groups_periodic")
+    captured = {}
+
+    def request(base_url, path, timeout, body=None):
+        captured.update(body=body)
+        return {"accepted": True, "operation_id": "operation_1"}
+
+    monkeypatch.setattr(example, "api_request", request)
+    example.start_save_sequence(
+        "http://127.0.0.1:8080", ["front", "back"], 0.5, 10,
+        "periodic", 5.0, True,
+    )
+
     assert captured["body"]["synchronize_groups"] is True
+
+
+def test_periodic_save_resolves_requested_groups_to_aggregate(monkeypatch):
+    example = load_example("http_trigger_groups_periodic")
+    monkeypatch.setattr(example, "api_request", lambda *_args, **_kwargs: {
+        "groups": [
+            {"group_id": "front", "member_ids": ["a", "b"]},
+            {"group_id": "back", "member_ids": ["c", "d"]},
+            {"group_id": "all4", "member_ids": ["a", "b", "c", "d"]},
+        ]
+    })
+
+    assert example.aggregate_capture_group(
+        "http://127.0.0.1:8080", ["front", "back"], 5.0
+    ) == "all4"
+
+
+def test_periodic_save_requires_explicit_fallback_without_aggregate(monkeypatch):
+    example = load_example("http_trigger_groups_periodic")
+    monkeypatch.setattr(example, "api_request", lambda *_args, **_kwargs: {
+        "groups": [
+            {"group_id": "front", "member_ids": ["a"]},
+            {"group_id": "back", "member_ids": ["b"]},
+        ]
+    })
+
+    with pytest.raises(RuntimeError, match="--separate-groups"):
+        example.aggregate_capture_group(
+            "http://127.0.0.1:8080", ["front", "back"], 5.0
+        )
 
 
 def test_periodic_example_acquires_session_and_waits_until_groups_are_ready(monkeypatch):

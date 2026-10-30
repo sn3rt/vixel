@@ -226,11 +226,19 @@ def test_legacy_lucid_provider_is_migrated_in_memory():
     machine = validate_machine(MACHINE)
     assert "lucid" not in machine["providers"]
     imaging = machine["providers"]["genicam"]["imaging"]
+    assert imaging["pixel_format"] == "BGR8"
+    assert imaging["use_max_width"] is True
+    assert imaging["use_max_height"] is True
+    assert imaging["exposure_auto"] == "Continuous"
+    assert imaging["exposure_time_us"] == 1000.0
+    assert imaging["gain_auto"] == "Continuous"
+    assert imaging["gain_db"] == 0.0
     assert imaging["frame_rate_hz"] == 10.0
-    assert imaging["exposure_auto_limit_auto"] is False
-    assert imaging["exposure_auto_upper_us"] == 200000.0
-    assert imaging["gain_auto_upper_db"] == 12.0
-    assert imaging["auto_brightness_target"] == 50.0
+    assert "exposure_auto_limit_auto" not in imaging
+    assert "exposure_auto_upper_us" not in imaging
+    assert "gain_auto_upper_db" not in imaging
+    assert "auto_brightness_target" not in imaging
+    assert "metering_rate_hz" not in imaging
     assert machine["managed_networks"]["left"]["packet_delay"] == 100000
 
 
@@ -241,6 +249,9 @@ def test_explicit_genicam_imaging_defaults_are_preserved():
             "imaging": {
                 "exposure_auto_limit_auto": True,
                 "exposure_auto_upper_us": 25000.0,
+                "gain_auto_upper_db": 8.0,
+                "auto_brightness_target": 45.0,
+                "metering_rate_hz": 1.0,
             }
         }
     }
@@ -249,6 +260,9 @@ def test_explicit_genicam_imaging_defaults_are_preserved():
 
     assert imaging["exposure_auto_limit_auto"] is True
     assert imaging["exposure_auto_upper_us"] == 25000.0
+    assert imaging["gain_auto_upper_db"] == 8.0
+    assert imaging["auto_brightness_target"] == 45.0
+    assert imaging["metering_rate_hz"] == 1.0
 
 
 def test_recording_configuration_gets_safe_defaults():

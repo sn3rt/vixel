@@ -64,7 +64,7 @@ def test_shipped_lucid_auto_profile_enforces_exposure_ceiling():
     assert profile["settings"]["exposure_auto_upper_us"] == 200000.0
 
 
-def test_example_machine_defaults_enforce_exposure_ceiling():
+def test_example_machine_defaults_leave_auto_limits_to_profiles():
     machine_path = (
         Path(__file__).resolve().parents[2]
         / "vixel_bringup/config/machine.example.yaml"
@@ -72,8 +72,14 @@ def test_example_machine_defaults_enforce_exposure_ceiling():
     machine = yaml.safe_load(machine_path.read_text(encoding="utf-8"))
     imaging = machine["providers"]["genicam"]["imaging"]
 
-    assert imaging["exposure_auto_limit_auto"] is False
-    assert imaging["exposure_auto_upper_us"] == 200000.0
+    assert imaging["pixel_format"] == "BGR8"
+    assert imaging["exposure_auto"] == "Continuous"
+    assert imaging["gain_auto"] == "Continuous"
+    assert "exposure_auto_limit_auto" not in imaging
+    assert "exposure_auto_upper_us" not in imaging
+    assert "gain_auto_upper_db" not in imaging
+    assert "auto_brightness_target" not in imaging
+    assert "metering_rate_hz" not in imaging
 
 
 def test_unknown_profile_is_rejected():

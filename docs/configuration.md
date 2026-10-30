@@ -149,8 +149,13 @@ The manager rejects model profiles on a different vendor/model. Existing
 schema-version-1 administrator profiles remain supported as legacy wildcard
 profiles so deployments can migrate deliberately.
 
-The **Known sensor details → Per-camera overrides** field accepts JSON. Common
-portable settings include:
+The **Known sensor details → Per-camera overrides** field accepts JSON.
+Provider-level inherited defaults should be limited to broadly portable values
+such as pixel format, image size, exposure/gain mode, and frame rate. Automatic
+exposure/gain limits, brightness targets, and metering rate should be selected
+through a compatible camera profile (for example,
+`lucid_triton_indoor_auto`) or an explicit per-camera override. Supported
+settings include:
 
 ```json
 {
@@ -189,6 +194,12 @@ time or PTP synchronization. The conservative 100,000 ns default prevents
 simultaneous full-resolution streams from overrunning a shared PCIe uplink.
 Machines with independently provisioned NIC bandwidth may lower it after
 checking the NIC drop counters under simultaneous capture.
+
+`providers.genicam.frame_retention_ms` controls how long Aravis retains an
+incomplete GigE Vision frame while waiting for late or resent packets. It
+defaults to 900 ms and must remain below `image_timeout_ms` (1000 ms by
+default). Aravis' native 100 ms default is too short for the approximately
+202 ms transfer time of a paced, full-resolution 9 MiB BGR8 frame.
 
 Managed sequences derive camera limits from their requested interval; no
 camera-model or rate-specific profile is needed. For example, a 200 ms
