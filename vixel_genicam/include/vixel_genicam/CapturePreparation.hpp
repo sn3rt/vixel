@@ -7,19 +7,19 @@ namespace vixel_genicam
 {
 
 inline bool background_metering_allowed(
-  bool capture_reserved, bool /* capture_primed */)
+  bool capture_reserved, bool capture_primed)
 {
-  // A reserved camera must become trigger-ready without waiting for a
-  // disposable metering frame, and its receive pipeline must stay empty for
-  // the owner's first requested exposure.
-  return !capture_reserved;
+  // Every newly configured capture stream needs at least one clean disposable
+  // Action0 frame before it is offered to an owner. Once primed, a reserved
+  // stream stays empty for the owner's next requested exposure.
+  return !capture_primed || !capture_reserved;
 }
 
 inline bool capture_preparation_ready(
-  bool preparation_latched, bool pipeline_idle,
+  bool preparation_latched, bool capture_primed, bool pipeline_idle,
   bool trigger_armed_required, bool trigger_armed)
 {
-  return preparation_latched || (pipeline_idle &&
+  return preparation_latched || (capture_primed && pipeline_idle &&
          (!trigger_armed_required || trigger_armed));
 }
 

@@ -1087,8 +1087,9 @@ public:
 
   bool metering_due(const std::chrono::steady_clock::time_point tick) const
   {
-    if (assignment_.operating_mode != "capture" || metering_rate_hz_ <= 0.0 ||
-      tick < next_metering_ || !vixel_genicam::background_metering_allowed(
+    if (assignment_.operating_mode != "capture" || tick < next_metering_ ||
+      (capture_primed_.load() && metering_rate_hz_ <= 0.0) ||
+      !vixel_genicam::background_metering_allowed(
         capture_reserved_.load(), capture_primed_.load()))
     {
       return false;
@@ -1103,9 +1104,13 @@ public:
 
   void mark_metering_scheduled(const std::chrono::steady_clock::time_point tick)
   {
-    if (metering_rate_hz_ <= 0.0) {return;}
-    next_metering_ = tick + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-      std::chrono::duration<double>(1.0 / metering_rate_hz_));
+    // A zero background rate still permits the mandatory cold-stream priming
+    // frame. On failure, retry after the receive pipeline has drained.
+    const auto delay = metering_rate_hz_ > 0.0 ?
+      std::chrono::duration<double>(1.0 / metering_rate_hz_) :
+      std::chrono::duration<double>(0.1);
+    next_metering_ = tick +
+      std::chrono::duration_cast<std::chrono::steady_clock::duration>(delay);
   }
 
   std::shared_ptr<FrameCompletion> request_frame(
@@ -1200,7 +1205,8 @@ public:
     const bool require_trigger_armed = !trigger_armed_feature_.empty();
     const bool trigger_armed = capture_trigger_armed();
     const bool prepared = vixel_genicam::capture_preparation_ready(
-      false, pipeline_idle(), require_trigger_armed, trigger_armed);
+      false, capture_primed_.load(), pipeline_idle(),
+      require_trigger_armed, trigger_armed);
     if (prepared) {capture_preparation_latched_.store(true);}
     return prepared;
   }
@@ -2507,13 +2513,12 @@ private:
     const bool automatic = auto_mode(exposure_auto) != ARV_AUTO_OFF ||
       auto_mode(gain_auto) != ARV_AUTO_OFF;
     exposure_auto_enabled_ = auto_mode(exposure_auto) != ARV_AUTO_OFF;
-    // Captures themselves update continuous exposure/gain.  Keep background
-    // metering opt-in: making a disposable metering frame mandatory here can
-    // prevent an otherwise trigger-ready camera from ever entering capture.
+    // Captures themselves update continuous exposure/gain. Keep recurring
+    // background metering opt-in, while every new capture-mode stream still
+    // receives one clean disposable Action0 frame before it reports ready.
     metering_rate_hz_ = automatic ? std::clamp(
       setting(settings, "metering_rate_hz", 0.0), 0.0, 10.0) : 0.0;
-    capture_primed_.store(
-      assignment_.operating_mode != "capture" || metering_rate_hz_ <= 0.0);
+    capture_primed_.store(assignment_.operating_mode != "capture");
 
     // Link pacing constrains the camera's frame-rate bounds. Apply transport
     // first so the following frame-rate write and readback reflect the actual

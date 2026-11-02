@@ -180,7 +180,9 @@ def prepare_capture_groups(
     )
     print(f"capture session {session_id} acquired for: {','.join(groups)}")
     try:
-        wait_for_capture_groups_ready(base_url, groups, timeout, ready_timeout)
+        wait_for_capture_groups_ready(
+            base_url, groups, timeout, ready_timeout, session_id=session_id
+        )
     except BaseException:
         try:
             release_capture_session(base_url, session_id, timeout)
@@ -192,11 +194,17 @@ def prepare_capture_groups(
 
 def wait_for_capture_groups_ready(
     base_url: str, groups: list[str], timeout: float, ready_timeout: float,
+    session_id: str = "",
 ) -> None:
     deadline = time.monotonic() + ready_timeout
+    renew_deadline = time.monotonic() + 2.0
     last_status = ""
     consecutive_ready_polls = 0
     while True:
+        now = time.monotonic()
+        if session_id and now >= renew_deadline:
+            renew_capture_session(base_url, session_id, timeout)
+            renew_deadline = time.monotonic() + 2.0
         result = api_request(base_url, "/api/v1/groups", timeout)
         records = {
             str(group.get("group_id", "")): group
@@ -411,6 +419,12 @@ def main(argv: list[str] | None = None) -> int:
     renew_deadline = next_deadline + 2.0
     try:
         while args.count == 0 or sequence < args.count:
+            now = time.monotonic()
+            if publish_session_id and now >= renew_deadline:
+                renew_capture_session(
+                    args.base_url, publish_session_id, args.timeout
+                )
+                renew_deadline = time.monotonic() + 2.0
             sequence += 1
             results = trigger_cycle(
                 args.group_ids, args.base_url, args.timeout, sequence, args.mode,

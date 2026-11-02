@@ -337,6 +337,42 @@ def test_periodic_example_acquires_session_and_waits_until_groups_are_ready(monk
     assert len([call for call in calls if call[1] == "/api/v1/groups"]) == 3
 
 
+def test_periodic_example_renews_session_while_waiting_for_readiness(monkeypatch):
+    example = load_example("http_trigger_groups_periodic")
+    calls = []
+    clock = SimpleNamespace(now=0.0)
+    group_snapshots = iter([
+        {"groups": [{"group_id": "all4", "operating_mode": "capture", "ready": False}]},
+        {"groups": [{"group_id": "all4", "operating_mode": "capture", "ready": False}]},
+        {"groups": [{"group_id": "all4", "operating_mode": "capture", "ready": False}]},
+        {"groups": [{"group_id": "all4", "operating_mode": "capture", "ready": True}]},
+        {"groups": [{"group_id": "all4", "operating_mode": "capture", "ready": True}]},
+    ])
+
+    def request(base_url, path, timeout, body=None, method=None):
+        calls.append((path, method))
+        if path == "/api/v1/groups":
+            return next(group_snapshots)
+        return {"success": True}
+
+    monkeypatch.setattr(example, "api_request", request)
+    monkeypatch.setattr(example.time, "monotonic", lambda: clock.now)
+    monkeypatch.setattr(
+        example.time, "sleep", lambda _seconds: setattr(clock, "now", clock.now + 1.1)
+    )
+
+    example.wait_for_capture_groups_ready(
+        "http://127.0.0.1:8080", ["all4"], 5.0, 10.0,
+        session_id="session_1",
+    )
+
+    renewals = [
+        call for call in calls
+        if call == ("/api/v1/capture-sessions/session_1", "PATCH")
+    ]
+    assert len(renewals) == 2
+
+
 def test_periodic_example_passes_session_to_each_group_request():
     example = load_example("http_trigger_groups_periodic")
     calls = []

@@ -263,11 +263,14 @@ and missing GenICam-node diagnostics remain in provider startup logs.
 Manual exposure uses `exposure_auto: "Off"` with `exposure_us`, and manual
 gain uses `gain_auto: "Off"` with `gain_db`. Saved and published capture frames
 update continuous camera auto-exposure/gain, so `metering_rate_hz` defaults to
-0 Hz and capture readiness never depends on a disposable metering frame.
+0 Hz. Every newly configured capture stream still receives clean disposable
+scheduled-action frames until each camera has produced one complete buffer;
+only then does the group report capture-ready. This absorbs cold transport
+buffers without consuming or failing the owner's first requested exposure.
 Profiles that need exposure adaptation before a capture may explicitly set a
 non-zero `metering_rate_hz`; those unsaved, unencoded frames are then used while
-the group is unreserved. A prepared group becomes capture-ready when its receive
-pipeline is empty and `TriggerArmed` is true when the camera exposes it. That
+the group is unreserved. A prepared group becomes capture-ready after priming,
+when its receive pipeline is empty and `TriggerArmed` is true when the camera exposes it. That
 preparation result is latched for the lifetime of the configured camera session,
 so an in-flight sequence frame does not temporarily revoke the group's readiness.
 Scheduled frames are matched to their PTP action timestamp; an old metering
