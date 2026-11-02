@@ -2,9 +2,9 @@
 
 #include <gtest/gtest.h>
 
-TEST(CapturePreparation, PreparedCadenceQuiescesMeteringAfterInitialFrame)
+TEST(CapturePreparation, ReservedCaptureQuiescesMeteringImmediately)
 {
-  EXPECT_TRUE(vixel_genicam::background_metering_allowed(true, false));
+  EXPECT_FALSE(vixel_genicam::background_metering_allowed(true, false));
   EXPECT_FALSE(vixel_genicam::background_metering_allowed(true, true));
 }
 
@@ -14,22 +14,21 @@ TEST(CapturePreparation, UnreservedCaptureModeContinuesBackgroundMetering)
   EXPECT_TRUE(vixel_genicam::background_metering_allowed(false, true));
 }
 
-TEST(CapturePreparation, PreparedCameraMustBePrimedIdleAndArmed)
+TEST(CapturePreparation, PreparedCameraMustBeIdleAndArmed)
 {
-  EXPECT_FALSE(vixel_genicam::capture_preparation_ready(false, false, true, true, true));
-  EXPECT_FALSE(vixel_genicam::capture_preparation_ready(false, true, false, true, true));
-  EXPECT_FALSE(vixel_genicam::capture_preparation_ready(false, true, true, true, false));
-  EXPECT_TRUE(vixel_genicam::capture_preparation_ready(false, true, true, true, true));
+  EXPECT_FALSE(vixel_genicam::capture_preparation_ready(false, false, true, true));
+  EXPECT_FALSE(vixel_genicam::capture_preparation_ready(false, true, true, false));
+  EXPECT_TRUE(vixel_genicam::capture_preparation_ready(false, true, true, true));
 }
 
-TEST(CapturePreparation, MissingTriggerArmedFeatureUsesPrimedIdleFallback)
+TEST(CapturePreparation, MissingTriggerArmedFeatureUsesIdleFallback)
 {
-  EXPECT_TRUE(vixel_genicam::capture_preparation_ready(false, true, true, false, false));
+  EXPECT_TRUE(vixel_genicam::capture_preparation_ready(false, true, false, false));
 }
 
 TEST(CapturePreparation, InFlightCaptureDoesNotRevokeLatchedReadiness)
 {
-  EXPECT_TRUE(vixel_genicam::capture_preparation_ready(true, true, false, true, false));
+  EXPECT_TRUE(vixel_genicam::capture_preparation_ready(true, false, true, false));
 }
 
 TEST(CapturePreparation, UngroupedCameraGetsPrivateMeteringDomain)

@@ -14,6 +14,7 @@ TEST(GenicamConfig, LoadsProviderAndNetworks)
     host_cidr: 192.168.2.1/24
     approved: true
     packet_size: 8192
+    transfer_slot_ms: 75
 providers:
   genicam:
     image_timeout_ms: 1200
@@ -38,7 +39,8 @@ defaults:
   EXPECT_EQ(config.networks.at("link").interface, "enp1s0");
   EXPECT_TRUE(config.networks.at("link").approved);
   EXPECT_EQ(config.networks.at("link").packet_size, 8192);
-  EXPECT_EQ(config.networks.at("link").packet_delay, 100000);
+  EXPECT_EQ(config.networks.at("link").packet_delay, 50000);
+  EXPECT_EQ(config.networks.at("link").transfer_slot_ms, 75);
   EXPECT_EQ(config.buffer_count, 20);
   EXPECT_EQ(config.image_timeout_ms, 1200);
   EXPECT_EQ(config.frame_retention_ms, 1000);

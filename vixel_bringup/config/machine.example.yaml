@@ -27,8 +27,8 @@ managed_networks:
     gateway: 0.0.0.0
     packet_size: 9000
     # Safe for several full-resolution cameras sharing a PCIe uplink.
-    packet_delay: 100000
-    transfer_slot_ms: 100
+    packet_delay: 50000
+    transfer_slot_ms: 30
 
   # A switch may host multiple cameras. Give each switched port its own subnet.
   camera_link_1:
@@ -45,8 +45,8 @@ managed_networks:
     rp_filter: 0
     gateway: 0.0.0.0
     packet_size: 9000
-    packet_delay: 100000
-    transfer_slot_ms: 100
+    packet_delay: 50000
+    transfer_slot_ms: 30
 
 providers:
   genicam:

@@ -2,6 +2,7 @@
 #include "vixel_genicam/CapturePreparation.hpp"
 #include "vixel_genicam/GenicamConfig.hpp"
 #include "vixel_genicam/FrameTimestamp.hpp"
+#include "vixel_genicam/SessionLiveness.hpp"
 #include "vixel_genicam/StreamRecovery.hpp"
 #include "vixel_genicam/TriggerReadiness.hpp"
 #include "vixel_genicam/TriggerSelection.hpp"
@@ -9,6 +10,7 @@
 #include <arv.h>
 #include <camera_info_manager/camera_info_manager.hpp>
 #include <cv_bridge/cv_bridge.hpp>
+#include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -36,6 +38,10 @@
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -75,6 +81,17 @@ using Assignment = vixel_interfaces::msg::ProviderAssignment;
 using Sensor = vixel_interfaces::msg::Sensor;
 using SyncGroup = vixel_interfaces::msg::SyncGroup;
 using ProviderCapture = vixel_interfaces::srv::ProviderCapture;
+
+void release_unused_heap()
+{
+#if defined(__GLIBC__)
+  // Camera mode changes replace all Aravis stream pools.  Those pools are
+  // hundreds of MiB for full-resolution BGR cameras, and glibc otherwise
+  // leaves the freed pages in the executor thread's arena.  Returning them
+  // here prevents every capture-session transition from raising the RSS.
+  malloc_trim(0);
+#endif
+}
 
 struct DeviceRecord
 {
@@ -939,11 +956,13 @@ public:
 
   CameraSession(
     rclcpp::Node * node, Assignment assignment, DeviceRecord record, NetworkConfig network,
-    GenicamConfig config, std::shared_ptr<StreamHealth> stream_health)
+    GenicamConfig config, std::size_t transfer_slot_index,
+    std::shared_ptr<StreamHealth> stream_health)
   : node_(node), assignment_(std::move(assignment)), record_(std::move(record)),
     network_(std::move(network)), config_(std::move(config)),
     endpoint_(std::make_unique<CameraEndpoint>(node_, assignment_, config_)),
-    stream_health_(std::move(stream_health))
+    stream_health_(std::move(stream_health)),
+    transfer_slot_index_(transfer_slot_index)
   {
   }
 
@@ -962,14 +981,15 @@ public:
       node_->get_logger(),
       "%s capture cadence: requested=%u ms maximum_rate=%.6f Hz "
       "exposure_budget=%.3f ms overlap=%s minimum_interval=%u ms "
-      "ready=%s action_queue=%u packet_delay=%lld ns",
+      "ready=%s action_queue=%u packet_delay=%lld ns frame_transmission_delay=%lld ns",
       assignment_.sensor_id.c_str(), cadence_.requested_interval_ms,
       cadence_.maximum_frame_rate_hz,
       cadence_.exposure_budget_us / 1000.0,
       trigger_overlap_value_.empty() ? "unavailable" : trigger_overlap_value_.c_str(),
       minimum_capture_interval_ms_, cadence_ready_ ? "true" : "false",
       cadence_.action_queue_size,
-      static_cast<long long>(packet_delay_ns_));
+      static_cast<long long>(packet_delay_ns_),
+      static_cast<long long>(frame_transmission_delay_ns_));
 
     error = nullptr;
     stream_ = arv_camera_create_stream(camera_, nullptr, nullptr, &error);
@@ -1038,7 +1058,7 @@ public:
     if (worker_.joinable()) {worker_.join();}
     if (encoder_.joinable()) {encoder_.join();}
     collect_stream_statistics();
-    if (camera_ != nullptr && streaming_.exchange(false)) {
+    if (camera_ != nullptr && streaming_.exchange(false) && !endpoint_disconnected_.load()) {
       GError * error = nullptr;
       if (transfer_start_required_) {
         arv_camera_execute_command(camera_, "TransferStop", &error);
@@ -1069,7 +1089,7 @@ public:
   {
     if (assignment_.operating_mode != "capture" || metering_rate_hz_ <= 0.0 ||
       tick < next_metering_ || !vixel_genicam::background_metering_allowed(
-        assignment_.capture_reserved, capture_primed_.load()))
+        capture_reserved_.load(), capture_primed_.load()))
     {
       return false;
     }
@@ -1137,6 +1157,11 @@ public:
   }
 
   bool ready() const {return ready_.load();}
+  void mark_endpoint_disconnected()
+  {
+    endpoint_disconnected_.store(true);
+    ready_.store(false);
+  }
   bool recovery_requested() const
   {
     std::lock_guard<std::mutex> lock(stream_health_->mutex);
@@ -1175,7 +1200,7 @@ public:
     const bool require_trigger_armed = !trigger_armed_feature_.empty();
     const bool trigger_armed = capture_trigger_armed();
     const bool prepared = vixel_genicam::capture_preparation_ready(
-      false, capture_primed_.load(), pipeline_idle(), require_trigger_armed, trigger_armed);
+      false, pipeline_idle(), require_trigger_armed, trigger_armed);
     if (prepared) {capture_preparation_latched_.store(true);}
     return prepared;
   }
@@ -1190,6 +1215,7 @@ public:
   bool cadence_ready() const {return cadence_ready_;}
   const std::string & cadence_limit_reason() const {return cadence_limit_reason_;}
   const NetworkConfig & network() const {return network_;}
+  std::size_t transfer_slot_index() const {return transfer_slot_index_;}
   std::int64_t ptp_offset_ns()
   {
     if (!ptp_action_) {return 0;}
@@ -1232,6 +1258,8 @@ public:
     return static_cast<std::uint64_t>(value);
   }
   const Assignment & assignment() const {return assignment_;}
+  bool capture_reserved() const {return capture_reserved_.load();}
+  void set_capture_reserved(bool value) {capture_reserved_.store(value);}
 
   Sensor status()
   {
@@ -2479,8 +2507,11 @@ private:
     const bool automatic = auto_mode(exposure_auto) != ARV_AUTO_OFF ||
       auto_mode(gain_auto) != ARV_AUTO_OFF;
     exposure_auto_enabled_ = auto_mode(exposure_auto) != ARV_AUTO_OFF;
+    // Captures themselves update continuous exposure/gain.  Keep background
+    // metering opt-in: making a disposable metering frame mandatory here can
+    // prevent an otherwise trigger-ready camera from ever entering capture.
     metering_rate_hz_ = automatic ? std::clamp(
-      setting(settings, "metering_rate_hz", 2.0), 0.0, 10.0) : 0.0;
+      setting(settings, "metering_rate_hz", 0.0), 0.0, 10.0) : 0.0;
     capture_primed_.store(
       assignment_.operating_mode != "capture" || metering_rate_hz_ <= 0.0);
 
@@ -2496,6 +2527,46 @@ private:
       throw_on_error(error, "setting GigE packet size");
       arv_camera_gv_set_packet_delay(camera_, packet_delay, &error);
       throw_on_error(error, "setting GigE packet delay");
+
+      const std::int64_t slot_delay_ns =
+        static_cast<std::int64_t>(network_.transfer_slot_ms) *
+        static_cast<std::int64_t>(transfer_slot_index_) *
+        static_cast<std::int64_t>(1000000);
+      const auto requested_delay_ns = setting(
+        settings, "frame_transmission_delay_ns", slot_delay_ns);
+      if (requested_delay_ns < 0) {
+        throw std::runtime_error("frame_transmission_delay_ns cannot be negative");
+      }
+      error = nullptr;
+      const bool frame_delay_available = arv_camera_is_feature_available(
+        camera_, "GevSCFTD", &error);
+      if (error != nullptr) {
+        g_error_free(error);
+        error = nullptr;
+      }
+      if (frame_delay_available && feature_writable(camera_, "GevSCFTD")) {
+        std::int64_t minimum = 0;
+        std::int64_t maximum = 0;
+        arv_camera_get_integer_bounds(
+          camera_, "GevSCFTD", &minimum, &maximum, &error);
+        throw_on_error(error, "reading GigE frame transmission delay bounds");
+        frame_transmission_delay_ns_ = std::clamp(
+          requested_delay_ns, minimum, maximum);
+        error = nullptr;
+        arv_camera_set_integer(
+          camera_, "GevSCFTD", frame_transmission_delay_ns_, &error);
+        throw_on_error(error, "setting GigE frame transmission delay");
+        RCLCPP_INFO(
+          node_->get_logger(),
+          "%s GigE transmission slot: index=%zu width=%d ms delay=%lld ns",
+          assignment_.sensor_id.c_str(), transfer_slot_index_, network_.transfer_slot_ms,
+          static_cast<long long>(frame_transmission_delay_ns_));
+      } else if (requested_delay_ns > 0) {
+        RCLCPP_WARN(
+          node_->get_logger(),
+          "%s cannot apply GigE transmission slot %zu: GevSCFTD is unavailable or read-only",
+          assignment_.sensor_id.c_str(), transfer_slot_index_);
+      }
     }
 
     // AcquisitionFrameRate is a free-running control in SFNC. A requested
@@ -3299,6 +3370,8 @@ private:
   std::atomic<bool> stopping_{false};
   std::atomic<bool> streaming_{false};
   std::atomic<bool> ready_{false};
+  std::atomic<bool> endpoint_disconnected_{false};
+  std::atomic<bool> capture_reserved_{assignment_.capture_reserved};
   std::atomic<bool> capture_primed_{false};
   std::atomic<bool> capture_preparation_latched_{false};
   std::atomic<std::uint64_t> completed_frames_{0};
@@ -3336,6 +3409,8 @@ private:
   std::string cadence_limit_reason_;
   std::string trigger_overlap_value_;
   std::int64_t packet_delay_ns_{0};
+  std::int64_t frame_transmission_delay_ns_{0};
+  std::size_t transfer_slot_index_{0};
   bool exposure_auto_enabled_{false};
   std::mutex camera_control_mutex_;
   bool transfer_start_required_{false};
@@ -3630,11 +3705,41 @@ private:
 
   void reconcile_sessions()
   {
+    std::vector<std::pair<std::string, std::string>> transfer_slot_order;
+    for (const auto & item : assignments_) {
+      const auto & assignment = item.second;
+      const auto network = config_.networks.find(assignment.network_id);
+      if (assignment.enabled && network != config_.networks.end() &&
+        network->second.approved)
+      {
+        transfer_slot_order.emplace_back(assignment.network_id, item.first);
+      }
+    }
+    std::sort(transfer_slot_order.begin(), transfer_slot_order.end());
+    std::map<std::string, std::size_t> transfer_slot_indices;
+    for (std::size_t index = 0; index < transfer_slot_order.size(); ++index) {
+      transfer_slot_indices[transfer_slot_order[index].second] = index;
+    }
+
+    bool removed_session = false;
     for (auto iterator = sessions_.begin(); iterator != sessions_.end();) {
       const auto assignment = assignments_.find(iterator->first);
+      auto network = config_.networks.end();
+      auto record = records_.end();
+      if (assignment != assignments_.end()) {
+        network = config_.networks.find(assignment->second.network_id);
+        record = records_.find(assignment->second.serial);
+      }
+      const bool endpoint_check_applicable =
+        assignment != assignments_.end() && network != config_.networks.end();
+      const bool endpoint_matches = endpoint_check_applicable &&
+        vixel_genicam::session_endpoint_matches(
+        record != records_.end(),
+        record == records_.end() ? std::string{} : record->second.address,
+        record == records_.end() ? std::string{} : record->second.interface_name,
+        assignment->second.assigned_address, network->second.interface);
       const bool keep = assignment != assignments_.end() && assignment->second.enabled &&
-        config_.networks.count(assignment->second.network_id) != 0 &&
-        config_.networks.at(assignment->second.network_id).approved &&
+        network != config_.networks.end() && network->second.approved &&
         assignment->second.operating_mode == iterator->second->assignment().operating_mode &&
         assignment->second.provider_settings_json ==
         iterator->second->assignment().provider_settings_json &&
@@ -3642,13 +3747,20 @@ private:
         iterator->second->assignment().preview_rate_hz &&
         assignment->second.requested_capture_interval_ms ==
         iterator->second->assignment().requested_capture_interval_ms &&
-        assignment->second.capture_reserved ==
-        iterator->second->assignment().capture_reserved &&
         assignment->second.calibration_url ==
         iterator->second->assignment().calibration_url &&
         assignment->second.network_id == iterator->second->assignment().network_id &&
-        records_.count(assignment->second.serial) != 0;
+        transfer_slot_indices.count(iterator->first) != 0 &&
+        transfer_slot_indices.at(iterator->first) ==
+        iterator->second->transfer_slot_index() && endpoint_matches;
       if (!keep) {
+        if (endpoint_check_applicable && !endpoint_matches) {
+          iterator->second->mark_endpoint_disconnected();
+          RCLCPP_WARN(
+            get_logger(),
+            "Dropping stale GenICam session for %s after its discovered endpoint changed",
+            iterator->first.c_str());
+        }
         if (iterator->second->recovery_requested()) {
           iterator->second->mark_restarting(std::chrono::steady_clock::now());
           RCLCPP_WARN(
@@ -3656,8 +3768,13 @@ private:
             iterator->first.c_str());
         }
         iterator = sessions_.erase(iterator);
-      } else {++iterator;}
+        removed_session = true;
+      } else {
+        iterator->second->set_capture_reserved(assignment->second.capture_reserved);
+        ++iterator;
+      }
     }
+    if (removed_session) {release_unused_heap();}
     for (const auto & item : assignments_) {
       const auto & assignment = item.second;
       if (!assignment.enabled || sessions_.count(item.first) != 0)
@@ -3709,7 +3826,8 @@ private:
         auto & health = stream_health_[item.first];
         if (!health) {health = std::make_shared<StreamHealth>(config_);}
         auto session = std::make_unique<CameraSession>(
-          this, assignment, record->second, network->second, config_, health);
+          this, assignment, record->second, network->second, config_,
+          transfer_slot_indices.at(item.first), health);
         session->initialize();
         sessions_[item.first] = std::move(session);
         initialization_errors_.erase(item.first);
@@ -3863,7 +3981,10 @@ private:
         sensor_id.c_str());
       sessions_.erase(session);
     }
-    if (!rebuilding.empty()) {reconcile_sessions();}
+    if (!rebuilding.empty()) {
+      release_unused_heap();
+      reconcile_sessions();
+    }
   }
 
   void publish_status()
@@ -3925,7 +4046,6 @@ private:
     std::map<std::string, SyncGroup> groups;
     std::map<std::string, std::vector<std::string>> locking_members;
     std::map<std::string, std::vector<std::string>> unsupported_members;
-    std::map<std::string, std::vector<std::string>> warming_members;
     std::map<std::string, std::vector<std::string>> arming_members;
     std::map<std::string, std::vector<std::string>> cadence_failed_members;
     std::map<std::string, std::vector<std::string>> cadence_unconfigured_members;
@@ -3980,10 +4100,6 @@ private:
               session->second->cadence_limit_reason();
           }
           if (assignment.operating_mode == "capture" &&
-            !session->second->capture_primed())
-          {
-            warming_members[group_id].push_back(item.first);
-          } else if (assignment.operating_mode == "capture" &&
             assignment.capture_reserved &&
             !session->second->capture_prepared())
           {
@@ -4026,7 +4142,6 @@ private:
       const bool members_ready = group.operating_mode == "idle" ||
         group.missing_member_ids.empty() ||
         (group.missing_policy == "degraded" && !group.online_member_ids.empty());
-      const auto & warming = warming_members[group.group_id];
       const auto & arming = arming_members[group.group_id];
       const auto & cadence_failed = cadence_failed_members[group.group_id];
       const auto & cadence_unconfigured = cadence_unconfigured_members[group.group_id];
@@ -4036,11 +4151,11 @@ private:
         (group.cadence_configured && cadence_failed.empty() &&
         group.minimum_capture_interval_ms != 0 &&
         group.minimum_capture_interval_ms <= group.requested_capture_interval_ms);
-      group.ready = members_ready && group.locking_member_ids.empty() && warming.empty() &&
-        arming.empty() && group.cadence_ready;
+      group.ready = members_ready && group.locking_member_ids.empty() && arming.empty() &&
+        group.cadence_ready;
       if (!group.locking_member_ids.empty() ||
         (group.operating_mode == "capture" &&
-        (!group.unsynchronized_member_ids.empty() || !warming.empty() || !arming.empty() ||
+        (!group.unsynchronized_member_ids.empty() || !arming.empty() ||
         !cadence_failed.empty() || !cadence_unconfigured.empty())))
       {
         std::ostringstream notice;
@@ -4055,25 +4170,20 @@ private:
           notice << joined(unsupported);
           notice << "; they remain unsynchronized";
         }
-        if (!warming.empty()) {
-          if (!locking.empty() || !unsupported.empty()) {notice << ". ";}
-          notice << "Waiting for a clean initial metering frame from: ";
-          notice << joined(warming);
-        }
         if (!arming.empty()) {
-          if (!locking.empty() || !unsupported.empty() || !warming.empty()) {notice << ". ";}
+          if (!locking.empty() || !unsupported.empty()) {notice << ". ";}
           notice << "Waiting for an idle, armed capture pipeline from: ";
           notice << joined(arming);
         }
         if (!cadence_unconfigured.empty()) {
-          if (!locking.empty() || !unsupported.empty() || !warming.empty() || !arming.empty()) {
+          if (!locking.empty() || !unsupported.empty() || !arming.empty()) {
             notice << ". ";
           }
           notice << "Waiting for cadence configuration from: ";
           notice << joined(cadence_unconfigured);
         }
         if (!cadence_failed.empty()) {
-          if (!locking.empty() || !unsupported.empty() || !warming.empty() || !arming.empty() ||
+          if (!locking.empty() || !unsupported.empty() || !arming.empty() ||
             !cadence_unconfigured.empty())
           {
             notice << ". ";
@@ -4460,7 +4570,7 @@ private:
       response->message = "camera must be online to inspect its GenICam features";
       return;
     }
-    if (session->second->assignment().capture_reserved) {
+    if (session->second->capture_reserved()) {
       response->success = false;
       response->message = "camera features cannot be inspected during an active capture session";
       return;
@@ -4515,9 +4625,14 @@ private:
 
 int main(int argc, char ** argv)
 {
+  // Four cameras already process frames concurrently in dedicated workers.
+  // A second, process-wide OpenCV worker pool only oversubscribes the CPU and
+  // creates large per-thread malloc arenas for image scratch buffers.
+  cv::setNumThreads(1);
   rclcpp::init(argc, argv);
   auto node = std::make_shared<vixel_genicam::GenicamProvider>();
-  rclcpp::executors::MultiThreadedExecutor executor;
+  rclcpp::executors::MultiThreadedExecutor executor(
+    rclcpp::ExecutorOptions(), 4U);
   executor.add_node(node);
   executor.spin();
   rclcpp::shutdown();

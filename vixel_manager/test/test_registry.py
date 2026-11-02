@@ -239,7 +239,7 @@ def test_legacy_lucid_provider_is_migrated_in_memory():
     assert "gain_auto_upper_db" not in imaging
     assert "auto_brightness_target" not in imaging
     assert "metering_rate_hz" not in imaging
-    assert machine["managed_networks"]["left"]["packet_delay"] == 100000
+    assert machine["managed_networks"]["left"]["packet_delay"] == 50000
 
 
 def test_explicit_genicam_imaging_defaults_are_preserved():

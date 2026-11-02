@@ -174,7 +174,8 @@ settings include:
   "capture_png_compression": 1,
   "frame_rate_hz": 4.0,
   "packet_size": 9000,
-  "packet_delay_ns": 100000,
+  "packet_delay_ns": 50000,
+  "frame_transmission_delay_ns": 0,
   "trigger_overlap": "PreviousFrame",
   "trigger_source": "FreeRun",
   "transfer_control_mode": "Basic"
@@ -190,10 +191,17 @@ available, Vixel defaults it to `Basic` to avoid frames being held by settings
 left behind by another application.
 
 `packet_delay_ns` paces GigE Vision image packets without changing exposure
-time or PTP synchronization. The conservative 100,000 ns default prevents
-simultaneous full-resolution streams from overrunning a shared PCIe uplink.
-Machines with independently provisioned NIC bandwidth may lower it after
-checking the NIC drop counters under simultaneous capture.
+time or PTP synchronization. The 50,000 ns default leaves enough transfer time
+for four full-resolution BGR8 cameras at 2 Hz when used with the default
+transmission slots. Machines with different NIC topology should tune it only
+after checking camera and host drop counters under simultaneous capture.
+
+`managed_networks.<id>.transfer_slot_ms` assigns deterministic transmission
+slots to enabled cameras. For synchronized groups, exposure still starts from
+the same PTP action, but `GevSCFTD` delays each camera's image transfer by its
+slot index so several full-resolution frames do not arrive at the host at once.
+The machine-wide default is 30 ms, so four slots add at most 90 ms. A per-camera
+`frame_transmission_delay_ns` override may replace the calculated delay.
 
 `providers.genicam.frame_retention_ms` controls how long Aravis retains an
 incomplete GigE Vision frame while waiting for late or resent packets. It
@@ -253,16 +261,15 @@ software-triggered and unsynchronized. Firmware is omitted from normal status,
 and missing GenICam-node diagnostics remain in provider startup logs.
 
 Manual exposure uses `exposure_auto: "Off"` with `exposure_us`, and manual
-gain uses `gain_auto: "Off"` with `gain_db`. With either automatic control
-enabled, `metering_rate_hz` defaults to 2 Hz and requests unsaved, unencoded
-metering frames while a capture group has no prepared cadence. Preparing a
-sequence allows one clean initial metering frame, then quiesces background
-metering so its PTP action cannot overlap cycle one. A prepared group becomes
-capture-ready only after every automatic camera has returned that frame, its
-receive pipeline is empty, and `TriggerArmed` is true when the camera exposes
-it. That preparation result is latched for the lifetime of the configured
-camera session, so an in-flight sequence frame does not temporarily revoke the
-group's readiness. Saved sequence frames continue to update camera auto-exposure/gain.
+gain uses `gain_auto: "Off"` with `gain_db`. Saved and published capture frames
+update continuous camera auto-exposure/gain, so `metering_rate_hz` defaults to
+0 Hz and capture readiness never depends on a disposable metering frame.
+Profiles that need exposure adaptation before a capture may explicitly set a
+non-zero `metering_rate_hz`; those unsaved, unencoded frames are then used while
+the group is unreserved. A prepared group becomes capture-ready when its receive
+pipeline is empty and `TriggerArmed` is true when the camera exposes it. That
+preparation result is latched for the lifetime of the configured camera session,
+so an in-flight sequence frame does not temporarily revoke the group's readiness.
 Scheduled frames are matched to their PTP action timestamp; an old metering
 frame can never be relabelled as a later saved capture. Static upper-limit
 settings remain useful as a tighter image quality or motion limit; the

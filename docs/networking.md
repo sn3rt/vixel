@@ -56,7 +56,7 @@ adjusts NIC RX rings when supported. Disconnected ports remain configured and
 activate when link carrier appears.
 
 Camera `packet_delay` is equally important when several NICs share one PCIe
-uplink. The 100,000 ns default paces image transfer while leaving PTP exposure
+uplink. The 50,000 ns default paces image transfer while leaving PTP exposure
 timing unchanged. Validate a machine under simultaneous capture with
 `ethtool -S <interface>`; increasing `rx_missed_errors` or `rx_fifo_errors`
 means aggregate camera traffic still exceeds the host path.

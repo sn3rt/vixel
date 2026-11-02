@@ -59,6 +59,8 @@ if(BUILD_TESTING)
   target_include_directories(test_trigger_readiness PRIVATE include)
   ament_add_gtest(test_stream_recovery test/test_stream_recovery.cpp)
   target_include_directories(test_stream_recovery PRIVATE include)
+  ament_add_gtest(test_session_liveness test/test_session_liveness.cpp)
+  target_include_directories(test_session_liveness PRIVATE include)
 endif()
 
 ament_package()

@@ -67,6 +67,12 @@ GenicamConfig load_genicam_config(const std::string & path)
     network.gateway = read_or(value, "gateway", network.gateway);
     network.packet_size = read_or(value, "packet_size", network.packet_size);
     network.packet_delay = read_or(value, "packet_delay", network.packet_delay);
+    network.transfer_slot_ms = read_or(
+      value, "transfer_slot_ms", network.transfer_slot_ms);
+    if (network.transfer_slot_ms < 0) {
+      throw std::runtime_error(
+              "managed_networks." + network.id + ".transfer_slot_ms cannot be negative");
+    }
     config.networks[network.id] = network;
   }
 
